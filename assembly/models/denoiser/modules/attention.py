@@ -7,7 +7,12 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import flash_attn
+try:
+    import flash_attn
+    HAS_FLASH_ATTN = True
+except ImportError:
+    flash_attn = None
+    HAS_FLASH_ATTN = False
 from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import Timesteps, TimestepEmbedding
 
