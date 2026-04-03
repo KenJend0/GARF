@@ -1,3 +1,36 @@
+"""
+assembly/models/denoiser/modules/scheduler.py
+===============================================
+Schedulers de bruit pour le flow matching et la diffusion sur SE(3).
+
+SE(3) = groupe des transformations rigides 3D = translations (R³) + rotations (SO(3))
+
+Pourquoi un scheduler spécial pour SE(3) ?
+  Les espaces de translations (R³) et de rotations (SO(3)) sont DIFFÉRENTS :
+  - R³ est un espace euclidien plat → interpolation linéaire OK
+  - SO(3) est une variété courbe → il faut interpoler via axis-angle (géodésique)
+
+Ce fichier contient 3 schedulers :
+  1. SE3FlowMatchEulerDiscreteScheduler  ← UTILISÉ DANS GARF (flow matching)
+  2. SE3PiecewiseScheduler               ← variante diffusion DDPM (non utilisé par défaut)
+  3. SE3DDPMScheduler                    ← variante diffusion DDPM standard (non utilisé par défaut)
+
+=== CONCEPT CLÉ : Flow Matching ===
+Contrairement à la diffusion qui apprend à "débruiter",
+le flow matching apprend un CHAMP VECTORIEL qui guide les poses de x_noise vers x_GT.
+
+  Entraînement :
+    x_t = (1 - σ) * x_0 + σ * x_noise   (interpolation à temps t)
+    cible = x_noise - x_0                (le champ vectoriel à prédire)
+
+  Inference :
+    On part de x_noise et on fait des petits pas dans la direction prédite
+    x_{t-1} = x_t + Δσ * champ_prédit   (intégration d'Euler)
+
+  Pour les rotations, on remplace l'interpolation linéaire par une interpolation
+  sur la variété SO(3) via la représentation axis-angle.
+"""
+
 import math
 from typing import Union, Tuple, Literal
 from dataclasses import dataclass
@@ -13,18 +46,33 @@ from pytorch3d import transforms as p3dt
 @dataclass
 class SE3FlowMatchEulerDiscreteSchedulerOutput(BaseOutput):
     """
-    Output class for the scheduler's `step` function output.
+    Sortie de la méthode step() du scheduler.
 
-    Args:
-        prev_sample (`torch.FloatTensor` of shape `(batch_size, 7)` for translations and scalar first quaternions):
-            Computed sample `(x_{t-1})` of previous timestep. `prev_sample` should be used as next model input in the
-            denoising loop.
+    prev_sample : pose du timestep précédent (t-1), forme (batch_size, 7)
+                  7 = 3 (translation) + 4 (quaternion scalar-first [w,x,y,z])
     """
-
     prev_sample: torch.FloatTensor
 
 
 class SE3FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
+    """
+    Scheduler Flow Matching Euler pour SE(3).
+
+    Principe du flow matching :
+      - σ(t) : niveau de bruit au temps t, varie de σ_max (=1, bruit pur) à σ_min (≈0, signal pur)
+      - x_t = (1-σ) * x_0 + σ * x_noise  pour les translations
+      - x_t = exp(σ * axis_angle_noise) @ x_0  pour les rotations (géodésique sur SO(3))
+
+    Args:
+        num_train_timesteps : nombre de timesteps discrets pour l'entraînement (ex: 1000)
+        stochastic_paths    : ajoute du bruit stochastique pendant les steps (optionnel)
+        sigma_schedule      : forme de la courbe σ(t) :
+                              - 'linear'              : σ croît linéairement
+                              - 'piecewise-linear'    : lent au début (0→0.1), rapide ensuite
+                              - 'piecewise-quadratic' : quadratique par morceaux
+                              - 'exponential'         : σ = exp(-5*(1-t))
+    """
+
     @register_to_config
     def __init__(
         self,
@@ -33,99 +81,102 @@ class SE3FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         stochastic_level: float = 0.1,
         min_stochastic_epsilon: float = 0.01,
         sigma_schedule: Literal[
-            "linear",
-            "piecewise-linear",
-            "piecewise-quadratic",
-            "exponential",
+            "linear", "piecewise-linear", "piecewise-quadratic", "exponential",
         ] = "linear",
     ):
         super().__init__()
+
+        # Génère les timesteps de num_train_timesteps → 1 (ordre décroissant pour le dénoising)
         timesteps = torch.flip(
             torch.linspace(1, num_train_timesteps, num_train_timesteps), dims=[0]
         )
+        # Calcule σ(t) pour chaque timestep selon le schedule choisi
         sigmas = torch.tensor(
             [self._sigma_schedule(t, num_train_timesteps) for t in timesteps],
             dtype=torch.float32,
         )
+        # Les "timesteps" exposés sont en fait σ * num_timesteps (pratique pour l'indexation)
         self.timesteps = sigmas * num_train_timesteps
         self.sigmas = sigmas.to("cpu")
-        self.sigma_min = self.sigmas[-1].item()
-        self.sigma_max = self.sigmas[0].item()
+        self.sigma_min = self.sigmas[-1].item()  # ≈ 0 (quasi signal pur)
+        self.sigma_max = self.sigmas[0].item()   # = 1 (bruit pur)
 
         self._step_index = None
         self._begin_index = None
 
     def _calc_stochastic_epsilon(self, sigma: torch.FloatTensor):
+        """
+        Calcule l'amplitude du bruit stochastique ajouté pendant les steps.
+        Vaut 0 quand σ=0 ou σ=1, maximal à σ=0.5.
+        """
         return torch.sqrt(
             self.config.get("stochastic_level") ** 2 * sigma * (1 - sigma)
             + self.config.get("min_stochastic_epsilon")
         )
 
-    def _sigma_schedule(
-        self,
-        t: torch.FloatTensor,
-        num_timesteps: int = 1000,
-    ):
-        t = t * 1000 / num_timesteps  # rescale t to [0, 1000]
+    def _sigma_schedule(self, t: torch.FloatTensor, num_timesteps: int = 1000):
+        """
+        Définit σ(t) ∈ [0, 1] en fonction du timestep t.
+
+        t est rescalé dans [0, 1000] pour faciliter les comparaisons.
+
+        Piecewise-linear : σ monte lentement jusqu'à 0.1 (70% du temps),
+                           puis rapidement jusqu'à 1.0 (30% restants).
+                           → Le modèle passe plus de temps sur des poses quasi-correctes.
+        """
+        t = t * 1000 / num_timesteps  # normalise t dans [0, 1000]
         if self.config.get("sigma_schedule") == "linear":
-            return t / 1000
+            return t / 1000                     # 0 → 1 linéaire
+
         elif self.config.get("sigma_schedule") == "piecewise-linear":
             if t <= 700:
-                return t / 700 * 0.1
+                return t / 700 * 0.1            # 0 → 0.1 sur les 70% premiers
             else:
-                return 0.1 + (t - 700) / 300 * 0.9
+                return 0.1 + (t - 700) / 300 * 0.9  # 0.1 → 1.0 sur les 30% restants
+
         elif self.config.get("sigma_schedule") == "piecewise-quadratic":
             if t <= 700:
                 return 0.1 * (t / 700) ** 2
             else:
                 return 0.1 + 0.9 * ((t - 700) / 300) ** 2
+
         elif self.config.get("sigma_schedule") == "exponential":
-            return math.exp(-5 * (1 - t / 1000))
+            return math.exp(-5 * (1 - t / 1000))   # démarre proche de 0, monte exponentiellement
+
         else:
-            raise ValueError(
-                f"Invalid sigma schedule: {self.config.get('sigma_schedule')}"
-            )
+            raise ValueError(f"Invalid sigma schedule: {self.config.get('sigma_schedule')}")
 
     @property
     def step_index(self):
-        """
-        The index counter for current timestep. It will increase 1 after each scheduler step.
-        """
+        """Index du timestep courant (incrémenté à chaque appel de step())."""
         return self._step_index
 
     @property
     def begin_index(self):
-        """
-        The index for the first timestep. It should be set from pipeline with `set_begin_index` method.
-        """
+        """Index de départ du dénoising (utile pour démarrer en milieu de schedule)."""
         return self._begin_index
 
-    # Copied from diffusers.schedulers.scheduling_dpmsolver_multistep.DPMSolverMultistepScheduler.set_begin_index
     def set_begin_index(self, begin_index: int = 0):
-        """
-        Sets the begin index for the scheduler. This function should be run from pipeline before the inference.
-
-        Args:
-            begin_index (`int`):
-                The begin index for the scheduler.
-        """
+        """Fixe le timestep de départ pour l'inference."""
         self._begin_index = begin_index
 
     def _sigma_to_t(self, sigma: torch.FloatTensor) -> torch.FloatTensor:
+        """Convertit un σ en timestep discret."""
         return sigma * self.config.get("num_train_timesteps")
 
-    def set_timesteps(
-        self,
-        num_inference_steps: int = 50,
-        sigmas: torch.FloatTensor = None,
-    ):
+    def set_timesteps(self, num_inference_steps: int = 50, sigmas: torch.FloatTensor = None):
         """
-        Set the timesteps for the scheduler.
+        Configure les timesteps pour l'INFERENCE (peut être moins que pendant l'entraînement).
 
-        By default, we use linspace from sigma_max to sigma_min with num_inference_steps.
-        If sigmas is provided, we will use it directly.
+        En inference, on utilise souvent 20 steps au lieu de 1000 :
+        le modèle doit faire des "grands pas" pour aller du bruit au signal.
+
+        Args:
+            num_inference_steps : nb de steps d'inference (ex: 20)
+            sigmas              : si fourni, utilise directement ces valeurs σ
         """
         if sigmas is None:
+            # Génère un nouveau schedule avec num_inference_steps points
             timesteps = torch.flip(
                 torch.linspace(1, num_inference_steps, num_inference_steps), dims=[0]
             )
@@ -137,7 +188,7 @@ class SE3FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
             num_inference_steps = len(sigmas)
 
         self.timesteps = sigmas * self.config.get("num_train_timesteps")
-
+        # Ajoute un 0 final (σ=0 = signal pur = pose finale)
         sigmas = torch.cat([sigmas, torch.zeros(1, device=sigmas.device)])
         self.sigmas = sigmas
         self._step_index = None
@@ -145,118 +196,145 @@ class SE3FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
     def _scale_noise_for_translation(
         self,
-        x_0_trans: torch.FloatTensor,  # (B, 3)
-        sigma: torch.FloatTensor,  # (B)
-        x_1_trans: torch.FloatTensor,  # (B, 3)
+        x_0_trans: torch.FloatTensor,  # (B, 3) — translation GT
+        sigma: torch.FloatTensor,       # (B,)   — niveau de bruit
+        x_1_trans: torch.FloatTensor,  # (B, 3) — bruit gaussien pur
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         """
-        Forward process for translations from x_0 to x_1.
-        Args:
-            x_0_trans: (B, 3) tensor, ground truth translations.
-            sigma: (B) tensor, sigmas for each sample
-            x_1_trans: (B, 3) tensor, pure noise translations.
+        Processus forward pour les TRANSLATIONS (flow matching).
+
+        Formule d'interpolation linéaire :
+          x_t = (1 - σ) * x_0 + σ * x_1
+          où x_0 = GT, x_1 = bruit, σ ∈ [0,1]
+
+        Le champ vectoriel cible (ce que le modèle apprend à prédire) :
+          v* = x_1 - x_0  (direction du bruit vers le GT, normalisée)
+
+        Note : le modèle prédit v*, et pendant l'inference on intègre :
+          x_{t-1} = x_t + Δσ * v_prédit
 
         Returns:
-            Tuple[torch.FloatTensor, torch.FloatTensor]:
-                - x_t_trans: (B, 3) tensor, noisy translations.
-                - trans_vec_field: (B, 3) tensor, translation vector field.
+            (x_t_trans, trans_vec_field)
+            - x_t_trans      : pose bruitée à temps t [B, 3]
+            - trans_vec_field : champ vectoriel cible [B, 3]
         """
-        sigma = sigma.unsqueeze(-1)
+        sigma = sigma.unsqueeze(-1)  # (B,) → (B, 1) pour le broadcast avec (B, 3)
+        # Interpolation linéaire entre GT (x_0) et bruit (x_1)
         x_t_trans = (1 - sigma) * x_0_trans + sigma * x_1_trans
-        if self.config.get("stochastic_paths"):
-            x_t_trans += torch.randn_like(x_t_trans) * self._calc_stochastic_epsilon(
-                sigma
-            )
 
+        if self.config.get("stochastic_paths"):
+            # Ajoute un bruit brownien pour rendre les trajectoires stochastiques
+            x_t_trans += torch.randn_like(x_t_trans) * self._calc_stochastic_epsilon(sigma)
+
+        # Le champ vectoriel = différence entre bruit et GT (à intégrer pour aller de x_0 → x_1)
         trans_vec_field = x_1_trans - x_0_trans
         return (x_t_trans, trans_vec_field)
 
     def _scale_noise_for_rotation(
         self,
-        x_0_rot: torch.FloatTensor,  # (B, 4)
-        sigma: torch.FloatTensor,  # (B)
-        x_1_rot: torch.FloatTensor,  # (B, 4)
+        x_0_rot: torch.FloatTensor,  # (B, 4) — rotation GT (quaternion scalar-first)
+        sigma: torch.FloatTensor,     # (B,)   — niveau de bruit
+        x_1_rot: torch.FloatTensor,  # (B, 4) — rotation bruit (quaternion aléatoire)
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         """
-        Forward process for rotations from x_0 to x_1.
-        Args:
-            x_0_rot: (B, 4) tensor, ground truth rotations, scalar first quaternions.
-            sigma: (B) tensor, sigmas for each sample
-            x_1_rot: (B, 4) tensor, pure noise rotations, scalar first quaternions.
+        Processus forward pour les ROTATIONS sur SO(3) (flow matching géodésique).
+
+        Contrairement aux translations, on NE PAS faire d'interpolation linéaire de quaternions
+        (ça sortirait de SO(3)). On utilise la représentation axis-angle :
+
+          R_t = exp(σ * ω) @ R_0
+          où ω = log(R_1)  est l'axis-angle de la rotation de bruit R_1
+
+        Cela garantit que R_t reste une matrice de rotation valide à tout instant.
+
+        Le champ vectoriel cible pour les rotations = ω = axis-angle du bruit
+        (le modèle prédit un axis-angle, appliqué via exp() pendant l'inference)
 
         Returns:
-            Tuple[torch.FloatTensor, torch.FloatTensor]:
-                - x_t_rot: (B, 4) tensor, noisy rotations, scalar first quaternions.
-                - rot_vec_field: (B, 3) tensor, rotation vector field.
+            (x_t_rot, rot_vec_field)
+            - x_t_rot      : quaternion bruité à temps t [B, 4]
+            - rot_vec_field : axis-angle de la rotation de bruit [B, 3]
         """
-        sigma = sigma.unsqueeze(-1)
+        sigma = sigma.unsqueeze(-1)  # (B,) → (B, 1)
+
+        # Convertit les quaternions en matrices de rotation 3x3
         x_0_rot_mat = p3dt.quaternion_to_matrix(x_0_rot)
         x_1_rot_mat = p3dt.quaternion_to_matrix(x_1_rot)
 
-        # Calculate the rotation vector field
+        # Calcule le champ vectoriel = axis-angle de la rotation de bruit R_1
+        # log(R_1) = représentation axis-angle de R_1, vecteur ∈ R³
         rot_vec_field = p3dt.matrix_to_axis_angle(x_1_rot_mat)
+
+        # Interpolation géodésique : R_t = exp(σ * ω) @ R_0
+        # exp(σ * ω) = rotation d'angle σ*||ω|| autour de l'axe ω/||ω||
         x_t_rot_mat = p3dt.axis_angle_to_matrix(sigma * rot_vec_field) @ x_0_rot_mat
+
         if self.config.get("stochastic_paths"):
+            # Bruit stochastique appliqué via composition de rotations
             epsilon_t = self._calc_stochastic_epsilon(sigma)
             x_t_rot_mat = x_t_rot_mat @ p3dt.axis_angle_to_matrix(
                 epsilon_t * torch.randn_like(rot_vec_field)
             )
 
+        # Reconvertit la matrice de rotation en quaternion scalar-first
         x_t_rot = p3dt.matrix_to_quaternion(x_t_rot_mat)
         return (x_t_rot, rot_vec_field)
 
     def scale_noise(
         self,
-        sample: torch.FloatTensor,  # (B, 7)
-        timestep: torch.FloatTensor,  # (B)
-        noise: torch.FloatTensor,  # (B, 7)
+        sample: torch.FloatTensor,    # (B, 7) — pose GT [trans(3) + quat(4)]
+        timestep: torch.FloatTensor,  # (B,)   — timesteps
+        noise: torch.FloatTensor,     # (B, 7) — bruit [trans_noise(3) + rot_noise(4)]
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         """
-        Args:
-            sample (`torch.FloatTensor`): (B, 7) tensor, translations and scalar first quaternions.
-            timesteps (`torch.FloatTensor`): (B) tensor, timesteps for each sample.
-            noise (`torch.FloatTensor`): (B, 7) tensor, noise for each sample.
+        Applique le processus forward (ajout de bruit) sur une pose SE(3).
+
+        Traite séparément les translations et les rotations, puis concatène.
 
         Returns:
-            Tuple[torch.FloatTensor, torch.FloatTensor]:
-                - x_t: (B, 7) tensor, noisy translations and scalar first quaternions.
-                - vec_field: (B, 6) tensor, translation and rotation vector fields.
+            (x_t, vec_field) où :
+            - x_t       : pose bruitée (B, 7) = [trans_bruitée(3) + quat_bruité(4)]
+            - vec_field : champ vectoriel cible (B, 6) = [vec_trans(3) + vec_rot(3)]
+                          Note : 6D car le champ rotatif est un axis-angle (3D), pas un quaternion
         """
         sigmas = self.sigmas.to(device=sample.device, dtype=sample.dtype)
         schedule_timesteps = self.timesteps.to(sample.device)
         timestep = timestep.to(sample.device)
 
-        step_indices = [
-            self.index_for_timestep(t, schedule_timesteps) for t in timestep
-        ]
-        sigma = sigmas[step_indices].flatten()
+        # Trouve l'index σ correspondant au timestep demandé
+        step_indices = [self.index_for_timestep(t, schedule_timesteps) for t in timestep]
+        sigma = sigmas[step_indices].flatten()  # (B,) — σ pour chaque élément du batch
 
+        # Applique séparément aux translations et aux rotations
         x_t_trans, trans_vec_field = self._scale_noise_for_translation(
-            sample[..., :3], sigma, noise[..., :3]
+            sample[..., :3],   # translations GT
+            sigma,
+            noise[..., :3],    # bruit gaussien pour les translations
         )
         x_t_rots, rot_vec_field = self._scale_noise_for_rotation(
-            sample[..., 3:], sigma, noise[..., 3:]
+            sample[..., 3:],   # quaternions GT
+            sigma,
+            noise[..., 3:],    # quaternions aléatoires comme bruit
         )
 
+        # Concatène : x_t = [trans_bruitée | quat_bruité]
+        # vec_field = [vec_trans(3) | vec_rot(3)] → 6D total
         return torch.cat([x_t_trans, x_t_rots], dim=-1), torch.cat(
             [trans_vec_field, rot_vec_field], dim=-1
         )
 
     def index_for_timestep(self, timestep, schedule_timesteps=None):
+        """Trouve l'index d'un timestep dans le schedule (gère les doublons)."""
         if schedule_timesteps is None:
             schedule_timesteps = self.timesteps
 
         indices = (schedule_timesteps == timestep).nonzero()
-
-        # The sigma index that is taken for the **very** first `step`
-        # is always the second index (or the last index if there is only 1)
-        # This way we can ensure we don't accidentally skip a sigma in
-        # case we start in the middle of the denoising schedule (e.g. for image-to-image)
+        # Prend le 2ème index si plusieurs matches (évite de sauter un σ en milieu de schedule)
         pos = 1 if len(indices) > 1 else 0
-
         return indices[pos].item()
 
     def _init_step_index(self, timestep):
+        """Initialise l'index de step pour l'inference."""
         if self.begin_index is None:
             if isinstance(timestep, torch.Tensor):
                 timestep = timestep.to(self.timesteps.device)
@@ -266,21 +344,19 @@ class SE3FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
     def _step_for_translation(
         self,
-        vec_field: torch.FloatTensor,
-        delta_sigma: torch.FloatTensor,
-        sample: torch.FloatTensor,
+        vec_field: torch.FloatTensor,    # (B, 3) — champ vectoriel prédit (translations)
+        delta_sigma: torch.FloatTensor,  # (B,)   — Δσ = σ_{t-1} - σ_t (négatif !)
+        sample: torch.FloatTensor,       # (B, 3) — pose actuelle
     ) -> torch.FloatTensor:
         """
-        Args:
-            vec_field (`torch.FloatTensor`): (B, 3) tensor, translation vector field.
-            delta_sigma (`torch.FloatTensor`): (B) tensor.
-            sample (`torch.FloatTensor`): (B, 3) tensor, sample translations.
+        Step d'Euler pour les translations.
 
-        Returns:
-            prev_sample (`torch.FloatTensor`): (B, 3) tensor, denoised translations.
+        Intégration d'Euler : x_{t-1} = x_t + Δσ * v
+        Comme Δσ < 0 (σ décroît), on avance vers le signal (GT) en soustrayant du bruit.
         """
         prev_sample = sample + delta_sigma * vec_field
         if self.config.get("stochastic_paths"):
+            # Bruit stochastique (Langevin dynamics) : √(-Δσ) car Δσ < 0
             prev_sample += (
                 self.config.get("stochastic_level")
                 * torch.sqrt(-delta_sigma)
@@ -290,22 +366,25 @@ class SE3FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
     def _step_for_rotation(
         self,
-        vec_field: torch.FloatTensor,
-        delta_sigma: torch.FloatTensor,
-        sample: torch.FloatTensor,
+        vec_field: torch.FloatTensor,    # (B, 3) — axis-angle prédit (champ rotatif)
+        delta_sigma: torch.FloatTensor,  # (B,)   — Δσ (négatif)
+        sample: torch.FloatTensor,       # (B, 4) — quaternion actuel
     ) -> torch.FloatTensor:
         """
-        Args:
-            vec_field (`torch.FloatTensor`): (B, 3) tensor, rotation vector field.
-            delta_sigma (`torch.FloatTensor`): (B) tensor.
-            sample (`torch.FloatTensor`): (B, 4) tensor, sample rotations, scalar first quaternions.
+        Step d'Euler pour les rotations sur SO(3).
+
+        Intégration géodésique : R_{t-1} = exp(Δσ * ω) @ R_t
+        Comme Δσ < 0, exp(Δσ * ω) est une rotation dans la direction INVERSE du bruit,
+        ce qui ramène progressivement la rotation vers la GT.
 
         Returns:
-            prev_sample (`torch.FloatTensor`): (B, 4) tensor, denoised rotations, scalar first quaternions.
+            Quaternion scalar-first de la rotation mise à jour [B, 4]
         """
-        prev_sample = p3dt.axis_angle_to_matrix(
-            delta_sigma * vec_field
-        ) @ p3dt.quaternion_to_matrix(sample)
+        # Convertit le step en matrice de rotation et compose avec la rotation actuelle
+        prev_sample = (
+            p3dt.axis_angle_to_matrix(delta_sigma * vec_field)
+            @ p3dt.quaternion_to_matrix(sample)
+        )
         if self.config.get("stochastic_paths"):
             z = (
                 self.config.get("stochastic_level")
@@ -319,51 +398,56 @@ class SE3FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
     def step(
         self,
-        model_output: torch.FloatTensor,
+        model_output: torch.FloatTensor,       # (B, 6) — sortie du denoiser [Δtrans | axis-angle]
         timestep: Union[float, torch.FloatTensor],
-        sample: torch.FloatTensor,
+        sample: torch.FloatTensor,             # (B, 7) — pose actuelle [trans | quat]
     ) -> SE3FlowMatchEulerDiscreteSchedulerOutput:
         """
+        Effectue UN step d'intégration d'Euler pour l'inference.
+
+        À chaque step :
+          1. Calcule Δσ = σ_{t-1} - σ_t  (négatif : on va de plus de bruit vers moins)
+          2. Met à jour la translation : x_{t-1} = x_t + Δσ * v_trans
+          3. Met à jour la rotation    : R_{t-1} = exp(Δσ * ω) @ R_t
+          4. Incrémente le compteur de steps
+
         Args:
-            model_output (`torch.FloatTensor`):
-                The model output. Should be a tuple of (trans_vec_field, rot_vec_field), each of shape (B, 3).
-            timestep (`Union[float, torch.FloatTensor]`):
-                The current timestep.
-            sample (`torch.FloatTensor`):
-                The sample for the current timestep of shape (B, 7).
-                First 3 elements are translation
-                Last 4 elements are quaternion, scalar first.
+            model_output : champ vectoriel prédit par le modèle (B, 6)
+                           [:3] = translation field, [3:] = rotation axis-angle
+            timestep     : timestep courant
+            sample       : pose actuelle (B, 7)
 
         Returns:
-            `torch.FloatTensor`:
-                The denoised sample.
+            SE3FlowMatchEulerDiscreteSchedulerOutput avec prev_sample = pose mise à jour (B, 7)
         """
         if self.step_index is None:
             self._init_step_index(timestep)
 
-        # Avoid precision issues
+        # Assure la précision float32 pour éviter des erreurs numériques
         sample = sample.to(torch.float32)
-        # sigma_next - sigma < 0
-        sigma = self.sigmas[self.step_index]
-        sigma_next = self.sigmas[self.step_index + 1]
-        delta_sigma = sigma_next - sigma
 
+        # σ_t et σ_{t-1} depuis la table des sigmas
+        sigma = self.sigmas[self.step_index]           # σ actuel
+        sigma_next = self.sigmas[self.step_index + 1]  # σ suivant (plus petit)
+        delta_sigma = sigma_next - sigma               # Δσ < 0
+
+        # Step Euler pour translations et rotations séparément
         prev_sample_trans = self._step_for_translation(
-            model_output[..., :3],
+            model_output[..., :3],   # champ vectoriel de translation
             delta_sigma,
-            sample[..., :3],
+            sample[..., :3],         # translation actuelle
         )
-
         prev_sample_rot = self._step_for_rotation(
-            model_output[..., 3:],
+            model_output[..., 3:],   # axis-angle du champ rotatif
             delta_sigma,
-            sample[..., 3:],
+            sample[..., 3:],         # quaternion actuel
         )
 
+        # Concatène translation et rotation mise à jour
         prev_sample = torch.cat([prev_sample_trans, prev_sample_rot], dim=-1)
-        prev_sample = prev_sample.to(model_output.dtype)
+        prev_sample = prev_sample.to(model_output.dtype)  # revient au dtype d'origine (fp16)
 
-        # upon completion increase step index by one
+        # Avance au timestep suivant
         self._step_index += 1
 
         return SE3FlowMatchEulerDiscreteSchedulerOutput(prev_sample=prev_sample)
@@ -373,8 +457,20 @@ class SE3FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
 
 """
-Following are adapted from puzzlefusion++
+=====================================================================
+Ce qui suit est adapté de puzzlefusion++
 https://github.com/eric-zqwang/puzzlefusion-plusplus
+
+Les classes SE3PiecewiseScheduler et SE3DDPMScheduler sont des variantes
+basées sur la DIFFUSION DDPM classique (non utilisées par défaut dans GARF).
+
+Différence principale avec le Flow Matching :
+  DDPM prédit le BRUIT ajouté à chaque step et doit l'enlever progressivement
+  Flow Matching prédit le CHAMP VECTORIEL qui pointe vers la solution
+
+DDPM sur SO(3) nécessite de travailler dans l'espace de Lie algebra (axis-angle = log(R))
+pour interpoler les rotations, puis d'utiliser exp() pour revenir dans SO(3).
+=====================================================================
 """
 
 
@@ -384,44 +480,34 @@ def betas_for_alpha_bar(
     alpha_transform_type="piece_wise",
 ):
     """
-    Create a beta schedule that discretizes the given alpha_t_bar function, which defines the cumulative product of
-    (1-beta) over time from t = [0,1].
+    Génère un schedule de betas pour la diffusion DDPM.
 
-    Contains a function alpha_bar that takes an argument t and transforms it to the cumulative product of (1-beta) up
-    to that part of the diffusion process.
+    alpha_bar(t) = produit cumulatif de (1 - beta_t)
+    → contrôle la quantité de signal restante au temps t
 
-
-    Args:
-        num_diffusion_timesteps (`int`): the number of betas to produce.
-        max_beta (`float`): the maximum beta to use; use values lower than 1 to
-                     prevent singularities.
-        alpha_transform_type (`str`, *optional*, default to `cosine`): the type of noise schedule for alpha_bar.
-                     Choose from `cosine` or `exp`
-
-    Returns:
-        betas (`np.ndarray`): the betas used by the scheduler to step the model outputs
+    Trois formes supportées :
+      - cosine     : schedule cosinus standard (Ho et al. 2020 amélioré)
+      - exp        : exponentiel
+      - piece_wise : quadratique par morceaux (utilisé ici)
+                     resemble au piecewise-linear du flow matching
     """
     if alpha_transform_type == "cosine":
-
         def alpha_bar_fn(t):
             return math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2
 
     elif alpha_transform_type == "exp":
-
         def alpha_bar_fn(t):
             return math.exp(t * -12.0)
 
     elif alpha_transform_type == "piece_wise":
-
         def alpha_bar_fn(t):
             t = t * 1000
             if t <= 700:
-                # Quadratic decrease from 1 to 0.9 between x = 0 to 700
+                # Quadratique lent : alpha_bar va de 1 à 0.9 sur les premiers 70%
                 return 1 - 0.1 * (t / 700) ** 2
             else:
-                # Quadratic decrease from 0.9 to 0 between x = 700 to 1000
+                # Quadratique rapide : alpha_bar va de 0.9 à 0 sur les derniers 30%
                 return 0.9 * (1 - ((t - 700) / 300) ** 2)
-
     else:
         raise ValueError(f"Unsupported alpha_tranform_type: {alpha_transform_type}")
 
@@ -434,33 +520,44 @@ def betas_for_alpha_bar(
 
 
 class PiecewiseScheduler(DDPMScheduler):
+    """DDPM Scheduler avec un schedule de betas quadratique par morceaux."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
         self.betas = betas_for_alpha_bar(alpha_transform_type="piece_wise")
-
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
 
 
 class SE3PiecewiseScheduler(PiecewiseScheduler):
+    """
+    DDPM Scheduler adapté pour SE(3) avec schedule piecewise.
+
+    Surcharge add_noise et step pour gérer les rotations SO(3) via log/exp maps.
+    Utilise so3_log_map pour passer dans l'algèbre de Lie (espace tangent),
+    fait les calculs DDPM classiques, puis so3_exp_map pour revenir dans SO(3).
+    """
     def add_noise(
         self,
-        original_samples: torch.Tensor,  # (B, 7) trans+quat
-        noise: torch.Tensor,  # (B, 6)
+        original_samples: torch.Tensor,  # (B, 7) — pose GT [trans | quat]
+        noise: torch.Tensor,              # (B, 6) — bruit [trans_noise(3) | rot_noise(3)]
         timesteps: torch.Tensor,
     ):
+        """
+        Processus forward DDPM : x_t = sqrt(alpha_bar) * x_0 + sqrt(1-alpha_bar) * noise
+
+        Pour les rotations : on travaille dans l'espace axis-angle (log de la rotation)
+          log_rot = so3_log_map(R)  ∈ R³
+          noisy_log_rot = sqrt(α) * log_rot + sqrt(1-α) * rot_noise
+          R_noisy = so3_exp_map(noisy_log_rot)
+        """
         translations = original_samples[:, :3]
         quaternions = original_samples[:, 3:]
         rot_matrics = p3dt.quaternion_to_matrix(quaternions)
-        log_rot = p3dt.so3_log_map(rot_matrics)  # (B, 3)
+        log_rot = p3dt.so3_log_map(rot_matrics)  # (B, 3) — dans l'espace de Lie algebra
 
         trans_noise = noise[:, :3]
         rot_noise = noise[:, 3:]
 
-        # Make sure alphas_cumprod and timestep have same device and dtype as original_samples
-        # Move the self.alphas_cumprod to device to avoid redundant CPU to GPU data movement
-        # for the subsequent add_noise calls
         self.alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device)
         alphas_cumprod = self.alphas_cumprod.to(dtype=original_samples.dtype)
         timesteps = timesteps.to(original_samples.device)
@@ -475,63 +572,37 @@ class SE3PiecewiseScheduler(PiecewiseScheduler):
         while len(sqrt_one_minus_alpha_prod.shape) < len(original_samples.shape):
             sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
 
-        noisy_translations = (
-            sqrt_alpha_prod * translations + sqrt_one_minus_alpha_prod * trans_noise
-        )
-        noisy_log_rot = (
-            sqrt_alpha_prod * log_rot + sqrt_one_minus_alpha_prod * rot_noise
-        )
+        # DDPM classique sur translations
+        noisy_translations = sqrt_alpha_prod * translations + sqrt_one_minus_alpha_prod * trans_noise
+        # DDPM dans l'espace de Lie pour les rotations
+        noisy_log_rot = sqrt_alpha_prod * log_rot + sqrt_one_minus_alpha_prod * rot_noise
+        # Retour dans SO(3) via exp map
         noisy_rot_matrics = p3dt.so3_exp_map(noisy_log_rot)
         noisy_quaternions = p3dt.matrix_to_quaternion(noisy_rot_matrics)
 
         noisy_samples = torch.cat([noisy_translations, noisy_quaternions], dim=1)
         return noisy_samples
 
-    def step(
-        self,
-        model_output: torch.Tensor,
-        timestep: torch.Tensor,
-        sample: torch.Tensor,
-        generator=None,
-        return_dict=True,
-    ):
+    def step(self, model_output, timestep, sample, generator=None, return_dict=True):
         """
-        Predict the sample from the previous timestep by reversing the SDE. This function propagates the diffusion
-        process from the learned model outputs (most often the predicted noise).
+        Step de dénoising DDPM (processus inverse).
 
-        Args:
-            model_output (`torch.Tensor`):
-                The direct output from learned diffusion model.
-            timestep (`float`):
-                The current discrete timestep in the diffusion chain.
-            sample (`torch.Tensor`):
-                A current instance of a sample created by the diffusion process.
-            generator (`torch.Generator`, *optional*):
-                A random number generator.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`~schedulers.scheduling_ddpm.DDPMSchedulerOutput`] or `tuple`.
+        Formule DDPM inverse :
+          x_{t-1} = (sqrt(alpha_{t-1}) * beta_t / (1-alpha_t)) * x_0_pred
+                  + (sqrt(alpha_t) * (1-alpha_{t-1}) / (1-alpha_t)) * x_t
+                  + variance * epsilon
 
-        Returns:
-            [`~schedulers.scheduling_ddpm.DDPMSchedulerOutput`] or `tuple`:
-                If return_dict is `True`, [`~schedulers.scheduling_ddpm.DDPMSchedulerOutput`] is returned, otherwise a
-                tuple is returned where the first element is the sample tensor.
-
+        Pour les rotations : calculs dans l'espace log, puis conversion finale.
         """
         t = timestep
-
         prev_t = self.previous_timestep(t)
 
-        if model_output.shape[1] == sample.shape[1] * 2 and self.variance_type in [
-            "learned",
-            "learned_range",
-        ]:
-            model_output, predicted_variance = torch.split(
-                model_output, sample.shape[1], dim=1
-            )
+        if model_output.shape[1] == sample.shape[1] * 2 and self.variance_type in ["learned", "learned_range"]:
+            model_output, predicted_variance = torch.split(model_output, sample.shape[1], dim=1)
         else:
             predicted_variance = None
 
-        # 1. compute alphas, betas
+        # Calcul des coefficients alpha/beta
         alpha_prod_t = self.alphas_cumprod[t]
         alpha_prod_t_prev = self.alphas_cumprod[prev_t] if prev_t >= 0 else self.one
         beta_prod_t = 1 - alpha_prod_t
@@ -539,116 +610,77 @@ class SE3PiecewiseScheduler(PiecewiseScheduler):
         current_alpha_t = alpha_prod_t / alpha_prod_t_prev
         current_beta_t = 1 - current_alpha_t
 
-        # 2. compute predicted original sample from predicted noise also called
-        # "predicted x_0" of formula (15) from https://arxiv.org/pdf/2006.11239.pdf
         translations = sample[:, :3]
         quaternions = sample[:, 3:]
         rot_matrics = p3dt.quaternion_to_matrix(quaternions)
-        log_rot = p3dt.so3_log_map(rot_matrics)  # (B, 3)
+        log_rot = p3dt.so3_log_map(rot_matrics)  # espace de Lie
 
         if self.config.prediction_type == "epsilon":
-            pred_trans = (
-                translations - beta_prod_t**0.5 * model_output[:, :3]
-            ) / alpha_prod_t**0.5
-            pred_log_rot = (
-                log_rot - beta_prod_t**0.5 * model_output[:, 3:6]
-            ) / alpha_prod_t**0.5
+            # Le modèle prédit le bruit → on déduit x_0
+            pred_trans = (translations - beta_prod_t**0.5 * model_output[:, :3]) / alpha_prod_t**0.5
+            pred_log_rot = (log_rot - beta_prod_t**0.5 * model_output[:, 3:6]) / alpha_prod_t**0.5
         elif self.config.prediction_type == "sample":
+            # Le modèle prédit x_0 directement
             pred_trans = model_output[:, :3]
             pred_log_rot = model_output[:, 3:6]
         elif self.config.prediction_type == "v_prediction":
-            pred_trans = (alpha_prod_t**0.5) * translations - (
-                beta_prod_t**0.5
-            ) * model_output[:, :3]
-            pred_log_rot = (alpha_prod_t**0.5) * log_rot - (
-                beta_prod_t**0.5
-            ) * model_output[:, 3:6]
+            # Prédiction "velocity" (mélange bruit et signal)
+            pred_trans = (alpha_prod_t**0.5) * translations - (beta_prod_t**0.5) * model_output[:, :3]
+            pred_log_rot = (alpha_prod_t**0.5) * log_rot - (beta_prod_t**0.5) * model_output[:, 3:6]
         else:
-            raise ValueError(
-                f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample` or"
-                " `v_prediction`  for the DDPMScheduler."
-            )
+            raise ValueError(f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample` or `v_prediction`")
 
-        # 3. Compute coefficients for pred_original_sample x_0 and current sample x_t
-        # See formula (7) from https://arxiv.org/pdf/2006.11239.pdf
+        # Coefficients pour la moyenne de x_{t-1}
         pred_trans_coeff = (alpha_prod_t_prev**0.5 * current_beta_t) / beta_prod_t
         current_trans_coeff = current_alpha_t**0.5 * beta_prod_t_prev / beta_prod_t
-
         pred_log_rot_coeff = (alpha_prod_t_prev**0.5 * current_beta_t) / beta_prod_t
         current_log_rot_coeff = current_alpha_t**0.5 * beta_prod_t_prev / beta_prod_t
 
-        # 5. Compute predicted previous sample µ_t
-        # See formula (7) from https://arxiv.org/pdf/2006.11239.pdf
-        pred_prev_trans = (
-            pred_trans_coeff * pred_trans + current_trans_coeff * translations
-        )
-        pred_prev_log_rot = (
-            pred_log_rot_coeff * pred_log_rot + current_log_rot_coeff * log_rot
-        )
+        # Moyenne de la distribution p(x_{t-1} | x_t)
+        pred_prev_trans = pred_trans_coeff * pred_trans + current_trans_coeff * translations
+        pred_prev_log_rot = pred_log_rot_coeff * pred_log_rot + current_log_rot_coeff * log_rot
 
-        # 6. Add noise
+        # Ajout du bruit stochastique (sauf au dernier step t=0)
         variance = torch.zeros_like(model_output)
         if t > 0:
             device = model_output.device
-            variance_noise = torch.randn(
-                model_output.shape,
-                generator=generator,
-                device=device,
-                dtype=model_output.dtype,
-            )
+            variance_noise = torch.randn(model_output.shape, generator=generator, device=device, dtype=model_output.dtype)
             if self.variance_type == "fixed_small_log":
-                variance = (
-                    self._get_variance(t, predicted_variance=predicted_variance)
-                    * variance_noise
-                )
+                variance = self._get_variance(t, predicted_variance=predicted_variance) * variance_noise
             elif self.variance_type == "learned_range":
                 variance = self._get_variance(t, predicted_variance=predicted_variance)
                 variance = torch.exp(0.5 * variance) * variance_noise
             else:
-                variance = (
-                    self._get_variance(t, predicted_variance=predicted_variance) ** 0.5
-                ) * variance_noise
+                variance = (self._get_variance(t, predicted_variance=predicted_variance) ** 0.5) * variance_noise
 
         pred_prev_trans = pred_prev_trans + variance[:, :3]
         pred_prev_log_rot = pred_prev_log_rot + variance[:, 3:6]
 
+        # Retour dans SO(3) via exp map
         pred_prev_rot_matrices = p3dt.so3_exp_map(pred_prev_log_rot)
         pred_prev_quaternions = p3dt.matrix_to_quaternion(pred_prev_rot_matrices)
-
-        pred_prev_sample = torch.cat(
-            [
-                pred_prev_trans,
-                pred_prev_quaternions,
-            ],
-            dim=1,
-        )
+        pred_prev_sample = torch.cat([pred_prev_trans, pred_prev_quaternions], dim=1)
 
         if not return_dict:
             return (pred_prev_sample,)
-
-        return DDPMSchedulerOutput(
-            prev_sample=pred_prev_sample,
-        )
+        return DDPMSchedulerOutput(prev_sample=pred_prev_sample)
 
 
 class SE3DDPMScheduler(DDPMScheduler):
-    def add_noise(
-        self,
-        original_samples: torch.Tensor,  # (B, 7) trans+quat
-        noise: torch.Tensor,  # (B, 6)
-        timesteps: torch.Tensor,
-    ):
+    """
+    DDPM Scheduler adapté pour SE(3) avec schedule cosinus standard.
+    Identique à SE3PiecewiseScheduler mais avec le schedule de betas par défaut de DDPM.
+    """
+    def add_noise(self, original_samples, noise, timesteps):
+        """Même logique que SE3PiecewiseScheduler.add_noise (log map pour SO(3))."""
         translations = original_samples[:, :3]
         quaternions = original_samples[:, 3:]
         rot_matrics = p3dt.quaternion_to_matrix(quaternions)
-        log_rot = p3dt.so3_log_map(rot_matrics)  # (B, 3)
+        log_rot = p3dt.so3_log_map(rot_matrics)
 
         trans_noise = noise[:, :3]
         rot_noise = noise[:, 3:]
 
-        # Make sure alphas_cumprod and timestep have same device and dtype as original_samples
-        # Move the self.alphas_cumprod to device to avoid redundant CPU to GPU data movement
-        # for the subsequent add_noise calls
         self.alphas_cumprod = self.alphas_cumprod.to(device=original_samples.device)
         alphas_cumprod = self.alphas_cumprod.to(dtype=original_samples.dtype)
         timesteps = timesteps.to(original_samples.device)
@@ -663,63 +695,24 @@ class SE3DDPMScheduler(DDPMScheduler):
         while len(sqrt_one_minus_alpha_prod.shape) < len(original_samples.shape):
             sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
 
-        noisy_translations = (
-            sqrt_alpha_prod * translations + sqrt_one_minus_alpha_prod * trans_noise
-        )
-        noisy_log_rot = (
-            sqrt_alpha_prod * log_rot + sqrt_one_minus_alpha_prod * rot_noise
-        )
+        noisy_translations = sqrt_alpha_prod * translations + sqrt_one_minus_alpha_prod * trans_noise
+        noisy_log_rot = sqrt_alpha_prod * log_rot + sqrt_one_minus_alpha_prod * rot_noise
         noisy_rot_matrics = p3dt.so3_exp_map(noisy_log_rot)
         noisy_quaternions = p3dt.matrix_to_quaternion(noisy_rot_matrics)
 
         noisy_samples = torch.cat([noisy_translations, noisy_quaternions], dim=1)
         return noisy_samples
 
-    def step(
-        self,
-        model_output: torch.Tensor,
-        timestep: torch.Tensor,
-        sample: torch.Tensor,
-        generator=None,
-        return_dict=True,
-    ):
-        """
-        Predict the sample from the previous timestep by reversing the SDE. This function propagates the diffusion
-        process from the learned model outputs (most often the predicted noise).
-
-        Args:
-            model_output (`torch.Tensor`):
-                The direct output from learned diffusion model.
-            timestep (`float`):
-                The current discrete timestep in the diffusion chain.
-            sample (`torch.Tensor`):
-                A current instance of a sample created by the diffusion process.
-            generator (`torch.Generator`, *optional*):
-                A random number generator.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`~schedulers.scheduling_ddpm.DDPMSchedulerOutput`] or `tuple`.
-
-        Returns:
-            [`~schedulers.scheduling_ddpm.DDPMSchedulerOutput`] or `tuple`:
-                If return_dict is `True`, [`~schedulers.scheduling_ddpm.DDPMSchedulerOutput`] is returned, otherwise a
-                tuple is returned where the first element is the sample tensor.
-
-        """
+    def step(self, model_output, timestep, sample, generator=None, return_dict=True):
+        """Même logique que SE3PiecewiseScheduler.step."""
         t = timestep
-
         prev_t = self.previous_timestep(t)
 
-        if model_output.shape[1] == sample.shape[1] * 2 and self.variance_type in [
-            "learned",
-            "learned_range",
-        ]:
-            model_output, predicted_variance = torch.split(
-                model_output, sample.shape[1], dim=1
-            )
+        if model_output.shape[1] == sample.shape[1] * 2 and self.variance_type in ["learned", "learned_range"]:
+            model_output, predicted_variance = torch.split(model_output, sample.shape[1], dim=1)
         else:
             predicted_variance = None
 
-        # 1. compute alphas, betas
         alpha_prod_t = self.alphas_cumprod[t]
         alpha_prod_t_prev = self.alphas_cumprod[prev_t] if prev_t >= 0 else self.one
         beta_prod_t = 1 - alpha_prod_t
@@ -727,98 +720,56 @@ class SE3DDPMScheduler(DDPMScheduler):
         current_alpha_t = alpha_prod_t / alpha_prod_t_prev
         current_beta_t = 1 - current_alpha_t
 
-        # 2. compute predicted original sample from predicted noise also called
-        # "predicted x_0" of formula (15) from https://arxiv.org/pdf/2006.11239.pdf
         translations = sample[:, :3]
         quaternions = sample[:, 3:]
         rot_matrics = p3dt.quaternion_to_matrix(quaternions)
-        log_rot = p3dt.so3_log_map(rot_matrics)  # (B, 3)
+        log_rot = p3dt.so3_log_map(rot_matrics)
 
         if self.config.prediction_type == "epsilon":
-            pred_trans = (
-                translations - beta_prod_t**0.5 * model_output[:, :3]
-            ) / alpha_prod_t**0.5
-            pred_log_rot = (
-                log_rot - beta_prod_t**0.5 * model_output[:, 3:6]
-            ) / alpha_prod_t**0.5
+            pred_trans = (translations - beta_prod_t**0.5 * model_output[:, :3]) / alpha_prod_t**0.5
+            pred_log_rot = (log_rot - beta_prod_t**0.5 * model_output[:, 3:6]) / alpha_prod_t**0.5
         elif self.config.prediction_type == "sample":
             pred_trans = model_output[:, :3]
             pred_log_rot = model_output[:, 3:6]
         elif self.config.prediction_type == "v_prediction":
-            pred_trans = (alpha_prod_t**0.5) * translations - (
-                beta_prod_t**0.5
-            ) * model_output[:, :3]
-            pred_log_rot = (alpha_prod_t**0.5) * log_rot - (
-                beta_prod_t**0.5
-            ) * model_output[:, 3:6]
+            pred_trans = (alpha_prod_t**0.5) * translations - (beta_prod_t**0.5) * model_output[:, :3]
+            pred_log_rot = (alpha_prod_t**0.5) * log_rot - (beta_prod_t**0.5) * model_output[:, 3:6]
         else:
-            raise ValueError(
-                f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample` or"
-                " `v_prediction`  for the DDPMScheduler."
-            )
+            raise ValueError(f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample` or `v_prediction`")
 
-        # 3. Compute coefficients for pred_original_sample x_0 and current sample x_t
-        # See formula (7) from https://arxiv.org/pdf/2006.11239.pdf
         pred_trans_coeff = (alpha_prod_t_prev**0.5 * current_beta_t) / beta_prod_t
         current_trans_coeff = current_alpha_t**0.5 * beta_prod_t_prev / beta_prod_t
-
         pred_log_rot_coeff = (alpha_prod_t_prev**0.5 * current_beta_t) / beta_prod_t
         current_log_rot_coeff = current_alpha_t**0.5 * beta_prod_t_prev / beta_prod_t
 
-        # 5. Compute predicted previous sample µ_t
-        # See formula (7) from https://arxiv.org/pdf/2006.11239.pdf
-        pred_prev_trans = (
-            pred_trans_coeff * pred_trans + current_trans_coeff * translations
-        )
-        pred_prev_log_rot = (
-            pred_log_rot_coeff * pred_log_rot + current_log_rot_coeff * log_rot
-        )
+        pred_prev_trans = pred_trans_coeff * pred_trans + current_trans_coeff * translations
+        pred_prev_log_rot = pred_log_rot_coeff * pred_log_rot + current_log_rot_coeff * log_rot
 
-        # 6. Add noise
         variance = torch.zeros_like(model_output)
         if t > 0:
             device = model_output.device
-            variance_noise = torch.randn(
-                model_output.shape,
-                generator=generator,
-                device=device,
-                dtype=model_output.dtype,
-            )
+            variance_noise = torch.randn(model_output.shape, generator=generator, device=device, dtype=model_output.dtype)
             if self.variance_type == "fixed_small_log":
-                variance = (
-                    self._get_variance(t, predicted_variance=predicted_variance)
-                    * variance_noise
-                )
+                variance = self._get_variance(t, predicted_variance=predicted_variance) * variance_noise
             elif self.variance_type == "learned_range":
                 variance = self._get_variance(t, predicted_variance=predicted_variance)
                 variance = torch.exp(0.5 * variance) * variance_noise
             else:
-                variance = (
-                    self._get_variance(t, predicted_variance=predicted_variance) ** 0.5
-                ) * variance_noise
+                variance = (self._get_variance(t, predicted_variance=predicted_variance) ** 0.5) * variance_noise
 
         pred_prev_trans = pred_prev_trans + variance[:, :3]
         pred_prev_log_rot = pred_prev_log_rot + variance[:, 3:6]
 
         pred_prev_rot_matrices = p3dt.so3_exp_map(pred_prev_log_rot)
         pred_prev_quaternions = p3dt.matrix_to_quaternion(pred_prev_rot_matrices)
-
-        pred_prev_sample = torch.cat(
-            [
-                pred_prev_trans,
-                pred_prev_quaternions,
-            ],
-            dim=1,
-        )
+        pred_prev_sample = torch.cat([pred_prev_trans, pred_prev_quaternions], dim=1)
 
         if not return_dict:
             return (pred_prev_sample,)
-
-        return DDPMSchedulerOutput(
-            prev_sample=pred_prev_sample,
-        )
+        return DDPMSchedulerOutput(prev_sample=pred_prev_sample)
 
 
 if __name__ == "__main__":
+    # Test rapide : affiche les sigmas du scheduler linéaire
     scheduler = SE3FlowMatchEulerDiscreteScheduler()
     print(scheduler.sigmas)
