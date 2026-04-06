@@ -185,9 +185,16 @@ class HybridFracSeg(pl.LightningModule):
         """
         out_dict = {}
 
-        pointclouds: torch.Tensor = batch["pointclouds"]          # (B, N, 3)
-        normals: torch.Tensor = batch["pointclouds_normals"]       # (B, N, 3)
+        pointclouds: torch.Tensor = batch["pointclouds"]
+        normals: torch.Tensor = batch["pointclouds_normals"]
         points_per_part: torch.Tensor = batch["points_per_part"]   # (B, P)
+
+        # Uniform sampler returns (B, P, N, 3); weighted sampler returns (B, N, 3).
+        # Reshape to (B, N_total, 3) so the rest of the forward is format-agnostic.
+        if pointclouds.dim() == 4:
+            B, P_dim, N_per_part, C = pointclouds.shape
+            pointclouds = pointclouds.reshape(B, P_dim * N_per_part, C)
+            normals = normals.reshape(B, P_dim * N_per_part, C)
 
         valid_pcs = points_per_part != 0                           # (B, P)
 
@@ -248,7 +255,8 @@ class HybridFracSeg(pl.LightningModule):
 
         with torch.no_grad():
             if "fracture_surface_gt" in batch:
-                out_dict["coarse_seg_gt"] = batch["fracture_surface_gt"].view(-1)
+                # uniform: (B, P, N) → flatten; weighted: (B, N) → flatten
+                out_dict["coarse_seg_gt"] = batch["fracture_surface_gt"].reshape(-1)
 
             # Teacher forcing during training (same strategy as FracSeg)
             if self.training and out_dict.get("coarse_seg_gt") is not None:
