@@ -1,0 +1,24 @@
+# configs/experiment/eval_frac_seg.yaml
+# --------------------------------------
+# Eval config for baseline FracSeg segmentation.
+#
+# Usage — from a standalone FracSeg checkpoint:
+#   python eval.py experiment=eval_frac_seg \
+#       data.data_root=/path/to/breaking_bad_vol.hdf5 \
+#       ckpt_path=/path/to/frac_seg.ckpt
+#
+# Usage — from a full GARF checkpoint (extracts feature_extractor weights):
+#   python eval_segmentation.py \
+#       data.data_root=/path/to/breaking_bad_vol.hdf5 \
+#       ckpt_path=/path/to/GARF_mini.ckpt \
+#       model_type=baseline
+
+# @package _global_
+
+defaults:
+  - override /model: frac_seg
+
+experiment_name: eval_frac_seg
+
+data:
+  batch_size: 1

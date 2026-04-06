@@ -1,0 +1,47 @@
+# configs/model/hybrid_frac_seg.yaml
+# ------------------------------------
+# Hybrid fracture segmentation model config.
+# Extends FracSeg with explicit geometric features fused after the PTv3 encoder.
+# PTv3 encoder is IDENTICAL to the baseline (same in_channels=6, same architecture).
+
+defaults:
+  - encoder: ptv3  # reuse the exact same PTv3 config as baseline
+
+_target_: assembly.models.hybrid_segmentation_model.HybridFracSeg
+
+# ---- Encoder output dimension (must match encoder.dec_channels[0]) ----
+pc_feat_dim: 64
+
+# ---- Optimizer (same as baseline FracSeg) ----
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 1e-4
+  weight_decay: 1e-5
+
+lr_scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingWarmRestarts
+  _partial_: true
+  T_0: 100
+
+seg_warmup_epochs: 10
+grid_size: 0.02
+
+# ---- Geometric feature settings ----
+# k-NN neighborhood size for local PCA. Larger k = smoother estimates but slower.
+# 16 is a good trade-off for point clouds of ~5000 points per fragment.
+geo_k: 16
+
+# Which geometric descriptors to include.
+# Ablation protocol:
+#   normals only             → use_normals=true,  use_curvature=false, use_roughness=false
+#   normals + curvature      → use_normals=true,  use_curvature=true,  use_roughness=false
+#   normals + curvature + roughness → all true (default, full hybrid)
+use_normals: true
+use_curvature: true
+use_roughness: true
+
+# ---- Fusion MLP head ----
+# Hidden dim of the MLP that fuses PTv3 features + geometric features.
+# Keep small: the geometric features are low-dim and the MLP should stay lightweight.
+fusion_hidden_dim: 32

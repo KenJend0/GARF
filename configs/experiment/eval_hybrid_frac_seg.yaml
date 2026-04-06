@@ -1,0 +1,19 @@
+# configs/experiment/eval_hybrid_frac_seg.yaml
+# ---------------------------------------------
+# Eval config for the hybrid segmentation model.
+#
+# Usage:
+#   python eval_segmentation.py \
+#       data.data_root=/path/to/breaking_bad_vol.hdf5 \
+#       ckpt_path=/path/to/hybrid_checkpoint.ckpt \
+#       model_type=hybrid
+
+# @package _global_
+
+defaults:
+  - override /model: hybrid_frac_seg
+
+experiment_name: eval_hybrid_frac_seg
+
+data:
+  batch_size: 1

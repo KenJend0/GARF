@@ -1,0 +1,27 @@
+# configs/experiment/hybrid_frac_seg.yaml
+# ----------------------------------------
+# Experiment config for the hybrid fracture segmentation variant.
+# Run with:
+#   python train_hybrid_segmentation.py data.data_root=/path/to/breaking_bad_vol.hdf5
+# Or equivalently via train.py:
+#   python train.py experiment=hybrid_frac_seg data.data_root=/path/to/breaking_bad_vol.hdf5
+
+# @package _global_
+
+defaults:
+  - override /model: hybrid_frac_seg
+
+experiment_name: hybrid_frac_seg
+
+tags: ["hybrid", "segmentation", "geometric_features"]
+
+trainer:
+  max_epochs: 500   # same budget as baseline for fair comparison
+
+data:
+  batch_size: 64    # same as baseline pretraining_frac_seg
+
+# Override geometric feature ablation from command line:
+#   model.use_curvature=false   → normals only
+#   model.use_roughness=false   → normals + curvature
+#   (default)                   → full hybrid (normals + curvature + roughness)
