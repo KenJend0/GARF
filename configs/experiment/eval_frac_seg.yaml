@@ -1,3 +1,4 @@
+# @package _global_
 # configs/experiment/eval_frac_seg.yaml
 # --------------------------------------
 # Eval config for baseline FracSeg segmentation.

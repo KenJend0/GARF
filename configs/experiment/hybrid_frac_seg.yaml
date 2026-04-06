@@ -1,12 +1,5 @@
-# configs/experiment/hybrid_frac_seg.yaml
-# ----------------------------------------
-# Experiment config for the hybrid fracture segmentation variant.
-# Run with:
-#   python train_hybrid_segmentation.py data.data_root=/path/to/breaking_bad_vol.hdf5
-# Or equivalently via train.py:
-#   python train.py experiment=hybrid_frac_seg data.data_root=/path/to/breaking_bad_vol.hdf5
-
 # @package _global_
+# configs/experiment/hybrid_frac_seg.yaml
 
 defaults:
   - override /model: hybrid_frac_seg
