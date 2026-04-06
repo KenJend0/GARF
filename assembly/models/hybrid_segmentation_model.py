@@ -189,33 +189,52 @@ class HybridFracSeg(pl.LightningModule):
         normals: torch.Tensor = batch["pointclouds_normals"]
         points_per_part: torch.Tensor = batch["points_per_part"]   # (B, P)
 
-        # Uniform sampler returns (B, P, N, 3); weighted sampler returns (B, N, 3).
-        # Reshape to (B, N_total, 3) so the rest of the forward is format-agnostic.
-        if pointclouds.dim() == 4:
-            B, P_dim, N_per_part, C = pointclouds.shape
-            pointclouds = pointclouds.reshape(B, P_dim * N_per_part, C)
-            normals = normals.reshape(B, P_dim * N_per_part, C)
-
-        valid_pcs = points_per_part != 0                           # (B, P)
-
-        B, N, C = pointclouds.shape
-        _, P = points_per_part.shape
-
-        points_per_part_offset = torch.cumsum(points_per_part, dim=-1)  # (B, P)
+        valid_pcs = points_per_part != 0    # (B, P)
+        B, P = points_per_part.shape
 
         with torch.no_grad():
             valid_graph = valid_pcs.unsqueeze(2) & valid_pcs.unsqueeze(1)
-            valid_graph = valid_graph & ~torch.eye(
-                valid_graph.shape[1], device=valid_graph.device
-            ).bool()
+            valid_graph = valid_graph & ~torch.eye(P, device=valid_pcs.device).bool()
             out_dict["valid_graph"] = valid_graph
             out_dict["graph_gt"] = batch["graph"]
 
-        # Flatten to (B*N, 3)  — same as FracSeg
-        part_pcds = pointclouds.view(-1, C)
-        part_normals = normals.view(-1, C)
+        # ------------------------------------------------------------------
+        # Build flat (N_sum_valid, 3) tensors that PTv3 expects.
+        #
+        # Uniform sampler  → pointclouds: (B, P, N_per, 3)
+        #   padding fragments have points_per_part == 0 but still occupy space
+        #   in the tensor → must filter them out before passing to PTv3.
+        #
+        # Weighted sampler → pointclouds: (B, N_total, 3)
+        #   N_total = sum of valid fragment counts; no padding points in tensor.
+        # ------------------------------------------------------------------
+        if pointclouds.dim() == 4:
+            # Uniform: (B, P, N_per, 3) — filter out padding fragments
+            _B, _P, N_per, C = pointclouds.shape
+            valid_flat = valid_pcs.reshape(-1)              # (B*P,)
+            part_pcds = (
+                pointclouds.reshape(_B * _P, N_per, C)[valid_flat]
+                .reshape(-1, C)
+            )                                               # (N_sum_valid, 3)
+            part_normals = (
+                normals.reshape(_B * _P, N_per, C)[valid_flat]
+                .reshape(-1, C)
+            )
+            # GT labels: (B, P, N_per) → filter valid → (N_sum_valid,)
+            if "fracture_surface_gt" in batch:
+                gt = batch["fracture_surface_gt"]           # (B, P, N_per)
+                out_dict["coarse_seg_gt"] = (
+                    gt.reshape(_B * _P, N_per)[valid_flat].reshape(-1)
+                )
+        else:
+            # Weighted: (B, N_total, 3) — already flat, no padding points
+            C = pointclouds.shape[-1]
+            part_pcds = pointclouds.reshape(-1, C)          # (B*N_total, 3)
+            part_normals = normals.reshape(-1, C)
+            if "fracture_surface_gt" in batch:
+                out_dict["coarse_seg_gt"] = batch["fracture_surface_gt"].reshape(-1)
 
-        # Offset for valid parts only (for PTv3)
+        # Cumulative offset for PTv3 (valid parts only, same as FracSeg)
         points_offset = torch.cumsum(points_per_part[valid_pcs], dim=-1)
 
         # ---- PTv3 encoder (identical call to FracSeg) ----
@@ -224,11 +243,11 @@ class HybridFracSeg(pl.LightningModule):
                 {
                     "coord": part_pcds,
                     "offset": points_offset,
-                    "feat": torch.cat([part_pcds, part_normals], dim=-1),  # 6D input
+                    "feat": torch.cat([part_pcds, part_normals], dim=-1),  # 6D
                     "grid_size": torch.tensor(self.grid_size).to(part_pcds.device),
                 }
             )
-            ptv3_feat = point["feat"]   # (N_sum_valid, pc_feat_dim)
+            ptv3_feat = point["feat"]       # (N_sum_valid, pc_feat_dim)
 
         out_dict["point"] = point
         out_dict["point"]["normal"] = part_normals
@@ -237,39 +256,24 @@ class HybridFracSeg(pl.LightningModule):
         # ---- Geometric features (no gradient) ----
         geo_feat = self._compute_geo_features(
             part_pcds, part_normals, points_per_part, valid_pcs
-        )   # (N_sum_valid, geo_dim) — same ordering as ptv3_feat
-
-        # Cast geo_feat to match ptv3_feat dtype (ptv3 may output float16 inside autocast)
+        )                                   # (N_sum_valid, geo_dim)
         geo_feat = geo_feat.to(dtype=ptv3_feat.dtype)
 
         # ---- Fusion: concatenate and predict ----
-        fused = torch.cat([ptv3_feat, geo_feat], dim=-1)   # (N_sum_valid, fused_dim)
-        # seg_head operates in float32 (BatchNorm is sensitive to float16)
-        fused = fused.float()
-        logits = self.seg_head(fused).squeeze(-1)           # (N_sum_valid,)
+        fused = torch.cat([ptv3_feat, geo_feat], dim=-1).float()  # (N_sum_valid, fused_dim)
+        logits = self.seg_head(fused).squeeze(-1)                  # (N_sum_valid,)
         coarse_seg_pred = torch.sigmoid(logits)
         coarse_seg_pred_binary = coarse_seg_pred > 0.5
 
         out_dict["coarse_seg_pred"] = coarse_seg_pred
         out_dict["coarse_seg_pred_binary"] = coarse_seg_pred_binary
 
+        # coarse_seg: GT during training (teacher forcing), pred during val/test
         with torch.no_grad():
-            if "fracture_surface_gt" in batch:
-                # uniform: (B, P, N) → flatten; weighted: (B, N) → flatten
-                out_dict["coarse_seg_gt"] = batch["fracture_surface_gt"].reshape(-1)
-
-            # Teacher forcing during training (same strategy as FracSeg)
             if self.training and out_dict.get("coarse_seg_gt") is not None:
                 out_dict["coarse_seg"] = out_dict["coarse_seg_gt"]
             else:
-                out_dict["coarse_seg"] = out_dict["coarse_seg_pred_binary"]
-
-            fracture_surface_points_per_part = torch_scatter.segment_csr(
-                src=out_dict["coarse_seg"].view(B, N).float(),
-                indptr=F.pad(points_per_part_offset, (1, 0)),
-                reduce="sum",
-            ).view(B, P)
-            out_dict["fracture_surface_points_per_part"] = fracture_surface_points_per_part
+                out_dict["coarse_seg"] = coarse_seg_pred_binary
 
         return out_dict
 
