@@ -12,7 +12,9 @@ trainer:
   max_epochs: 500   # same budget as baseline for fair comparison
 
 data:
-  batch_size: 64    # same as baseline pretraining_frac_seg
+  batch_size: 64         # same as baseline pretraining_frac_seg
+  sample_method: uniform # required: weighted sampler produces variable-size tensors
+                         # that can't be batched with the default collate_fn
 
 # Override geometric feature ablation from command line:
 #   model.use_curvature=false   → normals only
