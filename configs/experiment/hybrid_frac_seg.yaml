@@ -8,6 +8,11 @@ experiment_name: hybrid_frac_seg
 
 tags: ["hybrid", "segmentation", "geometric_features"]
 
+# Optional: path to a baseline FracSeg/denoiser checkpoint for encoder warm-start.
+# Keys are remapped automatically: feature_extractor.encoder.* → encoder.*
+# Leave null to train from scratch.
+encoder_ckpt_path: null
+
 trainer:
   max_epochs: 500   # same budget as baseline for fair comparison
 
