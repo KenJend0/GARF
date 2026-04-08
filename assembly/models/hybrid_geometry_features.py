@@ -87,7 +87,11 @@ def _local_pca(points: torch.Tensor, idx: torch.Tensor):
     cov = centered.transpose(1, 2) @ centered / max(k - 1, 1)
 
     # torch.linalg.eigh: eigenvalues ascending, eigenvectors as columns
-    eigenvalues, eigenvectors = torch.linalg.eigh(cov)  # (N,3), (N,3,3)
+    # eigh does not support float16 on CUDA — upcast temporarily
+    orig_dtype = cov.dtype
+    eigenvalues, eigenvectors = torch.linalg.eigh(cov.float())  # (N,3), (N,3,3)
+    eigenvalues = eigenvalues.to(orig_dtype)
+    eigenvectors = eigenvectors.to(orig_dtype)
 
     # Flip to descending order (conventional: λ_0 = largest variance)
     eigenvalues = eigenvalues.flip(-1)
