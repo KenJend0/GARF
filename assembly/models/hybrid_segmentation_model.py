@@ -237,6 +237,12 @@ class HybridFracSeg(pl.LightningModule):
         # Cumulative offset for PTv3 (valid parts only, same as FracSeg)
         points_offset = torch.cumsum(points_per_part[valid_pcs], dim=-1)
 
+        # ---- Geometric features (no gradient) — computed BEFORE PTv3 ----
+        # Computing here avoids overlap with PTv3 activations kept for backprop.
+        geo_feat = self._compute_geo_features(
+            part_pcds, part_normals, points_per_part, valid_pcs
+        )                                   # (N_sum_valid, geo_dim)
+
         # ---- PTv3 encoder (identical call to FracSeg) ----
         with torch.autocast(device_type="cuda", dtype=torch.float16):
             super_point, point = self.encoder(
@@ -253,10 +259,6 @@ class HybridFracSeg(pl.LightningModule):
         out_dict["point"]["normal"] = part_normals
         out_dict["super_point"] = super_point
 
-        # ---- Geometric features (no gradient) ----
-        geo_feat = self._compute_geo_features(
-            part_pcds, part_normals, points_per_part, valid_pcs
-        )                                   # (N_sum_valid, geo_dim)
         geo_feat = geo_feat.to(dtype=ptv3_feat.dtype)
 
         # ---- Fusion: concatenate and predict ----
