@@ -60,7 +60,7 @@ def main(cfg: DictConfig):
     # Encoder-only warm-start: remap feature_extractor.encoder.* → encoder.*
     # Useful when starting from a baseline FracSeg or denoiser checkpoint.
     if cfg.get("encoder_ckpt_path"):
-        raw = torch.load(cfg.get("encoder_ckpt_path"), map_location="cpu")
+        raw = torch.load(cfg.get("encoder_ckpt_path"), map_location="cpu", weights_only=False)
         raw_state = raw.get("state_dict", raw)
         encoder_state = {
             k.replace("feature_extractor.encoder.", "encoder."): v
