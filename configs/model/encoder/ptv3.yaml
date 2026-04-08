@@ -39,4 +39,4 @@ dec_channels:
   - ${...pc_feat_dim}
   - 128
   - 128
-enable_flash: true
+enable_flash: false
