@@ -57,6 +57,25 @@ def main(cfg: DictConfig):
         model.load_state_dict(state_dict)
         model.enable_lora()
 
+    # Encoder-only warm-start: remap feature_extractor.encoder.* → encoder.*
+    # Useful when starting from a baseline FracSeg or denoiser checkpoint.
+    if cfg.get("encoder_ckpt_path"):
+        raw = torch.load(cfg.get("encoder_ckpt_path"), map_location="cpu")
+        raw_state = raw.get("state_dict", raw)
+        encoder_state = {
+            k.replace("feature_extractor.encoder.", "encoder."): v
+            for k, v in raw_state.items()
+            if k.startswith("feature_extractor.encoder.")
+        }
+        if not encoder_state:
+            # Fallback: try keys that already start with "encoder."
+            encoder_state = {k: v for k, v in raw_state.items() if k.startswith("encoder.")}
+        missing, unexpected = model.load_state_dict(encoder_state, strict=False)
+        encoder_loaded = len(encoder_state)
+        print(f"[warm-start] Loaded {encoder_loaded} encoder tensors (strict=False)")
+        print(f"[warm-start] Missing ({len(missing)}): {missing[:3]}{'...' if len(missing) > 3 else ''}")
+        print(f"[warm-start] Unexpected ({len(unexpected)}): {unexpected[:3]}{'...' if len(unexpected) > 3 else ''}")
+
     trainer: L.Trainer = hydra.utils.instantiate(
         cfg.get("trainer"), callbacks=callbacks, logger=loggers
     )
