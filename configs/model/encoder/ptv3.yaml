@@ -14,10 +14,10 @@ enc_num_head:
   - 8
   - 16
 enc_patch_size:
-  - 1024
-  - 1024
-  - 1024
-  - 1024
+  - 256
+  - 256
+  - 256
+  - 256
 enc_channels: 
   - 32
   - 64
@@ -32,9 +32,9 @@ dec_num_head:
   - 8
   - 16
 dec_patch_size:
-  - 1024
-  - 1024
-  - 1024
+  - 256
+  - 256
+  - 256
 dec_channels:
   - ${...pc_feat_dim}
   - 128
