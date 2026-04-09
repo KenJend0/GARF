@@ -1,0 +1,33 @@
+# @package _global_
+# configs/experiment/cnn_step4_bilinear.yaml
+#
+# Step 4 — + bilinear projection.
+# Cumulative: normals + splatting (step 3) + bilinear (this step).
+# Only new change: use_bilinear = true.
+#
+# Hypothesis: floor rounding maps each 3D point to a single pixel, causing
+# quantization noise. Bilinear projection distributes each point to its 4
+# surrounding pixels with continuous weights — reducing discretization
+# artifacts and providing partial differentiability through the weight values.
+#
+# Note on differentiability: gradient flows through bilinear weights (which
+# depend on continuous sub-pixel coordinates) but NOT through index selection
+# (which uses .long()). The projection is therefore partially, not fully,
+# differentiable. This is disclosed in the comment: "improves continuity, but
+# projection is still partially discretized."
+#
+# Note on interaction with splatting: bilinear already smooths slightly, so
+# splatting on top may over-smooth. Add model.splat_sigma=0 to test bilinear
+# alone if needed.
+
+defaults:
+  - cnn_ablation_shared
+  - _self_
+
+experiment_name: cnn_step4_bilinear
+tags: ["cnn", "ablation", "step4", "bilinear"]
+
+model:
+  use_normals: true
+  splat_sigma: 1.5
+  use_bilinear: true         # ← only new change vs step 3

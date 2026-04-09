@@ -1,0 +1,40 @@
+# configs/model/cnn_segmentation.yaml
+# Default model config for CNNFracSeg.
+# ALL ablation features are OFF by default.
+# This ensures that the model in its default state equals the Step-1 baseline.
+# Each step experiment config turns exactly one flag on.
+
+_target_: assembly.models.cnn_segmentation_model.CNNFracSeg
+
+# ---------- Optimizer ----------
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 1e-4
+  weight_decay: 1e-5
+
+lr_scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingWarmRestarts
+  _partial_: true
+  T_0: 100
+
+# ---------- Projection ----------
+num_views: 3          # 1=front only | 2=front+side | 3=front+side+top
+resolution: 128       # image H = W
+
+# ---------- Step 1: baseline only (all off) ----------
+use_bilinear: false       # false=floor assignment | true=bilinear 4-corner
+use_normals: false        # false=2-ch (depth+occ) | true=5-ch (+nx+ny+nz)
+splat_sigma: 0            # 0=no splatting; >0 enables Gaussian blur in pixels
+splat_kernel: 5           # kernel size for Gaussian splat
+
+# ---------- CNN backbone ----------
+base_ch: 16               # channel widths: 16->32->64 for num_blocks=3
+num_blocks: 3             # encoder depth (2=shallow ablation)
+
+# ---------- Step 5: global context (off by default) ----------
+use_global_context: false
+
+# ---------- Step 6: view attention (off by default) ----------
+use_view_attn: false
+view_attn_hidden: 16

@@ -1,0 +1,25 @@
+# @package _global_
+# configs/experiment/cnn_step3_splatting.yaml
+#
+# Step 3 — + Gaussian splatting.
+# Cumulative: normals (step 2) + splatting (this step).
+# Only new change: splat_sigma = 1.5 (kernel 5x5 Gaussian blur after projection).
+#
+# Hypothesis: sparse rasterization (~0.3 pts/pixel at 128x128) leaves most
+# pixels empty. Splatting densifies the signal, giving the CNN more area to
+# learn from. RISK: blur may smooth thin fracture edges → watch precision/recall
+# separately (F1 alone may miss a precision drop).
+#
+# Ablation within this step:
+#   splat_sigma=0 vs 1.5  (disable by overriding model.splat_sigma=0)
+
+defaults:
+  - cnn_ablation_shared
+  - _self_
+
+experiment_name: cnn_step3_splatting
+tags: ["cnn", "ablation", "step3", "splatting"]
+
+model:
+  use_normals: true
+  splat_sigma: 1.5           # ← only new change vs step 2

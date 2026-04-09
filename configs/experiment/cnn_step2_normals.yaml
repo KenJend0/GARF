@@ -1,0 +1,20 @@
+# @package _global_
+# configs/experiment/cnn_step2_normals.yaml
+#
+# Step 2 — + normal channels.
+# Only change vs step 1: use_normals = true.
+# CNN input changes from 2-ch (depth + occupancy) to 5-ch (+ nx, ny, nz).
+#
+# Hypothesis: surface normals encode fracture-surface geometry directly —
+# fracture faces have sharp normal discontinuities while intact surfaces are
+# smooth. This should be the largest single improvement in the ablation.
+
+defaults:
+  - cnn_ablation_shared
+  - _self_
+
+experiment_name: cnn_step2_normals
+tags: ["cnn", "ablation", "step2", "normals"]
+
+model:
+  use_normals: true          # ← only change vs step 1

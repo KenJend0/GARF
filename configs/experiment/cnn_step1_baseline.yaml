@@ -1,0 +1,19 @@
+# @package _global_
+# configs/experiment/cnn_step1_baseline.yaml
+#
+# Step 1 — pure baseline.
+# Floor projection, depth+occupancy channels only (2-ch), no Gaussian splat,
+# no global context, no view attention.
+#
+# This is the reference point: the simplest CNN pipeline that is directly
+# comparable to the GARF FracSeg baseline. Every subsequent step adds exactly
+# one improvement; the delta vs step 1 is the isolated contribution.
+
+defaults:
+  - cnn_ablation_shared
+  - _self_
+
+experiment_name: cnn_step1_baseline
+tags: ["cnn", "ablation", "step1", "baseline"]
+
+# No model overrides — all features remain off (from cnn_ablation_shared).

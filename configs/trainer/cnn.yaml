@@ -1,0 +1,18 @@
+# configs/trainer/cnn.yaml
+# Single-GPU fp32 trainer for CNN ablation runs.
+# Fully explicit — no inheritance from trainer/default.yaml.
+#
+# precision: 32  — avoids mixed-precision numerical differences between runs.
+#   (The GARF baseline uses torch.autocast manually inside its forward; the CNN
+#    model does not, so keeping both at fp32 gives a fair metric comparison.)
+# num_nodes: 1   — ablations are single-GPU; no distributed training needed.
+
+_target_: lightning.pytorch.trainer.Trainer
+accelerator: auto
+devices: 1
+strategy: auto
+default_root_dir: ./output/${experiment_name}
+num_nodes: 1
+precision: 32
+max_epochs: 500
+accumulate_grad_batches: 1

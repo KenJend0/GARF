@@ -1,0 +1,35 @@
+# @package _global_
+# configs/experiment/cnn_step6_attention.yaml
+#
+# Step 6 — + learned view attention (full pipeline).
+# Cumulative: all previous steps + view attention (this step).
+# Only new change: use_view_attn = true.
+#
+# Mechanism: after context injection, each fragment's post-context bottleneck
+# is global-average-pooled per view and passed through a small MLP
+# (Linear->ReLU->Linear->softmax) to produce per-view importance weights.
+# These weights replace uniform mean fusion in backprojection.
+#
+# Hypothesis: different fragment shapes make different views more informative.
+# The model should learn, e.g., that the top view is more useful for flat
+# fragments. A null result (no improvement over step 5) is also a valid
+# finding — it would mean uniform fusion is already sufficient, and the
+# extra MLP overfits or contributes nothing at this dataset scale.
+#
+# Diagnostic: log view_weights.mean(dim=0) periodically to check whether
+# the attention actually differentiates views or collapses to uniform weights.
+
+defaults:
+  - cnn_ablation_shared
+  - _self_
+
+experiment_name: cnn_step6_attention
+tags: ["cnn", "ablation", "step6", "attention"]
+
+model:
+  use_normals: true
+  splat_sigma: 1.5
+  use_bilinear: true
+  use_global_context: true
+  use_view_attn: true        # ← only new change vs step 5
+  view_attn_hidden: 16

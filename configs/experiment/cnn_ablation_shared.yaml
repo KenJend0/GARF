@@ -1,0 +1,53 @@
+# @package _global_
+# configs/experiment/cnn_ablation_shared.yaml
+#
+# SINGLE SOURCE OF TRUTH for all CNN ablation runs.
+# DO NOT run this config directly — use cnn_step1_baseline through cnn_step6_attention.
+#
+# Every controlled variable that must be identical across all six steps lives here:
+#   seed, trainer, logger, dataset params, model defaults.
+# Each step config only overrides the one new flag it introduces.
+
+defaults:
+  - override /model: cnn_segmentation
+  - override /trainer: cnn
+  - override /loggers: csv_cnn   # logs land in ./output/ — matches trainer default_root_dir
+
+# Seed: same as GARF baseline (train.yaml uses 1116) for fair comparison.
+# For multi-seed runs, pass seed=42 or seed=2024 from the CLI —
+# run_cnn_ablations.sh appends _seed{N} to the experiment_name automatically.
+seed: 1116
+
+# ---------- Dataset ----------
+# All parameters are explicit (not inherited) to prevent silent changes
+# if the breaking_bad.yaml defaults are ever modified.
+data:
+  batch_size: 32
+  sample_method: uniform       # required: bilinear backprojection assumes uniform num_pts
+  num_points_to_sample: 5000
+  categories: ["everyday"]
+  min_parts: 2
+  max_parts: 20
+  min_points_per_part: 20
+  num_removal: 0
+  num_redundancy: 0
+  num_workers: 4
+  multi_ref: false
+  mesh_sample_strategy: poisson
+  random_anchor: false
+
+# ---------- Model defaults (all features off — mirror of cnn_segmentation.yaml) ----------
+# Listed explicitly here so it is unambiguous which flags are controlled.
+# Each step config overrides only its one new flag.
+model:
+  num_views: 3
+  resolution: 128
+  use_bilinear: false
+  use_normals: false
+  splat_sigma: 0
+  splat_kernel: 5
+  base_ch: 16
+  num_blocks: 3
+  use_global_context: false
+  use_view_attn: false
+  view_attn_hidden: 16
