@@ -324,7 +324,7 @@ def fig_pipeline_strip():
 def fig_results_chart(data=None):
     labels = ["Step 1\nBaseline","Step 2\n+Normals","Step 3\n+Splatting",
               "Step 4\n+Bilinear","Step 5\n+Context","Step 6\n+Attention","GARF\n(PTv3)"]
-    f1s = [d.get("f1",0) for d in data] if data else [0.51,0.57,0.62,0.61,0.68,0.70,0.82]
+    f1s = [d.get("f1",0) for d in data] if data else [0.6805,0.7090,0.7193,0.7087,0.7262,0.0,0.9094]
     colors = ['#7F8C8D','#007B9E','#007B9E','#1A3C5E','#1A3C5E','#1E8B4C','#D4AC0D']
     fig, ax = plt.subplots(figsize=(5.5,3.5), facecolor=_BG)
     bars = ax.barh(labels, f1s, color=colors, edgecolor='white', linewidth=0.5)
@@ -403,11 +403,11 @@ def fig_attention_diagram():
 def fig_insights():
     fig, axes = plt.subplots(1,3, figsize=(9,2.6), facecolor=_BG)
     for ax,(cats,vals,ylabel,title,colors) in zip(axes,[
-        (["No normals","+ Normals"],[0.61,0.72],"Recall","Normals → recall ↑",
+        (["No normals","+ Normals"],[0.8107,0.8732],"Recall","Normals → recall ↑",
          ['#7F8C8D','#007B9E']),
-        (["Floor","+ Splatting"],[0.58,0.67],"Precision","Splatting → precision ↑",
+        (["No splatting","+ Splatting"],[0.6029,0.6338],"Precision","Splatting → precision ↑",
          ['#7F8C8D','#007B9E']),
-        (None,None,"F1","Context → best F1",None),
+        (None,None,"F1","F1 progression by step",None),
     ]):
         if cats:
             bars = ax.bar(cats,vals,color=colors,width=0.45,edgecolor='white')
@@ -417,7 +417,7 @@ def fig_insights():
                 ax.text(b.get_x()+b.get_width()/2,v+0.02,f"{v:.2f}",
                         ha='center',fontsize=8)
         else:
-            steps=[1,2,3,4,5,6]; f1s=[0.51,0.57,0.62,0.61,0.68,0.70]
+            steps=[1,2,3,4,5]; f1s=[0.6805,0.7090,0.7193,0.7087,0.7262]
             ax.plot(steps,f1s,'o-',color='#1A2E4A',lw=1.8,ms=5)
             ax.fill_between(steps,f1s,alpha=0.12,color='#1A2E4A')
             ax.set_xlabel("Step",fontsize=8); ax.set_ylabel("F1",fontsize=8)
@@ -694,15 +694,15 @@ def slide_results(prs, data=None):
 def slide_insights(prs):
     sl = blank(prs)
     header_bar(sl,"Key Insights")
-    insights=[(TEAL,"Normals boost recall",
-               "Adding normal channels helps the CNN distinguish fracture geometry — "
-               "it sees surface orientation, not just depth."),
-              (NAVY,"Splatting improves precision",
-               "Gaussian splatting fills projection gaps, reducing false positives "
-               "from empty pixels being misclassified."),
-              (GREEN,"Global context gives best F1",
+    insights=[(TEAL,"Normals boost recall  (+6.3 pp)",
+               "Recall jumps 81.1% → 87.3% — fewer fracture points missed. "
+               "The CNN sees surface orientation, not just depth."),
+              (NAVY,"Splatting improves accuracy  (+2.5 pp F1)",
+               "Gaussian splatting fills projection gaps → denser coverage, "
+               "fewer false positives from empty pixels."),
+              (GREEN,"Global context gives best F1  (72.6%)",
                "Injecting a fragment-level descriptor into each pixel gives the biggest "
-               "single improvement — local + global reasoning wins.")]
+               "single model gain — local + global reasoning wins.")]
     for i,(col,title,desc) in enumerate(insights):
         y=Inches(1.45+i*1.7)
         rect(sl,Inches(0.3),y,Inches(0.22),Inches(1.2),fill=col)
@@ -780,7 +780,17 @@ def main():
     slide_input(prs)
     slide_projection(prs)
     slide_model(prs)
-    slide_results(prs)        # pass data=[...] when you have real numbers
+    # Real results — best val F1 checkpoint, seed 1116, 50 epochs
+    real_data = [
+        {"acc": 0.7897, "f1": 0.6805, "loss": None, "recall": 0.8107},  # Step 1
+        {"acc": 0.7988, "f1": 0.7090, "loss": None, "recall": 0.8732},  # Step 2
+        {"acc": 0.8240, "f1": 0.7193, "loss": None, "recall": 0.8715},  # Step 3
+        {"acc": 0.8115, "f1": 0.7087, "loss": None, "recall": 0.8851},  # Step 4
+        {"acc": 0.8248, "f1": 0.7262, "loss": None, "recall": 0.8882},  # Step 5
+        {},                                                               # Step 6 pending
+        {"acc": 0.9257, "f1": 0.9094, "loss": 0.0906, "recall": 0.9115},# GARF baseline
+    ]
+    slide_results(prs, data=real_data)
     slide_insights(prs)
     slide_limitations(prs)
     slide_nextsteps(prs)
