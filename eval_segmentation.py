@@ -101,7 +101,8 @@ def _extract_frac_seg_weights(garf_ckpt_path: str, out_path: str) -> None:
         )
 
     print(f"[eval_segmentation] Extracted {len(frac_seg_state)} parameter tensors.")
-    torch.save({"state_dict": frac_seg_state}, out_path)
+    import lightning as L
+    torch.save({"state_dict": frac_seg_state, "pytorch-lightning_version": L.__version__}, out_path)
 
 
 @hydra.main(version_base="1.3", config_path="./configs", config_name="eval")
