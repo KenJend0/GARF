@@ -659,7 +659,9 @@ def slide_results(prs, data=None):
           ("Step 5","+ Context","context"),("Step 6","+ Attention","attention"),
           ("Base","GARF (PTv3)","full 3D")]
     def v(i,k):
-        return f"{data[i][k]:.3f}" if data and i<len(data) and k in data[i] else "??.???"
+        if data and i<len(data) and k in data[i] and data[i][k] is not None:
+            return f"{data[i][k]:.3f}"
+        return "—"
     col_x=[Inches(0.2),Inches(1.0),Inches(3.1),Inches(5.3),
            Inches(6.7),Inches(8.1),Inches(9.5)]
     col_w=[Inches(0.78),Inches(2.05),Inches(2.15),Inches(1.35),
