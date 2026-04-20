@@ -6,26 +6,28 @@
 # Results land in ./output/cnn_step{1..6}_*/
 #
 # Usage:
-#   bash scripts/run_cnn_ablations.sh /path/to/breaking_bad_vol.hdf5 [SEED]
+#   bash scripts/run_cnn_ablations.sh /path/to/breaking_bad_vol.hdf5 [SEED] [BATCH_SIZE] [MAX_EPOCHS]
 #
-#   SEED is optional (default: 1116, same as GARF baseline).
-#   When provided, experiment_name gets a _seed{N} suffix so runs are kept separate.
+#   SEED        optional (default: 1116, same as GARF baseline)
+#   BATCH_SIZE  optional (default: 32; reduce to 4-8 if GPU VRAM is limited)
+#   MAX_EPOCHS  optional (default: 500; reduce to 50 for quick ablation)
 #
 # Examples:
-#   # Single seed (default):
+#   # Full run (default):
 #   bash scripts/run_cnn_ablations.sh /data/breaking_bad_vol.hdf5
 #
-#   # Multi-seed replication:
-#   bash scripts/run_cnn_ablations.sh /data/breaking_bad_vol.hdf5 42
-#   bash scripts/run_cnn_ablations.sh /data/breaking_bad_vol.hdf5 2024
+#   # Hardware-constrained run (50 epochs, batch 4):
+#   bash scripts/run_cnn_ablations.sh /data/breaking_bad_vol.hdf5 1116 4 50
 #
-#   # Then collect results across seeds:
-#   python scripts/collect_cnn_results.py --seeds 1116 42 2024
+#   # Multi-seed replication:
+#   bash scripts/run_cnn_ablations.sh /data/breaking_bad_vol.hdf5 42 32 500
 
 set -e   # stop immediately on any failure — avoids silently broken later steps
 
 DATA_ROOT="${1:?Error: provide path to breaking_bad_vol.hdf5 as first argument}"
 SEED="${2:-1116}"
+BATCH_SIZE="${3:-32}"
+MAX_EPOCHS="${4:-500}"
 
 STEPS=(
     cnn_step1_baseline
@@ -46,14 +48,16 @@ for STEP in "${STEPS[@]}"; do
     fi
 
     echo "========================================================"
-    echo "Running: ${EXP_NAME}  (seed=${SEED})"
+    echo "Running: ${EXP_NAME}  (seed=${SEED}, batch=${BATCH_SIZE}, epochs=${MAX_EPOCHS})"
     echo "========================================================"
 
     python train_cnn_segmentation.py \
         experiment="${STEP}" \
         data.data_root="${DATA_ROOT}" \
         seed="${SEED}" \
-        experiment_name="${EXP_NAME}"
+        experiment_name="${EXP_NAME}" \
+        data.batch_size="${BATCH_SIZE}" \
+        trainer.max_epochs="${MAX_EPOCHS}"
 done
 
 echo ""

@@ -33,6 +33,7 @@ import glob
 import os
 import sys
 from collections import defaultdict
+from typing import Optional
 
 
 STEPS = [
@@ -94,14 +95,14 @@ def find_csv_files(step_name: str, seed: int) -> list:
     return sorted(glob.glob(pattern))
 
 
-def safe_float(row: dict, key: str) -> float | None:
+def safe_float(row: dict, key: str) -> Optional[float]:
     try:
         return float(row[key])
     except (KeyError, ValueError):
         return None
 
 
-def avg_rows(rows_list: list, metric: str) -> float | None:
+def avg_rows(rows_list: list, metric: str) -> Optional[float]:
     """Average a metric value across multiple best-row dicts. Returns None if all missing."""
     vals = []
     for row in rows_list:

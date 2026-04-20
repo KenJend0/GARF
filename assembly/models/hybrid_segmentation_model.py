@@ -43,7 +43,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import lightning as pl
 import torchmetrics
-import torch_scatter
 
 from assembly.models.pretraining.loss import dice_loss
 from assembly.models.hybrid_geometry_features import HybridGeometryFeatures

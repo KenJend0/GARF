@@ -6,3 +6,4 @@ default_root_dir: ./output/${experiment_name}
 num_nodes: 4
 precision: 16-mixed
 max_epochs: 500
+accumulate_grad_batches: 1
