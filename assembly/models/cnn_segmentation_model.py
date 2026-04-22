@@ -188,6 +188,91 @@ class SimpleCNNBackbone(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# U-Net backbone (skip connections encoder → decoder)
+# ---------------------------------------------------------------------------
+
+class UNetBackbone(nn.Module):
+    """
+    U-Net style encoder-decoder with skip connections.
+
+    Architecture (default: base_ch=16, depth=4):
+      Encoder:
+        Level 0 : Conv(in_ch →  16) ×2  → MaxPool/2   [skip_0: (B, 16,  H,   W  )]
+        Level 1 : Conv(16    →  32) ×2  → MaxPool/2   [skip_1: (B, 32,  H/2, W/2)]
+        Level 2 : Conv(32    →  64) ×2  → MaxPool/2   [skip_2: (B, 64,  H/4, W/4)]
+        Bottleneck: Conv(64  → 128) ×2               [(B, 128, H/8, W/8)]
+
+      Decoder (each level: upsample × concat(skip) × Conv ×2):
+        Level 2 : up → cat(skip_2) → Conv(128+64→64)  ×2
+        Level 1 : up → cat(skip_1) → Conv(64+32 →32)  ×2
+        Level 0 : up → cat(skip_0) → Conv(32+16 →16)  ×2
+        Head    : Conv(16→1, 1×1)  → logits
+
+    btn_ch exposed for compatibility with ViewAttention and context injection.
+    Context injection is applied at the bottleneck before decoding.
+    """
+
+    def __init__(self, in_ch: int = 2, base_ch: int = 16, depth: int = 4):
+        super().__init__()
+        self.depth = depth
+
+        # Build encoder channel sizes: [in_ch, base_ch, base_ch*2, ..., base_ch*2^(depth-1)]
+        enc_chs = [in_ch] + [base_ch * (2 ** i) for i in range(depth)]
+        self.btn_ch = enc_chs[-1]
+
+        # Encoder blocks
+        self.enc_blocks = nn.ModuleList([
+            nn.Sequential(
+                _ConvBnRelu(enc_chs[i], enc_chs[i + 1]),
+                _ConvBnRelu(enc_chs[i + 1], enc_chs[i + 1]),
+            )
+            for i in range(depth)
+        ])
+
+        # Context injection at bottleneck
+        self.context_proj = nn.Conv2d(
+            2 * self.btn_ch, self.btn_ch, kernel_size=1, bias=False
+        )
+
+        # Decoder blocks — input is concat(upsampled, skip)
+        dec_chs = list(reversed(enc_chs[1:]))   # [btn_ch, btn_ch/2, ..., base_ch]
+        self.dec_blocks = nn.ModuleList([
+            nn.Sequential(
+                _ConvBnRelu(dec_chs[i] + dec_chs[i + 1], dec_chs[i + 1]),
+                _ConvBnRelu(dec_chs[i + 1], dec_chs[i + 1]),
+            )
+            for i in range(depth - 1)
+        ])
+
+        self.head = nn.Conv2d(base_ch, 1, kernel_size=1)
+
+    def encode(self, x: torch.Tensor):
+        skips = []
+        for i, block in enumerate(self.enc_blocks):
+            x = block(x)
+            if i < self.depth - 1:
+                skips.append(x)
+                x = F.max_pool2d(x, kernel_size=2)
+        return x, skips   # bottleneck, list of skip tensors
+
+    def inject_context(self, bottleneck, context_spatial):
+        return self.context_proj(torch.cat([bottleneck, context_spatial], dim=1))
+
+    def decode(self, bottleneck: torch.Tensor, skips: list, output_hw: tuple):
+        x = bottleneck
+        for block, skip in zip(self.dec_blocks, reversed(skips)):
+            x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+            x = block(torch.cat([x, skip], dim=1))
+        x = F.interpolate(x, size=output_hw, mode="bilinear", align_corners=False)
+        return self.head(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        H, W = x.shape[-2], x.shape[-1]
+        bottleneck, skips = self.encode(x)
+        return self.decode(bottleneck, skips, (H, W))
+
+
+# ---------------------------------------------------------------------------
 # Main LightningModule
 # ---------------------------------------------------------------------------
 
@@ -218,6 +303,8 @@ class CNNFracSeg(pl.LightningModule):
         use_global_context : enable cross-fragment global reasoning
         use_view_attn      : enable learned view attention
         view_attn_hidden   : hidden dim of ViewAttention MLP
+        backbone           : "simple" (default) or "unet" (skip connections)
+        unet_depth         : encoder depth for UNetBackbone (default 4)
     """
 
     def __init__(
@@ -235,6 +322,8 @@ class CNNFracSeg(pl.LightningModule):
         use_global_context: bool = False,
         use_view_attn: bool = False,
         view_attn_hidden: int = 16,
+        backbone: str = "simple",
+        unet_depth: int = 4,
         **kwargs,
     ):
         super().__init__()
@@ -257,11 +346,18 @@ class CNNFracSeg(pl.LightningModule):
             use_bilinear=use_bilinear,
         )
 
-        self.cnn = SimpleCNNBackbone(
-            in_ch=self.projector.num_channels,
-            base_ch=base_ch,
-            num_blocks=num_blocks,
-        )
+        if backbone == "unet":
+            self.cnn = UNetBackbone(
+                in_ch=self.projector.num_channels,
+                base_ch=base_ch,
+                depth=unet_depth,
+            )
+        else:
+            self.cnn = SimpleCNNBackbone(
+                in_ch=self.projector.num_channels,
+                base_ch=base_ch,
+                num_blocks=num_blocks,
+            )
 
         if use_view_attn:
             self.view_attn = ViewAttention(
@@ -350,7 +446,11 @@ class CNNFracSeg(pl.LightningModule):
         C = self.projector.num_channels
 
         images_flat = images.view(K * V, C, H, W)
-        bottleneck  = self.cnn.encode(images_flat)   # (K*V, btn_ch, H', W')
+        enc_out = self.cnn.encode(images_flat)
+        if isinstance(enc_out, tuple):
+            bottleneck, _skips = enc_out   # UNet returns (bottleneck, skips)
+        else:
+            bottleneck, _skips = enc_out, None   # SimpleCNN returns bottleneck only
         btn_ch = bottleneck.shape[1]
         Hp, Wp = bottleneck.shape[2], bottleneck.shape[3]
 
@@ -402,7 +502,10 @@ class CNNFracSeg(pl.LightningModule):
             view_weights = self.view_attn(gap_ctx)                            # (K, V) softmax
 
         # 7. Decode → per-pixel logits → sigmoid → (K*V, 1, H, W)
-        logits_flat  = self.cnn.decode(bottleneck, (H, W))         # (K*V, 1, H, W)
+        if _skips is not None:
+            logits_flat = self.cnn.decode(bottleneck, _skips, (H, W))  # UNet
+        else:
+            logits_flat = self.cnn.decode(bottleneck, (H, W))          # SimpleCNN
         seg_flat     = torch.sigmoid(logits_flat).squeeze(1)       # (K*V, H, W)
         seg_per_frag = seg_flat.view(K, V, H, W)                   # (K, V, H, W)
 

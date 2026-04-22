@@ -1,0 +1,33 @@
+# @package _global_
+# configs/experiment/cnn_step7_unet.yaml
+#
+# Step 7 — U-Net backbone (skip connections).
+# Same full pipeline as Step 6 but replaces SimpleCNNBackbone with UNetBackbone.
+# Only new change: backbone = "unet".
+#
+# U-Net adds skip connections between encoder and decoder levels, giving the
+# decoder access to high-resolution features from the encoder. This improves
+# spatial localization — critical for fracture boundary precision.
+#
+# Hypothesis: skip connections improve precision at fracture boundaries,
+# reducing the precision gap vs GARF baseline.
+
+defaults:
+  - cnn_ablation_shared
+  - _self_
+
+experiment_name: cnn_step7_unet
+tags: ["cnn", "ablation", "step7", "unet"]
+
+trainer:
+  max_epochs: 100
+
+model:
+  use_normals: true
+  splat_sigma: 1.5
+  use_bilinear: true
+  use_global_context: true
+  use_view_attn: true
+  view_attn_hidden: 16
+  backbone: unet
+  unet_depth: 4
