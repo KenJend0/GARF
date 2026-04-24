@@ -49,6 +49,37 @@ STEPS = [
     ("cnn_step8c_feat_concat","Step 8c + FeatFuse(concat)"),
 ]
 
+# Hard-coded results for steps whose CSV output is no longer available.
+# Format: step_key → {"f1": {...}, "precision": {...}, "recall": {...}}
+# Each inner dict has keys matching VAL_METRICS.
+HARDCODED: dict[str, dict[str, dict]] = {
+    "cnn_step1_baseline": {
+        "f1":        {"val/coarse_seg_acc": 0.7897, "val/coarse_seg_f1": 0.6805, "val/coarse_seg_precision": 0.6029, "val/coarse_seg_recall": 0.8107},
+        "precision": {"val/coarse_seg_acc": 0.7897, "val/coarse_seg_f1": 0.6805, "val/coarse_seg_precision": 0.6029, "val/coarse_seg_recall": 0.8107},
+        "recall":    {"val/coarse_seg_acc": 0.5428, "val/coarse_seg_f1": 0.5207, "val/coarse_seg_precision": 0.3797, "val/coarse_seg_recall": 0.9165},
+    },
+    "cnn_step2_normals": {
+        "f1":        {"val/coarse_seg_acc": 0.7988, "val/coarse_seg_f1": 0.7090, "val/coarse_seg_precision": 0.6139, "val/coarse_seg_recall": 0.8732},
+        "precision": {"val/coarse_seg_acc": 0.7983, "val/coarse_seg_f1": 0.7000, "val/coarse_seg_precision": 0.6145, "val/coarse_seg_recall": 0.8484},
+        "recall":    {"val/coarse_seg_acc": 0.7528, "val/coarse_seg_f1": 0.6774, "val/coarse_seg_precision": 0.5575, "val/coarse_seg_recall": 0.9096},
+    },
+    "cnn_step3_splatting": {
+        "f1":        {"val/coarse_seg_acc": 0.8240, "val/coarse_seg_f1": 0.7193, "val/coarse_seg_precision": 0.6338, "val/coarse_seg_recall": 0.8715},
+        "precision": {"val/coarse_seg_acc": 0.8089, "val/coarse_seg_f1": 0.6846, "val/coarse_seg_precision": 0.6340, "val/coarse_seg_recall": 0.8001},
+        "recall":    {"val/coarse_seg_acc": 0.7954, "val/coarse_seg_f1": 0.7005, "val/coarse_seg_precision": 0.5892, "val/coarse_seg_recall": 0.9113},
+    },
+    "cnn_step4_bilinear": {
+        "f1":        {"val/coarse_seg_acc": 0.8242, "val/coarse_seg_f1": 0.7200, "val/coarse_seg_precision": 0.6306, "val/coarse_seg_recall": 0.8732},
+        "precision": {"val/coarse_seg_acc": 0.8300, "val/coarse_seg_f1": 0.7171, "val/coarse_seg_precision": 0.6438, "val/coarse_seg_recall": 0.8450},
+        "recall":    {"val/coarse_seg_acc": 0.7956, "val/coarse_seg_f1": 0.6981, "val/coarse_seg_precision": 0.5841, "val/coarse_seg_recall": 0.9115},
+    },
+    "cnn_step5_context": {
+        "f1":        {"val/coarse_seg_acc": 0.8447, "val/coarse_seg_f1": 0.7272, "val/coarse_seg_precision": 0.6742, "val/coarse_seg_recall": 0.8269},
+        "precision": {"val/coarse_seg_acc": 0.8386, "val/coarse_seg_f1": 0.6907, "val/coarse_seg_precision": 0.6869, "val/coarse_seg_recall": 0.7399},
+        "recall":    {"val/coarse_seg_acc": 0.8248, "val/coarse_seg_f1": 0.7262, "val/coarse_seg_precision": 0.6286, "val/coarse_seg_recall": 0.8882},
+    },
+}
+
 VAL_METRICS = [
     "val/coarse_seg_acc",
     "val/coarse_seg_f1",
@@ -134,9 +165,8 @@ def print_table(seeds: list, output_dir: str = "output"):
         print("  " + header)
         print("  " + sep)
 
-    # Best F1
-    print_block("Best val F1 epoch — Acc / F1 / Prec / Rec")
-    for step_key, step_label in STEPS:
+    def get_best_rows(step_key, seeds, metric):
+        """Return list of best-row dicts, falling back to HARDCODED if no CSV found."""
         rows_per_seed = []
         for seed in seeds:
             csvs = find_csv_files(step_key, seed, output_dir)
@@ -145,9 +175,21 @@ def print_table(seeds: list, output_dir: str = "output"):
             all_rows = []
             for p in csvs:
                 all_rows.extend(load_csv(p))
-            best = best_row_by(all_rows, "val/coarse_seg_f1")
+            best = best_row_by(all_rows, metric)
             if best:
                 rows_per_seed.append(best)
+
+        if not rows_per_seed and step_key in HARDCODED:
+            block = {"f1": "val/coarse_seg_f1", "precision": "val/coarse_seg_precision", "recall": "val/coarse_seg_recall"}
+            key = next(k for k, v in block.items() if v == metric)
+            rows_per_seed = [HARDCODED[step_key][key]]
+
+        return rows_per_seed
+
+    # Best F1
+    print_block("Best val F1 epoch — Acc / F1 / Prec / Rec")
+    for step_key, step_label in STEPS:
+        rows_per_seed = get_best_rows(step_key, seeds, "val/coarse_seg_f1")
 
         if not rows_per_seed:
             print(f"  {step_label:<{col_w}}  (no data — run train_cnn_segmentation.py first)")
@@ -156,51 +198,36 @@ def print_table(seeds: list, output_dir: str = "output"):
         vals = [format_val(avg_rows(rows_per_seed, m)) for m in VAL_METRICS]
         n_seeds = len(rows_per_seed)
         suffix = f"  (n={n_seeds} seeds)" if n_seeds > 1 else ""
-        print(f"  {step_label:<{col_w}}" + "".join(f"{v:>{metric_w}}" for v in vals) + suffix)
+        hardcoded_marker = " *" if step_key in HARDCODED and not find_csv_files(step_key, seeds[0], output_dir) else ""
+        print(f"  {step_label:<{col_w}}" + "".join(f"{v:>{metric_w}}" for v in vals) + hardcoded_marker + suffix)
 
     # Best Precision (isolated)
     print_block("Best val Precision epoch — Acc / F1 / Prec / Rec")
     for step_key, step_label in STEPS:
-        rows_per_seed = []
-        for seed in seeds:
-            csvs = find_csv_files(step_key, seed, output_dir)
-            if not csvs:
-                continue
-            all_rows = []
-            for p in csvs:
-                all_rows.extend(load_csv(p))
-            best = best_row_by(all_rows, "val/coarse_seg_precision")
-            if best:
-                rows_per_seed.append(best)
+        rows_per_seed = get_best_rows(step_key, seeds, "val/coarse_seg_precision")
 
         if not rows_per_seed:
             print(f"  {step_label:<{col_w}}  (no data)")
             continue
 
+        hardcoded_marker = " *" if step_key in HARDCODED and not find_csv_files(step_key, seeds[0], output_dir) else ""
         vals = [format_val(avg_rows(rows_per_seed, m)) for m in VAL_METRICS]
-        print(f"  {step_label:<{col_w}}" + "".join(f"{v:>{metric_w}}" for v in vals))
+        print(f"  {step_label:<{col_w}}" + "".join(f"{v:>{metric_w}}" for v in vals) + hardcoded_marker)
 
     # Best Recall (isolated)
     print_block("Best val Recall epoch — Acc / F1 / Prec / Rec")
     for step_key, step_label in STEPS:
-        rows_per_seed = []
-        for seed in seeds:
-            csvs = find_csv_files(step_key, seed, output_dir)
-            if not csvs:
-                continue
-            all_rows = []
-            for p in csvs:
-                all_rows.extend(load_csv(p))
-            best = best_row_by(all_rows, "val/coarse_seg_recall")
-            if best:
-                rows_per_seed.append(best)
+        rows_per_seed = get_best_rows(step_key, seeds, "val/coarse_seg_recall")
 
         if not rows_per_seed:
             print(f"  {step_label:<{col_w}}  (no data)")
             continue
 
+        hardcoded_marker = " *" if step_key in HARDCODED and not find_csv_files(step_key, seeds[0], output_dir) else ""
         vals = [format_val(avg_rows(rows_per_seed, m)) for m in VAL_METRICS]
-        print(f"  {step_label:<{col_w}}" + "".join(f"{v:>{metric_w}}" for v in vals))
+        print(f"  {step_label:<{col_w}}" + "".join(f"{v:>{metric_w}}" for v in vals) + hardcoded_marker)
+
+    print("  (* hard-coded from previous run)")
 
     print()
 
