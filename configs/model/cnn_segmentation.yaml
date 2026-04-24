@@ -38,3 +38,7 @@ use_global_context: false
 # ---------- Step 6: view attention (off by default) ----------
 use_view_attn: false
 view_attn_hidden: 16
+
+# ---------- Step 8: feature-level view fusion (off by default) ----------
+# "none" | "mean" | "max" | "concat"
+feature_fusion: "none"

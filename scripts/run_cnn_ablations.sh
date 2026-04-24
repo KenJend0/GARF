@@ -36,6 +36,10 @@ STEPS=(
     cnn_step4_bilinear
     cnn_step5_context
     cnn_step6_attention
+    cnn_step7_unet
+    cnn_step8a_feat_mean
+    cnn_step8b_feat_max
+    cnn_step8c_feat_concat
 )
 
 for STEP in "${STEPS[@]}"; do

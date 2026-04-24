@@ -11,16 +11,21 @@ Pipeline
     → SimpleCNNBackbone.encode         → (K*V, btn_ch, H', W') bottleneck
     → [optional] global context inject → cross-fragment object descriptor fused in
     → [optional] ViewAttention         → (K, V) learned view importance weights
+    → [optional] feature-level fusion  → fuse bottleneck over V, broadcast back
     → SimpleCNNBackbone.decode         → (K*V, 1, H, W) logits → sigmoid
     → backproject_pixel_to_points      → (N_sum_valid,) per-point predictions
     → dice_loss + acc/recall/precision/F1
 
-All six ablation flags are independently controllable:
+Ablation flags:
   use_normals        → 5-ch vs 2-ch image input
   splat_sigma > 0    → Gaussian splatting after projection
   use_bilinear       → bilinear vs floor projection
   use_global_context → cross-fragment object-level context injection
-  use_view_attn      → learned view attention vs uniform mean fusion
+  use_view_attn      → learned view attention weights
+  feature_fusion     → "none" | "mean" | "max" | "concat"
+                       moves view fusion from prediction level (Step 6/7)
+                       to bottleneck level so all decoders share a common
+                       cross-view representation before predicting
 
 The model has an identical LightningModule API to FracSeg and HybridFracSeg:
   same criteria(), same step method signatures, same log keys.
@@ -305,6 +310,13 @@ class CNNFracSeg(pl.LightningModule):
         view_attn_hidden   : hidden dim of ViewAttention MLP
         backbone           : "simple" (default) or "unet" (skip connections)
         unet_depth         : encoder depth for UNetBackbone (default 4)
+        feature_fusion     : "none" | "mean" | "max" | "concat"
+                             Fuses bottleneck features across views BEFORE decoding
+                             so all V decoders share a common cross-view representation.
+                             "none"   — no feature fusion (Steps 1-7 behaviour)
+                             "mean"   — mean over views (weighted by view_attn if enabled)
+                             "max"    — element-wise max over views
+                             "concat" — concat views then project back via 1×1 conv
     """
 
     def __init__(
@@ -324,6 +336,7 @@ class CNNFracSeg(pl.LightningModule):
         view_attn_hidden: int = 16,
         backbone: str = "simple",
         unet_depth: int = 4,
+        feature_fusion: str = "none",
         **kwargs,
     ):
         super().__init__()
@@ -334,6 +347,7 @@ class CNNFracSeg(pl.LightningModule):
         self.use_normals        = use_normals
         self.use_global_context = use_global_context
         self.use_view_attn      = use_view_attn
+        self.feature_fusion     = feature_fusion
         self._optimizer         = optimizer
         self._lr_scheduler      = lr_scheduler
 
@@ -363,6 +377,12 @@ class CNNFracSeg(pl.LightningModule):
             self.view_attn = ViewAttention(
                 in_ch=self.cnn.btn_ch,
                 hidden_ch=view_attn_hidden,
+            )
+
+        if feature_fusion == "concat":
+            # Project V concatenated bottleneck channels back to btn_ch
+            self.fusion_proj = nn.Conv2d(
+                num_views * self.cnn.btn_ch, self.cnn.btn_ch, kernel_size=1, bias=False
             )
 
     # ------------------------------------------------------------------
@@ -501,6 +521,37 @@ class CNNFracSeg(pl.LightningModule):
             gap_ctx      = bottleneck.mean(dim=[-2, -1]).view(K, V, btn_ch)  # (K, V, btn_ch)
             view_weights = self.view_attn(gap_ctx)                            # (K, V) softmax
 
+        # 6.5 Feature-level view fusion (Step 8)
+        # Fuse bottleneck across V views → broadcast back so every decoder
+        # shares the same cross-view representation before decoding.
+        # Skip connections (UNet) remain view-specific — local spatial features
+        # stay per-view while global semantics are shared.
+        if self.feature_fusion != "none":
+            btn_kv = bottleneck.view(K, V, btn_ch, Hp, Wp)  # (K, V, btn_ch, H', W')
+
+            if self.feature_fusion == "mean":
+                if view_weights is not None:
+                    # Use view attention as weighted mean at feature level
+                    w = view_weights.view(K, V, 1, 1, 1)
+                    fused = (btn_kv * w).sum(dim=1)           # (K, btn_ch, H', W')
+                else:
+                    fused = btn_kv.mean(dim=1)
+            elif self.feature_fusion == "max":
+                fused = btn_kv.max(dim=1).values              # (K, btn_ch, H', W')
+            else:  # "concat"
+                fused = self.fusion_proj(
+                    btn_kv.reshape(K, V * btn_ch, Hp, Wp)
+                )                                             # (K, btn_ch, H', W')
+
+            # Broadcast fused representation to all V decoder paths
+            bottleneck = (
+                fused.unsqueeze(1)                            # (K, 1, btn_ch, H', W')
+                .expand(-1, V, -1, -1, -1)                   # (K, V, btn_ch, H', W')
+                .reshape(K * V, btn_ch, Hp, Wp)              # (K*V, btn_ch, H', W')
+            )
+            # Fusion already captured view weighting — disable prediction-level weighting
+            view_weights = None
+
         # 7. Decode → per-pixel logits → sigmoid → (K*V, 1, H, W)
         if _skips is not None:
             logits_flat = self.cnn.decode(bottleneck, _skips, (H, W))  # UNet
@@ -510,6 +561,7 @@ class CNNFracSeg(pl.LightningModule):
         seg_per_frag = seg_flat.view(K, V, H, W)                   # (K, V, H, W)
 
         # 8. Bilinear + view-attention backprojection → (N_sum_valid,)
+        # view_weights is None when feature_fusion != "none" (fusion already done)
         coarse_seg_pred = backproject_pixel_to_points(
             seg_per_frag, pix_corners_list, pix_weights_list, view_weights
         )

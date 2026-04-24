@@ -1,0 +1,28 @@
+# @package _global_
+# configs/experiment/cnn_step8c_feat_concat.yaml
+#
+# Step 8c — Feature-level concat fusion.
+# Concatenates all V bottleneck maps along the channel axis then projects
+# back to btn_ch via a learned 1×1 conv. More expressive than mean/max
+# because the projection can learn any linear combination of views.
+# Adds V*btn_ch → btn_ch parameters (one conv layer).
+
+defaults:
+  - cnn_ablation_shared
+  - _self_
+
+experiment_name: cnn_step8c_feat_concat
+tags: ["cnn", "ablation", "step8", "feature_fusion", "concat"]
+
+trainer:
+  max_epochs: 100
+
+model:
+  use_normals: true
+  splat_sigma: 1.5
+  use_bilinear: true
+  use_global_context: true
+  use_view_attn: false
+  backbone: unet
+  unet_depth: 4
+  feature_fusion: "concat"

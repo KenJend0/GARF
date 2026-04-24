@@ -1,0 +1,28 @@
+# @package _global_
+# configs/experiment/cnn_step8b_feat_max.yaml
+#
+# Step 8b — Feature-level max fusion.
+# Same as Step 8a but uses element-wise max instead of mean.
+# Max retains the strongest activation across views per channel,
+# discarding view-specific noise and keeping the dominant signal.
+# No attention weights needed — max is inherently selective.
+
+defaults:
+  - cnn_ablation_shared
+  - _self_
+
+experiment_name: cnn_step8b_feat_max
+tags: ["cnn", "ablation", "step8", "feature_fusion", "max"]
+
+trainer:
+  max_epochs: 100
+
+model:
+  use_normals: true
+  splat_sigma: 1.5
+  use_bilinear: true
+  use_global_context: true
+  use_view_attn: false
+  backbone: unet
+  unet_depth: 4
+  feature_fusion: "max"

@@ -37,13 +37,16 @@ from typing import Optional
 
 
 STEPS = [
-    ("cnn_step1_baseline",  "Step 1 - Baseline"),
-    ("cnn_step2_normals",   "Step 2 + Normals"),
-    ("cnn_step3_splatting", "Step 3 + Splatting"),
-    ("cnn_step4_bilinear",  "Step 4 + Bilinear"),
-    ("cnn_step5_context",   "Step 5 + Context"),
-    ("cnn_step6_attention", "Step 6 + Attention"),
-    ("cnn_step7_unet",      "Step 7 + U-Net"),
+    ("cnn_step1_baseline",    "Step 1 - Baseline"),
+    ("cnn_step2_normals",     "Step 2 + Normals"),
+    ("cnn_step3_splatting",   "Step 3 + Splatting"),
+    ("cnn_step4_bilinear",    "Step 4 + Bilinear"),
+    ("cnn_step5_context",     "Step 5 + Context"),
+    ("cnn_step6_attention",   "Step 6 + Attention"),
+    ("cnn_step7_unet",        "Step 7 + U-Net"),
+    ("cnn_step8a_feat_mean",  "Step 8a + FeatFuse(mean)"),
+    ("cnn_step8b_feat_max",   "Step 8b + FeatFuse(max)"),
+    ("cnn_step8c_feat_concat","Step 8c + FeatFuse(concat)"),
 ]
 
 VAL_METRICS = [
