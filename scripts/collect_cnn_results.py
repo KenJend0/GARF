@@ -43,6 +43,7 @@ STEPS = [
     ("cnn_step4_bilinear",  "Step 4 + Bilinear"),
     ("cnn_step5_context",   "Step 5 + Context"),
     ("cnn_step6_attention", "Step 6 + Attention"),
+    ("cnn_step7_unet",      "Step 7 + U-Net"),
 ]
 
 VAL_METRICS = [
@@ -85,13 +86,13 @@ def best_row_by(rows: list, metric: str) -> dict:
     return best_row
 
 
-def find_csv_files(step_name: str, seed: int) -> list:
+def find_csv_files(step_name: str, seed: int, output_dir: str = "output") -> list:
     """Find all metrics.csv files for a given (step, seed) combination."""
     if seed == 1116:
         dir_name = step_name
     else:
         dir_name = f"{step_name}_seed{seed}"
-    pattern = os.path.join("output", dir_name, "version_*", "metrics.csv")
+    pattern = os.path.join(output_dir, dir_name, "version_*", "metrics.csv")
     return sorted(glob.glob(pattern))
 
 
@@ -118,7 +119,7 @@ def format_val(v) -> str:
     return f"{v:.4f}"
 
 
-def print_table(seeds: list):
+def print_table(seeds: list, output_dir: str = "output"):
     col_w = 28
     metric_w = 8
 
@@ -135,7 +136,7 @@ def print_table(seeds: list):
     for step_key, step_label in STEPS:
         rows_per_seed = []
         for seed in seeds:
-            csvs = find_csv_files(step_key, seed)
+            csvs = find_csv_files(step_key, seed, output_dir)
             if not csvs:
                 continue
             all_rows = []
@@ -159,7 +160,7 @@ def print_table(seeds: list):
     for step_key, step_label in STEPS:
         rows_per_seed = []
         for seed in seeds:
-            csvs = find_csv_files(step_key, seed)
+            csvs = find_csv_files(step_key, seed, output_dir)
             if not csvs:
                 continue
             all_rows = []
@@ -181,7 +182,7 @@ def print_table(seeds: list):
     for step_key, step_label in STEPS:
         rows_per_seed = []
         for seed in seeds:
-            csvs = find_csv_files(step_key, seed)
+            csvs = find_csv_files(step_key, seed, output_dir)
             if not csvs:
                 continue
             all_rows = []
@@ -211,14 +212,19 @@ def main():
         type=int,
         default=[1116],
         metavar="SEED",
-        help="Seed(s) to include. Default: 1116. "
-             "For multi-seed averages pass e.g. --seeds 1116 42 2024",
+        help="Seed(s) to include. Default: 1116.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="output",
+        help="Root output directory containing cnn_step* folders. Default: ./output",
     )
     args = parser.parse_args()
 
     print(f"\nCNN Ablation Results — seeds: {args.seeds}")
-    print(f"Reading from: ./output/cnn_step*/version_*/metrics.csv\n")
-    print_table(args.seeds)
+    print(f"Reading from: {args.output_dir}/cnn_step*/version_*/metrics.csv\n")
+    print_table(args.seeds, output_dir=args.output_dir)
 
 
 if __name__ == "__main__":
