@@ -1,0 +1,34 @@
+# @package _global_
+# configs/experiment/cnn_step8d_simplecnn_feat_mean.yaml
+#
+# Step 8d — Feature-level mean fusion WITHOUT U-Net (SimpleCNN backbone).
+# Same as Step 8a but replaces UNetBackbone with SimpleCNNBackbone.
+#
+# Purpose: isolate whether the F1 gain of Step 8a comes from feature fusion
+# alone, or requires U-Net's richer bottleneck features to be effective.
+#
+# Hypothesis A (fusion sufficient): 8d ≈ 8a → U-Net is unnecessary overhead,
+#   feature fusion alone is the key ingredient (~100K params instead of ~523K).
+# Hypothesis B (U-Net needed): 8d << 8a → U-Net's richer bottleneck provides
+#   better cross-view features worth fusing; both components are needed.
+
+defaults:
+  - cnn_ablation_shared
+  - _self_
+
+experiment_name: cnn_step8d_simplecnn_feat_mean
+tags: ["cnn", "ablation", "step8", "feature_fusion", "simplecnn"]
+
+trainer:
+  max_epochs: 100
+
+model:
+  use_normals: true
+  splat_sigma: 1.5
+  use_bilinear: true
+  use_global_context: true
+  use_view_attn: true
+  view_attn_hidden: 16
+  backbone: simple
+  num_blocks: 3
+  feature_fusion: "mean"
