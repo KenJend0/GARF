@@ -1,0 +1,39 @@
+# @package _global_
+# configs/experiment/cnn_step9_geo_features.yaml
+#
+# Step 9 — 3D geometric features projected to 2D image channels.
+# Full Step 8b pipeline (best fusion) + 3 extra geometric channels:
+#   ch 5 : curvature        (λ_min / Σλ from local k-NN PCA)
+#   ch 6 : roughness        (mean perpendicular distance to tangent plane)
+#   ch 7 : normal_consistency (input normal vs PCA normal alignment)
+#
+# These features are pure geometric descriptors — no gradients, no extra
+# trainable parameters. They give the CNN explicit signal about fracture
+# surfaces (high curvature, high roughness, low normal consistency) that
+# depth and normals alone do not encode directly.
+#
+# Hypothesis: explicit geometric features improve precision by giving the
+# CNN direct access to fracture-surface descriptors rather than having to
+# infer them implicitly from depth/normal channels.
+
+defaults:
+  - cnn_ablation_shared
+  - _self_
+
+experiment_name: cnn_step9_geo_features
+tags: ["cnn", "ablation", "step9", "geo_features"]
+
+trainer:
+  max_epochs: 100
+
+model:
+  use_normals: true
+  splat_sigma: 1.5
+  use_bilinear: true
+  use_global_context: true
+  use_view_attn: false
+  backbone: unet
+  unet_depth: 4
+  feature_fusion: "max"
+  use_geo_features: true
+  geo_k: 16

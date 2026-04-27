@@ -42,3 +42,7 @@ view_attn_hidden: 16
 # ---------- Step 8: feature-level view fusion (off by default) ----------
 # "none" | "mean" | "max" | "concat"
 feature_fusion: "none"
+
+# ---------- Step 9: 3D geometric features projected to 2D (off by default) ----------
+use_geo_features: false
+geo_k: 16

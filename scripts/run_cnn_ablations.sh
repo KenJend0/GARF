@@ -41,6 +41,7 @@ STEPS=(
     cnn_step8b_feat_max
     cnn_step8c_feat_concat
     cnn_step8d_simplecnn_feat_mean
+    cnn_step9_geo_features
 )
 
 for STEP in "${STEPS[@]}"; do

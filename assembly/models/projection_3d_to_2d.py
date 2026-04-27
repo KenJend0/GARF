@@ -12,11 +12,14 @@ Views (XYZ convention):
   view 2 — top   : u=X, v=Z, depth=Y
 
 Image channels:
-  ch 0 — depth             : average depth in [0, 1]
-  ch 1 — occupancy         : 1.0 where any point landed, else 0.0
-  ch 2 — nx  (optional)    : average world-space normal x
-  ch 3 — ny  (optional)
-  ch 4 — nz  (optional)
+  ch 0 — depth                        : average depth in [0, 1]
+  ch 1 — occupancy                    : 1.0 where any point landed, else 0.0
+  ch 2 — nx  (if use_normals)         : average world-space normal x
+  ch 3 — ny  (if use_normals)
+  ch 4 — nz  (if use_normals)
+  ch 5 — curvature   (if geo_features): λ_min / Σλ from local PCA
+  ch 6 — roughness   (if geo_features): mean perpendicular distance to tangent plane
+  ch 7 — consistency (if geo_features): input normal vs PCA normal alignment
 
 Projection modes (use_bilinear flag):
   False — floor assignment.
@@ -112,8 +115,9 @@ def _gaussian_splat(
 
 
 def project_fragment(
-    pts: torch.Tensor,                # (N, 3)
-    normals: torch.Tensor = None,     # (N, 3) optional
+    pts: torch.Tensor,                    # (N, 3)
+    normals: torch.Tensor = None,         # (N, 3) optional
+    geo_features: torch.Tensor = None,    # (N, G) optional — e.g. curvature/roughness/consistency
     num_views: int = 3,
     resolution: int = 128,
     splat_sigma: float = 1.5,
@@ -124,18 +128,17 @@ def project_fragment(
     Project one fragment to V orthographic depth-map images.
 
     Returns:
-        images      : (V, C, H, W)          C=2 without normals, C=5 with normals
+        images      : (V, C, H, W)
+                      C = 2 (base) + 3 (normals) + G (geo_features)
         pix_corners : (N, V, 4) long        flat pixel indices for bilinear corners
-                                            (floor mode: index 0 only, rest zero)
         pix_weights : (N, V, 4) float       bilinear weights summing to 1 per (N, V)
-                                            (floor mode: weight[0]=1, rest zero)
         count_flat  : (V, H*W) float        accumulated bilinear weight per pixel per view
-                                            (= point count in floor mode)
     """
     N = pts.shape[0]
     H = W = resolution
     V = num_views
-    C = 5 if normals is not None else 2
+    G = geo_features.shape[1] if geo_features is not None else 0
+    C = 2 + (3 if normals is not None else 0) + G
     device = pts.device
     dtype = pts.dtype
 
@@ -215,6 +218,15 @@ def project_fragment(
                 n_acc.scatter_add_(0, flat_c, n_rep * w_flat)
                 images[v, 2 + dim] = (n_acc / cnt.clamp(min=1e-6)).view(H, W)
 
+        # Geometric feature channels (optional): weighted-average per feature
+        if geo_features is not None:
+            base_ch = 5 if normals is not None else 2
+            for g in range(G):
+                g_rep = geo_features[:, g].to(dtype).unsqueeze(1).expand(-1, 4).reshape(-1)
+                g_acc = torch.zeros(H * W, device=device, dtype=dtype)
+                g_acc.scatter_add_(0, flat_c, g_rep * w_flat)
+                images[v, base_ch + g] = (g_acc / cnt.clamp(min=1e-6)).view(H, W)
+
         pix_corners[:, v, :] = corners
         pix_weights[:, v, :] = weights
 
@@ -234,12 +246,14 @@ class Project3DTo2D(nn.Module):
     per-pixel accumulation counts for every fragment in the batch.
 
     Args:
-        num_views    : 1 (front), 2 (front+side), or 3 (front+side+top)
-        resolution   : image H = W
-        use_normals  : if True, include nx/ny/nz channels (5-ch vs 2-ch output)
-        splat_sigma  : Gaussian blur sigma in pixels; 0 = disable splatting
-        splat_kernel : Gaussian blur kernel size (odd)
-        use_bilinear : if True, bilinear 4-corner projection; else floor assignment
+        num_views        : 1 (front), 2 (front+side), or 3 (front+side+top)
+        resolution       : image H = W
+        use_normals      : if True, include nx/ny/nz channels
+        splat_sigma      : Gaussian blur sigma in pixels; 0 = disable splatting
+        splat_kernel     : Gaussian blur kernel size (odd)
+        use_bilinear     : if True, bilinear 4-corner projection; else floor assignment
+        use_geo_features : if True, include 3 extra geometric channels:
+                           curvature, roughness, normal_consistency (in that order)
     """
 
     def __init__(
@@ -250,22 +264,34 @@ class Project3DTo2D(nn.Module):
         splat_sigma: float = 0.0,
         splat_kernel: int = 5,
         use_bilinear: bool = False,
+        use_geo_features: bool = False,
     ):
         super().__init__()
         assert 1 <= num_views <= 3, "num_views must be 1, 2 or 3"
-        self.num_views    = num_views
-        self.resolution   = resolution
-        self.use_normals  = use_normals
-        self.splat_sigma  = splat_sigma
-        self.splat_kernel = splat_kernel
-        self.use_bilinear = use_bilinear
-        self.num_channels = 5 if use_normals else 2
+        self.num_views        = num_views
+        self.resolution       = resolution
+        self.use_normals      = use_normals
+        self.splat_sigma      = splat_sigma
+        self.splat_kernel     = splat_kernel
+        self.use_bilinear     = use_bilinear
+        self.use_geo_features = use_geo_features
+        self.num_channels = (
+            2
+            + (3 if use_normals else 0)
+            + (3 if use_geo_features else 0)   # curvature + roughness + consistency
+        )
 
-    def forward(self, frag_list: list, normal_list: list = None) -> tuple:
+    def forward(
+        self,
+        frag_list: list,
+        normal_list: list = None,
+        geo_features_list: list = None,
+    ) -> tuple:
         """
         Args:
-            frag_list   : list of K tensors, each (N_i, 3)
-            normal_list : list of K tensors, each (N_i, 3) or None
+            frag_list         : list of K tensors, each (N_i, 3)
+            normal_list       : list of K tensors, each (N_i, 3) or None
+            geo_features_list : list of K tensors, each (N_i, G) or None
 
         Returns:
             images             : (K, V, C, H, W) float
@@ -279,10 +305,12 @@ class Project3DTo2D(nn.Module):
         cnt_all  = []
 
         for k, pts in enumerate(frag_list):
-            normals_k = normal_list[k] if (normal_list is not None) else None
+            normals_k     = normal_list[k]       if (normal_list       is not None) else None
+            geo_k         = geo_features_list[k] if (geo_features_list is not None) else None
             imgs, corners, weights, cnt = project_fragment(
                 pts,
                 normals=normals_k,
+                geo_features=geo_k,
                 num_views=self.num_views,
                 resolution=self.resolution,
                 splat_sigma=self.splat_sigma,

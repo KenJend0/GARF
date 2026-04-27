@@ -42,6 +42,7 @@ import torchmetrics
 
 from assembly.models.pretraining.loss import dice_loss
 from assembly.models.projection_3d_to_2d import Project3DTo2D
+from assembly.models.hybrid_geometry_features import HybridGeometryFeatures
 from assembly.models.projection_mapping_utils import (
     extract_fragment_list,
     extract_normal_list,
@@ -317,6 +318,10 @@ class CNNFracSeg(pl.LightningModule):
                              "mean"   — mean over views (weighted by view_attn if enabled)
                              "max"    — element-wise max over views
                              "concat" — concat views then project back via 1×1 conv
+        use_geo_features   : add 3 geometric feature channels to the projected image:
+                             curvature (λ_min/Σλ), roughness, normal_consistency.
+                             Requires use_normals=True (normals needed for kNN PCA).
+        geo_k              : k-NN neighborhood size for geometric feature computation
     """
 
     def __init__(
@@ -337,6 +342,8 @@ class CNNFracSeg(pl.LightningModule):
         backbone: str = "simple",
         unet_depth: int = 4,
         feature_fusion: str = "none",
+        use_geo_features: bool = False,
+        geo_k: int = 16,
         **kwargs,
     ):
         super().__init__()
@@ -348,6 +355,7 @@ class CNNFracSeg(pl.LightningModule):
         self.use_global_context = use_global_context
         self.use_view_attn      = use_view_attn
         self.feature_fusion     = feature_fusion
+        self.use_geo_features   = use_geo_features
         self._optimizer         = optimizer
         self._lr_scheduler      = lr_scheduler
 
@@ -358,7 +366,17 @@ class CNNFracSeg(pl.LightningModule):
             splat_sigma=splat_sigma,
             splat_kernel=splat_kernel,
             use_bilinear=use_bilinear,
+            use_geo_features=use_geo_features,
         )
+
+        if use_geo_features:
+            # No normals in geo extractor — already projected as image channels
+            self.geo_extractor = HybridGeometryFeatures(
+                k=geo_k,
+                use_normals=False,
+                use_curvature=True,
+                use_roughness=True,
+            )
 
         if backbone == "unet":
             self.cnn = UNetBackbone(
@@ -455,9 +473,19 @@ class CNNFracSeg(pl.LightningModule):
                 batch["pointclouds_normals"], valid_pcs, points_per_part
             )
 
+        # 2.5 Geometric features per fragment (Step 9)
+        # Computed from 3D points + normals via local k-NN PCA, then projected
+        # to 2D as extra image channels. No gradients — pure geometric descriptors.
+        geo_features_list = None
+        if self.use_geo_features and normal_list is not None:
+            geo_features_list = [
+                self.geo_extractor.forward_single(frag_list[k], normal_list[k])
+                for k in range(K)
+            ]
+
         # 3. Orthographic projection → (K, V, C, H, W) + corner/weight maps
         images, pix_corners_list, pix_weights_list, _ = self.projector(
-            frag_list, normal_list
+            frag_list, normal_list, geo_features_list
         )
 
         # 4. CNN encode — all K*V views in one batched call (weight sharing)
