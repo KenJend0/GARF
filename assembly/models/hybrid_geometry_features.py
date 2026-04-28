@@ -159,12 +159,17 @@ class HybridGeometryFeatures(nn.Module):
         Returns:
             features : (N, out_dim)  float32 geometric descriptors
         """
+        # kNN builds an (N, N) distance matrix — run on CPU to avoid GPU OOM
+        # for large fragments (N=5000 → 100 MB on GPU per fragment).
+        out_device = xyz.device
+        xyz     = xyz.cpu()
+        normals = normals.cpu()
+
         N = xyz.shape[0]
         k_actual = min(self.k, N - 1)
 
         if k_actual < 2:
-            # Degenerate fragment: return zeros to avoid crashing.
-            return torch.zeros(N, self.out_dim, device=xyz.device, dtype=xyz.dtype)
+            return torch.zeros(N, self.out_dim, device=out_device, dtype=xyz.dtype)
 
         idx = _knn_indices(xyz, k_actual)                       # (N, k)
         eigenvalues, eigenvectors = _local_pca(xyz, idx)        # (N,3), (N,3,3)
@@ -212,7 +217,7 @@ class HybridGeometryFeatures(nn.Module):
             roughness = perp_dist.mean(dim=-1, keepdim=True)    # (N, 1)
             features.append(roughness)
 
-        return torch.cat(features, dim=-1)                      # (N, out_dim)
+        return torch.cat(features, dim=-1).to(out_device)        # (N, out_dim)
 
     def forward(
         self,
