@@ -320,8 +320,11 @@ def main():
 
     # --- Load model ---
     print("Loading model from checkpoint...")
+    import functools
+    import torch.serialization
+    torch.serialization.add_safe_globals([functools.partial])
     from assembly.models.cnn_segmentation_model import CNNFracSeg
-    model = CNNFracSeg.load_from_checkpoint(args.ckpt, map_location=device)
+    model = CNNFracSeg.load_from_checkpoint(args.ckpt, map_location=device, weights_only=False)
     model.eval()
     model.to(device)
     print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
