@@ -103,13 +103,13 @@ def bin_stats(records, key, n_bins=4):
     """
     vals = np.array([r[key] for r in records])
     if key == "n_parts":
-        # Group by exact part count capped at 6+
-        unique = sorted(set(int(v) for v in vals))
-        bins = [str(u) if u < 6 else "6+" for u in unique]
         groups = defaultdict(list)
-        for r, v in zip(records, vals):
-            label = str(int(v)) if int(v) < 6 else "6+"
+        for r in records:
+            label = str(int(r[key])) if int(r[key]) < 6 else "6+"
             groups[label].append(r)
+        bins = [str(u) for u in sorted(int(k) for k in groups if k != "6+")]
+        if "6+" in groups:
+            bins.append("6+")
         return [
             (
                 b,
@@ -119,7 +119,6 @@ def bin_stats(records, key, n_bins=4):
                 len(groups[b]),
             )
             for b in bins
-            if b in groups
         ]
     else:
         quantiles = np.quantile(vals, np.linspace(0, 1, n_bins + 1))
