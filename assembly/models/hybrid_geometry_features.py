@@ -127,12 +127,14 @@ class HybridGeometryFeatures(nn.Module):
         use_normals: bool = True,
         use_curvature: bool = True,
         use_roughness: bool = True,
+        use_dist_to_centroid: bool = False,
     ):
         super().__init__()
         self.k = k
         self.use_normals = use_normals
         self.use_curvature = use_curvature
         self.use_roughness = use_roughness
+        self.use_dist_to_centroid = use_dist_to_centroid
 
         # Pre-compute output dimension so the caller can size the fusion MLP.
         self.out_dim = 1                        # normal_consistency always included
@@ -141,6 +143,8 @@ class HybridGeometryFeatures(nn.Module):
         if use_curvature:
             self.out_dim += 1
         if use_roughness:
+            self.out_dim += 1
+        if use_dist_to_centroid:
             self.out_dim += 1
 
     @torch.no_grad()
@@ -216,6 +220,14 @@ class HybridGeometryFeatures(nn.Module):
             perp_dist = (offset * n_exp).sum(dim=-1).abs()      # (N, k)
             roughness = perp_dist.mean(dim=-1, keepdim=True)    # (N, 1)
             features.append(roughness)
+
+        # ---- Feature 5: distance to fragment centroid (optional) ---------
+        if self.use_dist_to_centroid:
+            centroid = xyz.mean(dim=0, keepdim=True)              # (1, 3)
+            dists = (xyz - centroid).norm(dim=-1, keepdim=True)   # (N, 1)
+            # Normalise by mean (not max) — robust to outlier points
+            mean_d = dists.mean().clamp(min=1e-6)
+            features.append(dists / mean_d)                       # (N, 1) ratio > 1 = periphery
 
         return torch.cat(features, dim=-1).to(out_device)        # (N, out_dim)
 

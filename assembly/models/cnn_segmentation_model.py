@@ -40,7 +40,7 @@ import torch.nn.functional as F
 import lightning as pl
 import torchmetrics
 
-from assembly.models.pretraining.loss import dice_loss
+from assembly.models.pretraining.loss import dice_loss, tversky_loss
 from assembly.models.projection_3d_to_2d import Project3DTo2D
 from assembly.models.hybrid_geometry_features import HybridGeometryFeatures
 from assembly.models.projection_mapping_utils import (
@@ -318,10 +318,15 @@ class CNNFracSeg(pl.LightningModule):
                              "mean"   — mean over views (weighted by view_attn if enabled)
                              "max"    — element-wise max over views
                              "concat" — concat views then project back via 1×1 conv
-        use_geo_features   : add 3 geometric feature channels to the projected image:
-                             curvature (λ_min/Σλ), roughness, normal_consistency.
-                             Requires use_normals=True (normals needed for kNN PCA).
-        geo_k              : k-NN neighborhood size for geometric feature computation
+        use_geo_features        : add geometric feature channels to the projected image:
+                                  curvature (λ_min/Σλ), roughness, normal_consistency,
+                                  and optionally distance to centroid.
+        geo_k                   : k-NN neighborhood size for geometric feature computation
+        use_dist_to_centroid    : add normalised distance-to-centroid channel (no kNN,
+                                  directly addresses FP-at-periphery problem)
+        use_tversky_loss        : replace dice loss with Tversky loss (alpha > 0.5
+                                  penalises FP more → improves precision)
+        tversky_alpha           : FP weight in Tversky (default 0.7); beta = 1 - alpha
     """
 
     def __init__(
@@ -344,20 +349,38 @@ class CNNFracSeg(pl.LightningModule):
         feature_fusion: str = "none",
         use_geo_features: bool = False,
         geo_k: int = 16,
+        use_dist_to_centroid: bool = False,
+        use_tversky_loss: bool = False,
+        tversky_alpha: float = 0.7,
         **kwargs,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["lr_scheduler"])
 
-        self.num_views          = num_views
-        self.resolution         = resolution
-        self.use_normals        = use_normals
-        self.use_global_context = use_global_context
-        self.use_view_attn      = use_view_attn
-        self.feature_fusion     = feature_fusion
-        self.use_geo_features   = use_geo_features
-        self._optimizer         = optimizer
-        self._lr_scheduler      = lr_scheduler
+        self.num_views            = num_views
+        self.resolution           = resolution
+        self.use_normals          = use_normals
+        self.use_global_context   = use_global_context
+        self.use_view_attn        = use_view_attn
+        self.feature_fusion       = feature_fusion
+        self.use_geo_features     = use_geo_features
+        self.use_tversky_loss     = use_tversky_loss
+        self.tversky_alpha        = tversky_alpha
+        self._optimizer           = optimizer
+        self._lr_scheduler        = lr_scheduler
+
+        if use_geo_features:
+            # No normals in geo extractor — already projected as image channels
+            self.geo_extractor = HybridGeometryFeatures(
+                k=geo_k,
+                use_normals=False,
+                use_curvature=True,
+                use_roughness=True,
+                use_dist_to_centroid=use_dist_to_centroid,
+            )
+            geo_dim = self.geo_extractor.out_dim
+        else:
+            geo_dim = 0
 
         self.projector = Project3DTo2D(
             num_views=num_views,
@@ -367,16 +390,8 @@ class CNNFracSeg(pl.LightningModule):
             splat_kernel=splat_kernel,
             use_bilinear=use_bilinear,
             use_geo_features=use_geo_features,
+            geo_features_dim=geo_dim,
         )
-
-        if use_geo_features:
-            # No normals in geo extractor — already projected as image channels
-            self.geo_extractor = HybridGeometryFeatures(
-                k=geo_k,
-                use_normals=False,
-                use_curvature=True,
-                use_roughness=True,
-            )
 
         if backbone == "unet":
             self.cnn = UNetBackbone(
@@ -417,7 +432,11 @@ class CNNFracSeg(pl.LightningModule):
         gt      = output_dict["coarse_seg_gt"].float()   # (N_sum_valid,)
         gt_long = output_dict["coarse_seg_gt"]           # (N_sum_valid,) long
 
-        loss = dice_loss(pred, gt)
+        if self.use_tversky_loss:
+            loss = tversky_loss(pred, gt, alpha=self.tversky_alpha,
+                                beta=1.0 - self.tversky_alpha)
+        else:
+            loss = dice_loss(pred, gt)
 
         acc       = torchmetrics.functional.accuracy(pred_b, gt_long, task="binary")
         recall    = torchmetrics.functional.recall(pred_b, gt_long, task="binary")

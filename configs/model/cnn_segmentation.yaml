@@ -46,3 +46,8 @@ feature_fusion: "none"
 # ---------- Step 9: 3D geometric features projected to 2D (off by default) ----------
 use_geo_features: false
 geo_k: 16
+use_dist_to_centroid: false
+
+# ---------- Step 10: precision-focused training (off by default) ----------
+use_tversky_loss: false
+tversky_alpha: 0.7

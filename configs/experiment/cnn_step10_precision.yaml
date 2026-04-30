@@ -1,0 +1,41 @@
+# @package _global_
+# configs/experiment/cnn_step10_precision.yaml
+#
+# Step 10 — Precision-focused training.
+# Full Step 9 pipeline + two targeted improvements for low fracture-ratio fragments:
+#
+#   1. Tversky loss (alpha=0.7): penalises FP 40% more than FN.
+#      T = TP / (TP + 0.7*FP + 0.3*FN)
+#      Directly addresses FP rate = 19.6% identified in Step 9 error analysis.
+#
+#   2. dist_to_centroid feature: 1 extra image channel (no kNN, O(N)).
+#      Points far from fragment centroid tend to be on intact surface → FP signal.
+#      Total channels: 9 (depth + occ + nx/ny/nz + curv + rough + consistency + dist)
+#
+# Hypothesis: combined FP penalty + geometric FP signal reduces false discovery
+# rate from 19.6% → <15%, improving precision without sacrificing recall.
+
+defaults:
+  - cnn_ablation_shared
+  - _self_
+
+experiment_name: cnn_step10_precision
+tags: ["cnn", "ablation", "step10", "tversky", "dist_centroid"]
+
+trainer:
+  max_epochs: 100
+
+model:
+  use_normals: true
+  splat_sigma: 1.5
+  use_bilinear: true
+  use_global_context: true
+  use_view_attn: false
+  backbone: unet
+  unet_depth: 4
+  feature_fusion: "max"
+  use_geo_features: true
+  geo_k: 16
+  use_dist_to_centroid: true
+  use_tversky_loss: true
+  tversky_alpha: 0.7

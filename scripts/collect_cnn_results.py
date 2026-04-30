@@ -49,6 +49,7 @@ STEPS = [
     ("cnn_step8c_feat_concat",          "Step 8c + FeatFuse(concat)"),
     ("cnn_step8d_simplecnn_feat_mean",  "Step 8d + SimpleCNN+Fuse(mean)"),
     ("cnn_step9_geo_features",          "Step 9  + GeoFeatures"),
+    ("cnn_step10_precision",            "Step 10 + Tversky+DistCentroid"),
 ]
 
 # Hard-coded results for steps whose CSV output is no longer available.

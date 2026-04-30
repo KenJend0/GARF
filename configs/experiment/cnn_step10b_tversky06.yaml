@@ -1,0 +1,31 @@
+# @package _global_
+# configs/experiment/cnn_step10b_tversky06.yaml
+#
+# Step 10b — Same as Step 10 but with softer Tversky (alpha=0.6).
+# Tests whether alpha=0.7 is too aggressive and risks recall collapse.
+# Compare 10 vs 10b: if recall drops significantly on 10, use 10b.
+
+defaults:
+  - cnn_ablation_shared
+  - _self_
+
+experiment_name: cnn_step10b_tversky06
+tags: ["cnn", "ablation", "step10", "tversky06"]
+
+trainer:
+  max_epochs: 100
+
+model:
+  use_normals: true
+  splat_sigma: 1.5
+  use_bilinear: true
+  use_global_context: true
+  use_view_attn: false
+  backbone: unet
+  unet_depth: 4
+  feature_fusion: "max"
+  use_geo_features: true
+  geo_k: 16
+  use_dist_to_centroid: true
+  use_tversky_loss: true
+  tversky_alpha: 0.6

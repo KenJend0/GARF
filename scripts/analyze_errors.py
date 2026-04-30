@@ -284,6 +284,8 @@ def parse_args():
     p.add_argument("--max_batches", type=int, default=300, help="Max batches to process (0=all)")
     p.add_argument("--batch_size",  type=int, default=4)
     p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--sweep_threshold", action="store_true",
+                   help="Sweep decision threshold and print F1/Prec/Rec table")
     return p.parse_args()
 
 
@@ -457,6 +459,43 @@ def main():
     plt.savefig(out_dir / "f1_vs_fracture_ratio_scatter.png", dpi=120)
     plt.close()
     print(f"  Saved: {out_dir}/f1_vs_fracture_ratio_scatter.png")
+
+    # --- Threshold sweep (optional) ---
+    if args.sweep_threshold:
+        print("\n[Threshold Sweep — Global F1 / Precision / Recall]")
+        print(f"  {'Thresh':>7}  {'F1':>7}  {'Prec':>7}  {'Rec':>7}  {'FDR':>7}")
+        print("  " + "-" * 42)
+        all_pred = torch.cat([r["_pred"] for r in all_records])
+        all_gt   = torch.cat([r["_gt"].float()   for r in all_records])
+        for thresh in [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]:
+            pb = (all_pred > thresh)
+            tp = int((pb & (all_gt == 1)).sum())
+            fp = int((pb & (all_gt == 0)).sum())
+            fn = int((~pb & (all_gt == 1)).sum())
+            prec = safe_div(tp, tp + fp)
+            rec  = safe_div(tp, tp + fn)
+            f1   = safe_div(2 * prec * rec, prec + rec)
+            fdr  = safe_div(fp, fp + tp)
+            marker = " ←" if thresh == 0.50 else ""
+            print(f"  {thresh:>7.2f}  {f1:>7.4f}  {prec:>7.4f}  {rec:>7.4f}  {fdr:>7.4f}{marker}")
+
+        # Also sweep by fracture_ratio bin to find optimal threshold per group
+        print("\n[Threshold Sweep — Low fracture ratio fragments only (<0.14)]")
+        low_frac = [r for r in all_records if r["fracture_ratio"] < 0.14]
+        if low_frac:
+            lf_pred = torch.cat([r["_pred"] for r in low_frac])
+            lf_gt   = torch.cat([r["_gt"].float()   for r in low_frac])
+            print(f"  {'Thresh':>7}  {'F1':>7}  {'Prec':>7}  {'Rec':>7}")
+            print("  " + "-" * 33)
+            for thresh in [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]:
+                pb = (lf_pred > thresh)
+                tp = int((pb & (lf_gt == 1)).sum())
+                fp = int((pb & (lf_gt == 0)).sum())
+                fn = int((~pb & (lf_gt == 1)).sum())
+                prec = safe_div(tp, tp + fp)
+                rec  = safe_div(tp, tp + fn)
+                f1   = safe_div(2 * prec * rec, prec + rec)
+                print(f"  {thresh:>7.2f}  {f1:>7.4f}  {prec:>7.4f}  {rec:>7.4f}")
 
     print(f"\nAll outputs saved to: {out_dir}/")
     print("Done.")

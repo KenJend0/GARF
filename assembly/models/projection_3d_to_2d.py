@@ -252,8 +252,8 @@ class Project3DTo2D(nn.Module):
         splat_sigma      : Gaussian blur sigma in pixels; 0 = disable splatting
         splat_kernel     : Gaussian blur kernel size (odd)
         use_bilinear     : if True, bilinear 4-corner projection; else floor assignment
-        use_geo_features : if True, include 3 extra geometric channels:
-                           curvature, roughness, normal_consistency (in that order)
+        use_geo_features : if True, include geometric feature channels
+        geo_features_dim : number of geometric feature channels (set by HybridGeometryFeatures.out_dim)
     """
 
     def __init__(
@@ -265,6 +265,7 @@ class Project3DTo2D(nn.Module):
         splat_kernel: int = 5,
         use_bilinear: bool = False,
         use_geo_features: bool = False,
+        geo_features_dim: int = 3,
     ):
         super().__init__()
         assert 1 <= num_views <= 3, "num_views must be 1, 2 or 3"
@@ -278,7 +279,7 @@ class Project3DTo2D(nn.Module):
         self.num_channels = (
             2
             + (3 if use_normals else 0)
-            + (3 if use_geo_features else 0)   # curvature + roughness + consistency
+            + (geo_features_dim if use_geo_features else 0)
         )
 
     def forward(
