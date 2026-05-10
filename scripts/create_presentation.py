@@ -744,7 +744,7 @@ def _fig_fusion_comparison():
     for vy in vy_list:
         arr(ax1, 7.9, vy+0.42, 8.2, 2.92, col='#D4AC0D', lw=1.2)
 
-    ax1.text(5.0, 0.3, "← vues traitées séparément\n   fusion APRÈS prédiction",
+    ax1.text(5.0, 0.3, "← views processed independently\n   fusion AFTER prediction",
              ha='center', fontsize=8, color='#E74C3C', style='italic')
 
     # ── RIGHT: Step 8 — feature-level fusion ────────────────────────────────
@@ -773,7 +773,7 @@ def _fig_fusion_comparison():
         box(ax2, 8.0, vy, 1.2, 0.85, "Decode", dec_color, fs=8)
         arr(ax2, 7.8, 2.92, 8.0, vy+0.42, col='#27AE60', lw=1.2)
 
-    ax2.text(5.0, 0.3, "← fusion AVANT décodage\n   tous les décodeurs partagent la même sémantique",
+    ax2.text(5.0, 0.3, "← fusion BEFORE decoding\n   all decoders share the same cross-view semantics",
              ha='center', fontsize=8, color='#27AE60', style='italic')
 
     plt.tight_layout(pad=0.8)
@@ -791,10 +791,10 @@ def slide_10c_fusion(prs):
         Inches(0.3), Inches(1.15), Inches(12.7), Inches(2.9))
 
     # Key message
-    tb(sl, "Step 7 : vues décodées séparément → fusion des prédictions → trop de FP",
+    tb(sl, "Step 7: views decoded separately → fuse predictions → too many FP",
        Inches(0.4), Inches(4.15), Inches(12.5), Inches(0.38),
        size=13, color=RED)
-    tb(sl, "Step 8 : bottlenecks fusionnés (max) → broadcast → même sémantique dans tous les décodeurs",
+    tb(sl, "Step 8: fuse bottlenecks (max) → broadcast → all decoders share the same cross-view semantics",
        Inches(0.4), Inches(4.55), Inches(12.5), Inches(0.38),
        size=13, color=GREEN, bold=True)
 
