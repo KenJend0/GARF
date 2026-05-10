@@ -81,6 +81,41 @@ HARDCODED: dict[str, dict[str, dict]] = {
         "precision": {"val/coarse_seg_acc": 0.8386, "val/coarse_seg_f1": 0.6907, "val/coarse_seg_precision": 0.6869, "val/coarse_seg_recall": 0.7399},
         "recall":    {"val/coarse_seg_acc": 0.8248, "val/coarse_seg_f1": 0.7262, "val/coarse_seg_precision": 0.6286, "val/coarse_seg_recall": 0.8882},
     },
+    "cnn_step6_attention": {
+        "f1":        {"val/coarse_seg_acc": 0.8304, "val/coarse_seg_f1": 0.7715, "val/coarse_seg_precision": 0.7021, "val/coarse_seg_recall": 0.8659},
+        "precision": {"val/coarse_seg_acc": 0.8265, "val/coarse_seg_f1": 0.7530, "val/coarse_seg_precision": 0.7168, "val/coarse_seg_recall": 0.8041},
+        "recall":    {"val/coarse_seg_acc": 0.6739, "val/coarse_seg_f1": 0.6527, "val/coarse_seg_precision": 0.5201, "val/coarse_seg_recall": 0.9200},
+    },
+    "cnn_step7_unet": {
+        "f1":        {"val/coarse_seg_acc": 0.8284, "val/coarse_seg_f1": 0.7708, "val/coarse_seg_precision": 0.6964, "val/coarse_seg_recall": 0.8748},
+        "precision": {"val/coarse_seg_acc": 0.8244, "val/coarse_seg_f1": 0.7544, "val/coarse_seg_precision": 0.7072, "val/coarse_seg_recall": 0.8205},
+        "recall":    {"val/coarse_seg_acc": 0.7117, "val/coarse_seg_f1": 0.6788, "val/coarse_seg_precision": 0.5578, "val/coarse_seg_recall": 0.9074},
+    },
+    "cnn_step8a_feat_mean": {
+        "f1":        {"val/coarse_seg_acc": 0.8681, "val/coarse_seg_f1": 0.8177, "val/coarse_seg_precision": 0.7443, "val/coarse_seg_recall": 0.9192},
+        "precision": {"val/coarse_seg_acc": 0.8355, "val/coarse_seg_f1": 0.7754, "val/coarse_seg_precision": 0.7504, "val/coarse_seg_recall": 0.8211},
+        "recall":    {"val/coarse_seg_acc": 0.8616, "val/coarse_seg_f1": 0.8110, "val/coarse_seg_precision": 0.7283, "val/coarse_seg_recall": 0.9274},
+    },
+    "cnn_step8b_feat_max": {
+        "f1":        {"val/coarse_seg_acc": 0.8688, "val/coarse_seg_f1": 0.8191, "val/coarse_seg_precision": 0.7512, "val/coarse_seg_recall": 0.9095},
+        "precision": {"val/coarse_seg_acc": 0.8572, "val/coarse_seg_f1": 0.8054, "val/coarse_seg_precision": 0.7541, "val/coarse_seg_recall": 0.8752},
+        "recall":    {"val/coarse_seg_acc": 0.8206, "val/coarse_seg_f1": 0.7698, "val/coarse_seg_precision": 0.6653, "val/coarse_seg_recall": 0.9294},
+    },
+    "cnn_step8c_feat_concat": {
+        "f1":        {"val/coarse_seg_acc": 0.8632, "val/coarse_seg_f1": 0.8103, "val/coarse_seg_precision": 0.7359, "val/coarse_seg_recall": 0.9134},
+        "precision": {"val/coarse_seg_acc": 0.8647, "val/coarse_seg_f1": 0.8082, "val/coarse_seg_precision": 0.7492, "val/coarse_seg_recall": 0.8917},
+        "recall":    {"val/coarse_seg_acc": 0.8075, "val/coarse_seg_f1": 0.7610, "val/coarse_seg_precision": 0.6555, "val/coarse_seg_recall": 0.9309},
+    },
+    "cnn_step8d_simplecnn_feat_mean": {
+        "f1":        {"val/coarse_seg_acc": 0.7963, "val/coarse_seg_f1": 0.7326, "val/coarse_seg_precision": 0.6525, "val/coarse_seg_recall": 0.8550},
+        "precision": {"val/coarse_seg_acc": 0.7990, "val/coarse_seg_f1": 0.7286, "val/coarse_seg_precision": 0.6606, "val/coarse_seg_recall": 0.8344},
+        "recall":    {"val/coarse_seg_acc": 0.6682, "val/coarse_seg_f1": 0.6470, "val/coarse_seg_precision": 0.5160, "val/coarse_seg_recall": 0.9185},
+    },
+    "cnn_step9_geo_features": {
+        "f1":        {"val/coarse_seg_acc": 0.8932, "val/coarse_seg_f1": 0.8550, "val/coarse_seg_precision": 0.7868, "val/coarse_seg_recall": 0.9431},
+        "precision": {"val/coarse_seg_acc": 0.8948, "val/coarse_seg_f1": 0.8536, "val/coarse_seg_precision": 0.7930, "val/coarse_seg_recall": 0.9307},
+        "recall":    {"val/coarse_seg_acc": 0.8149, "val/coarse_seg_f1": 0.7776, "val/coarse_seg_precision": 0.6595, "val/coarse_seg_recall": 0.9637},
+    },
 }
 
 VAL_METRICS = [
