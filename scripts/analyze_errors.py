@@ -181,6 +181,104 @@ def plot_bin_metrics(stats, title, xlabel, out_path):
     print(f"  Saved: {out_path}")
 
 
+def plot_f1_histogram(records, out_path, threshold=0.5):
+    """Histogram of per-fragment F1 scores."""
+    f1s = [r["f1"] for r in records]
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.hist(f1s, bins=40, color="#2196F3", edgecolor="white", linewidth=0.5)
+    ax.axvline(np.mean(f1s), color="red", linestyle="--", label=f"mean={np.mean(f1s):.3f}")
+    ax.axvline(np.median(f1s), color="orange", linestyle="--", label=f"median={np.median(f1s):.3f}")
+    ax.set_xlabel("F1 score")
+    ax.set_ylabel("Number of fragments")
+    ax.set_title(f"F1 Distribution per Fragment (threshold={threshold})")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=120)
+    plt.close()
+    print(f"  Saved: {out_path}")
+
+
+def bin_stats_complexity(records):
+    """
+    Bin fragments by object complexity into: 2 parts, 3-5 parts, 6+ parts.
+    Returns list of (label, mean_f1, mean_prec, mean_rec, count).
+    """
+    groups = {"2": [], "3-5": [], "6+": []}
+    for r in records:
+        n = int(r["n_parts"])
+        if n == 2:
+            groups["2"].append(r)
+        elif 3 <= n <= 5:
+            groups["3-5"].append(r)
+        else:
+            groups["6+"].append(r)
+    result = []
+    for label in ["2", "3-5", "6+"]:
+        subset = groups[label]
+        if not subset:
+            continue
+        result.append((
+            label,
+            np.mean([r["f1"] for r in subset]),
+            np.mean([r["precision"] for r in subset]),
+            np.mean([r["recall"] for r in subset]),
+            len(subset),
+        ))
+    return result
+
+
+def analyze_isolated_fp(records, xyz_list, k_neighbors=10, min_cluster_size=5):
+    """
+    Count and characterize isolated FP clusters.
+    A FP point is 'isolated' if its k nearest neighbors contain fewer than
+    min_cluster_size FP points.
+    Returns summary dict.
+    """
+    try:
+        from sklearn.neighbors import NearestNeighbors
+    except ImportError:
+        print("  [warn] sklearn not available — skipping isolated FP analysis")
+        return {}
+
+    total_fp = 0
+    isolated_fp = 0
+    frag_isolated_counts = []
+
+    for rec, xyz in zip(records, xyz_list):
+        fp_mask = (rec["_pred"] > 0.5).numpy() & (rec["_gt"].numpy() == 0)
+        n_fp = fp_mask.sum()
+        total_fp += n_fp
+        if n_fp < 2:
+            frag_isolated_counts.append(0)
+            continue
+
+        fp_xyz = xyz[fp_mask].numpy() if hasattr(xyz, 'numpy') else xyz[fp_mask]
+        if len(fp_xyz) < 2:
+            frag_isolated_counts.append(0)
+            continue
+
+        k = min(k_neighbors, len(fp_xyz) - 1)
+        nbrs = NearestNeighbors(n_neighbors=k + 1).fit(fp_xyz)
+        dists, idxs = nbrs.kneighbors(fp_xyz)
+        # For each FP point, count how many of its k neighbors are also FP
+        neighbors_fp = (idxs[:, 1:].shape[1])  # all neighbors are FP by construction
+        # A point is "isolated" if it has fewer than min_cluster_size FP neighbors
+        n_isolated = int((k < min_cluster_size) or (len(fp_xyz) < min_cluster_size))
+        # Simpler: if the whole FP cluster is small (<= min_cluster_size pts), it's isolated
+        is_isolated_cluster = len(fp_xyz) <= min_cluster_size
+        n_isolated = int(is_isolated_cluster) * len(fp_xyz)
+        isolated_fp += n_isolated
+        frag_isolated_counts.append(n_isolated)
+
+    return {
+        "total_fp": total_fp,
+        "isolated_fp": isolated_fp,
+        "isolated_fp_rate": isolated_fp / max(total_fp, 1),
+        "frags_with_isolated_fp": sum(1 for c in frag_isolated_counts if c > 0),
+    }
+
+
 def plot_fp_fn_dist(records, out_path):
     fp_rates = [r["fp"] / max(r["n_pts"], 1) for r in records]
     fn_rates = [r["fn"] / max(r["n_fracture"], 1) for r in records if r["n_fracture"] > 0]
@@ -319,8 +417,12 @@ def main():
 
     print("Instantiating datamodule...")
     datamodule = instantiate(cfg.data)
-    datamodule.setup("fit")
-    loader = datamodule.val_dataloader() if args.split == "val" else datamodule.test_dataloader()
+    if args.split == "val":
+        datamodule.setup("fit")
+        loader = datamodule.val_dataloader()
+    else:
+        datamodule.setup("test")
+        loader = datamodule.test_dataloader()
 
     # --- Load model ---
     print("Loading model from checkpoint...")
@@ -437,8 +539,27 @@ def main():
     plot_bin_metrics(stats_parts, "F1 / Precision / Recall by Number of Parts",
                      "Number of parts in object", out_dir / "metrics_by_n_parts.png")
 
+    # --- Analysis by complexity (2 parts / 3-5 / 6+) ---
+    print("\n[F1 by Object Complexity (2 / 3-5 / 6+ parts)]")
+    stats_complexity = bin_stats_complexity(all_records)
+    for label, f1, prec, rec, cnt in stats_complexity:
+        print(f"  {label:<8}  F1={f1:.3f}  Prec={prec:.3f}  Rec={rec:.3f}  (n={cnt})")
+    plot_bin_metrics(stats_complexity, "F1 / Precision / Recall by Object Complexity",
+                     "Number of parts (complexity)", out_dir / "metrics_by_complexity.png")
+
+    # --- F1 histogram ---
+    plot_f1_histogram(all_records, out_dir / "f1_histogram.png")
+
     # --- FP/FN distribution ---
     plot_fp_fn_dist(all_records, out_dir / "fp_fn_distribution.png")
+
+    # --- Isolated FP analysis ---
+    print("\n[Isolated FP Cluster Analysis]")
+    iso = analyze_isolated_fp(all_records, all_xyz)
+    if iso:
+        print(f"  Total FP points:         {iso['total_fp']:,}")
+        print(f"  Isolated FP points:      {iso['isolated_fp']:,}  ({iso['isolated_fp_rate']:.1%})")
+        print(f"  Frags with isolated FP:  {iso['frags_with_isolated_fp']}")
 
     # --- Qualitative visualizations ---
     print(f"\nGenerating qualitative visualizations (n_vis={args.n_vis})...")
@@ -462,12 +583,17 @@ def main():
 
     # --- Threshold sweep (optional) ---
     if args.sweep_threshold:
+        import json
+        THRESHOLDS = [round(t, 2) for t in np.arange(0.30, 0.81, 0.05)]
         print("\n[Threshold Sweep — Global F1 / Precision / Recall]")
         print(f"  {'Thresh':>7}  {'F1':>7}  {'Prec':>7}  {'Rec':>7}  {'FDR':>7}")
         print("  " + "-" * 42)
         all_pred = torch.cat([r["_pred"] for r in all_records])
         all_gt   = torch.cat([r["_gt"].float()   for r in all_records])
-        for thresh in [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]:
+
+        best_thresh, best_f1 = 0.50, 0.0
+        sweep_results = []
+        for thresh in THRESHOLDS:
             pb = (all_pred > thresh)
             tp = int((pb & (all_gt == 1)).sum())
             fp = int((pb & (all_gt == 0)).sum())
@@ -478,6 +604,34 @@ def main():
             fdr  = safe_div(fp, fp + tp)
             marker = " ←" if thresh == 0.50 else ""
             print(f"  {thresh:>7.2f}  {f1:>7.4f}  {prec:>7.4f}  {rec:>7.4f}  {fdr:>7.4f}{marker}")
+            sweep_results.append({"threshold": thresh, "f1": f1, "precision": prec, "recall": rec, "fdr": fdr})
+            if f1 > best_f1:
+                best_f1, best_thresh = f1, thresh
+
+        print(f"\n  Best threshold on {args.split} set: {best_thresh:.2f}  (F1={best_f1:.4f})")
+        threshold_file = out_dir / "best_threshold.json"
+        with open(threshold_file, "w") as fh:
+            json.dump({"split": args.split, "best_threshold": best_thresh, "best_f1": best_f1,
+                       "sweep": sweep_results}, fh, indent=2)
+        print(f"  Saved best threshold to: {threshold_file}")
+
+        # Precision-Recall curve
+        fig, ax = plt.subplots(figsize=(6, 5))
+        precs_sw = [r["precision"] for r in sweep_results]
+        recs_sw  = [r["recall"]    for r in sweep_results]
+        f1s_sw   = [r["f1"]        for r in sweep_results]
+        ax.plot(recs_sw, precs_sw, "b-o", markersize=5)
+        for r in sweep_results:
+            ax.annotate(f"{r['threshold']:.2f}", (r["recall"], r["precision"]),
+                        fontsize=7, textcoords="offset points", xytext=(3, 3))
+        ax.set_xlabel("Recall")
+        ax.set_ylabel("Precision")
+        ax.set_title(f"Precision-Recall curve ({args.split} set)")
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(out_dir / "threshold_pr_curve.png", dpi=120)
+        plt.close()
+        print(f"  Saved: {out_dir}/threshold_pr_curve.png")
 
         # Also sweep by fracture_ratio bin to find optimal threshold per group
         print("\n[Threshold Sweep — Low fracture ratio fragments only (<0.14)]")
@@ -487,7 +641,7 @@ def main():
             lf_gt   = torch.cat([r["_gt"].float()   for r in low_frac])
             print(f"  {'Thresh':>7}  {'F1':>7}  {'Prec':>7}  {'Rec':>7}")
             print("  " + "-" * 33)
-            for thresh in [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]:
+            for thresh in THRESHOLDS:
                 pb = (lf_pred > thresh)
                 tp = int((pb & (lf_gt == 1)).sum())
                 fp = int((pb & (lf_gt == 0)).sum())

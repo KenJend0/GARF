@@ -59,6 +59,7 @@ class BreakingBadDataModule(L.LightningDataModule):
 
         self.train_dataset: Optional[Dataset] = None
         self.val_dataset: Optional[Dataset] = None
+        self.test_dataset: Optional[Dataset] = None
 
     def setup(self, stage):
         if stage == "fit":
@@ -109,10 +110,10 @@ class BreakingBadDataModule(L.LightningDataModule):
             )
 
         if stage == "test" or stage == "predict":
-            self.val_dataset = ConcatDataset(
+            self.test_dataset = ConcatDataset(
                 [
                     self.dataset_cls(
-                        split="val",
+                        split="test",
                         data_root=(
                             self.additional_data_root[category]
                             if self.additional_data_root is not None
@@ -151,6 +152,7 @@ class BreakingBadDataModule(L.LightningDataModule):
         )
 
     def test_dataloader(self):
+        dataset = self.test_dataset if self.test_dataset is not None else self.val_dataset
         return DataLoader(
-            self.val_dataset, batch_size=self.batch_size, num_workers=self.num_workers, collate_fn=BreakingBadWeighted.collate_fn
+            dataset, batch_size=self.batch_size, num_workers=self.num_workers, collate_fn=BreakingBadWeighted.collate_fn
         )
