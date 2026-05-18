@@ -8,7 +8,17 @@ import torch.serialization
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig, OmegaConf
 
-torch.serialization.add_safe_globals([functools.partial])
+torch.serialization.add_safe_globals([
+    functools.partial,
+    torch.optim.adamw.AdamW,
+    torch.optim.adam.Adam,
+    torch.optim.sgd.SGD,
+    torch.optim.lr_scheduler.CosineAnnealingLR,
+    torch.optim.lr_scheduler.StepLR,
+    torch.optim.lr_scheduler.OneCycleLR,
+    torch.optim.lr_scheduler.LinearLR,
+    torch.optim.lr_scheduler.SequentialLR,
+])
 OmegaConf.register_new_resolver("getIndex", lambda lst, idx: lst[idx])
 
 
