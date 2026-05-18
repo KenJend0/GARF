@@ -10,9 +10,9 @@ from omegaconf import DictConfig, OmegaConf
 
 torch.serialization.add_safe_globals([
     functools.partial,
-    torch.optim.adamw.AdamW,
-    torch.optim.adam.Adam,
-    torch.optim.sgd.SGD,
+    torch.optim.AdamW,
+    torch.optim.Adam,
+    torch.optim.SGD,
     torch.optim.lr_scheduler.CosineAnnealingLR,
     torch.optim.lr_scheduler.StepLR,
     torch.optim.lr_scheduler.OneCycleLR,
