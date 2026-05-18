@@ -1,0 +1,56 @@
+# @package _global_
+# configs/experiment/cnn_step11_hard_sampling.yaml
+#
+# Step 11 — Hard example focus : Focal Loss + WeightedRandomSampler
+#
+# Diagnostic Steps 9/10 : le modèle échoue sur les fragments à faible ratio
+# fracture (ratio<7% → F1=0.284). Deux causes identifiées :
+#
+#   1. Signal trop faible dans la projection 2D : une fracture à 3% occupe
+#      ~2 pixels sur 64×64 → le gradient est noyé par les pixels intacts.
+#      → Solution : Focal Loss (γ=2). Les pixels fracture prédits avec peu
+#        de confiance reçoivent un gradient ×4 plus fort.
+#
+#   2. Distribution d'entraînement biaisée : les objets difficiles sont
+#      vus moins souvent → le modèle apprend à les ignorer.
+#      → Solution : WeightedRandomSampler. Poids = 1/(ratio+0.05).
+#
+# Architecture : identique à Step 9 (aucun changement de couches).
+# Fine-tuning depuis le checkpoint Step 9 avec lr réduit (1e-4 vs 1e-3).
+# 30 epochs suffisent pour "patcher" la faiblesse sans oublier les acquis.
+#
+# Loss : 0.5 * Dice + 0.5 * Focal(γ=2)
+#   Dice  : stabilise l'entraînement globalement
+#   Focal : force l'attention sur les petites fractures
+
+defaults:
+  - cnn_ablation_shared
+  - _self_
+
+experiment_name: cnn_step11_hard_sampling
+tags: ["cnn", "ablation", "step11", "focal_loss", "weighted_sampling"]
+
+trainer:
+  max_epochs: 30
+
+model:
+  use_normals: true
+  splat_sigma: 1.5
+  use_bilinear: true
+  use_global_context: true
+  use_view_attn: false
+  backbone: unet
+  unet_depth: 4
+  feature_fusion: "max"
+  use_geo_features: true
+  geo_k: 16
+  use_focal_loss: true
+  focal_gamma: 2.0
+  focal_dice_alpha: 0.5   # 50% Dice + 50% Focal
+
+  # Learning rate réduit pour fine-tuning (évite l'oubli catastrophique)
+  optimizer:
+    lr: 1e-4
+
+data:
+  weight_hard_examples: true

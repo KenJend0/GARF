@@ -149,6 +149,36 @@ class BreakingBadBase(Dataset):
         h5_file.close()
         return filtered_data_list
 
+    def compute_fracture_ratios(self) -> List[float]:
+        """
+        Calcule le ratio de faces fracturées pour chaque objet de data_list.
+        Lit uniquement shared_faces (pas la géométrie) → rapide même sur NFS.
+
+        Utilisé par le WeightedRandomSampler pour suréchantillonner les
+        fragments difficiles (faible ratio fracture) pendant l'entraînement.
+
+        Returns:
+            Liste de floats dans [0, 1], un par objet dans data_list.
+        """
+        ratios = []
+        h5_file = h5py.File(self.data_root, "r")
+        for name in self.data_list:
+            try:
+                pieces = list(h5_file[name]["pieces"].keys())
+                total_faces = 0
+                fracture_faces = 0
+                for piece in pieces:
+                    n_faces = h5_file[name]["pieces"][piece]["faces"].shape[0]
+                    total_faces += n_faces
+                    if "shared_faces" in h5_file[name]["pieces"][piece]:
+                        sf = h5_file[name]["pieces"][piece]["shared_faces"][:]
+                        fracture_faces += int((sf != -1).sum())
+                ratios.append(fracture_faces / max(total_faces, 1))
+            except Exception:
+                ratios.append(0.5)  # valeur neutre si erreur
+        h5_file.close()
+        return ratios
+
     def get_meshes(self, name: str) -> List[trimesh.Trimesh]:
         """
         Charge les meshes bruts d'un objet pour la visualisation.

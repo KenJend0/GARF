@@ -1,7 +1,8 @@
 from typing import Literal, Optional, List, Dict
 
+import numpy as np
 import lightning as L
-from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, WeightedRandomSampler
 
 from . import BreakingBadUniform, BreakingBadWeighted
 
@@ -24,6 +25,7 @@ class BreakingBadDataModule(L.LightningDataModule):
         mesh_sample_strategy: Literal["uniform", "poisson"] = "poisson",
         random_anchor: bool = False,
         additional_data_root: Optional[Dict[str, str]] = None,
+        weight_hard_examples: bool = False,
     ):
         super().__init__()
         self.data_root = data_root
@@ -49,6 +51,9 @@ class BreakingBadDataModule(L.LightningDataModule):
 
         # If breaking_bad_other_data_root is provided
         self.additional_data_root = additional_data_root
+        # Suréchantillonnage des objets difficiles (faible ratio fracture)
+        # weight_hard_examples=True active le WeightedRandomSampler sur train
+        self.weight_hard_examples = weight_hard_examples
 
         if self.sample_method == "uniform":
             self.dataset_cls = BreakingBadUniform
@@ -135,11 +140,33 @@ class BreakingBadDataModule(L.LightningDataModule):
             )
 
     def train_dataloader(self):
+        sampler = None
+        shuffle = True
+        if self.weight_hard_examples:
+            # Calcule les ratios fracture de tous les datasets concaténés
+            all_ratios = []
+            for ds in self.train_dataset.datasets:
+                print("Computing fracture ratios for weighted sampling...")
+                all_ratios.extend(ds.compute_fracture_ratios())
+            all_ratios = np.array(all_ratios, dtype=np.float32)
+            # Poids inversement proportionnel au ratio + epsilon pour éviter /0
+            # Les objets difficiles (ratio~0) reçoivent un poids élevé
+            weights = 1.0 / (all_ratios + 0.05)
+            sampler = WeightedRandomSampler(
+                weights=weights.tolist(),
+                num_samples=len(all_ratios),
+                replacement=True,
+            )
+            shuffle = False   # incompatible avec sampler
+            print(f"WeightedRandomSampler: {len(all_ratios)} objects, "
+                  f"ratio range [{all_ratios.min():.3f}, {all_ratios.max():.3f}]")
+
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=sampler,
             persistent_workers=False,
         )
 

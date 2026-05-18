@@ -40,7 +40,7 @@ import torch.nn.functional as F
 import lightning as pl
 import torchmetrics
 
-from assembly.models.pretraining.loss import dice_loss, tversky_loss
+from assembly.models.pretraining.loss import dice_loss, tversky_loss, focal_loss, dice_focal_loss
 from assembly.models.projection_3d_to_2d import Project3DTo2D
 from assembly.models.hybrid_geometry_features import HybridGeometryFeatures
 from assembly.models.projection_mapping_utils import (
@@ -352,6 +352,9 @@ class CNNFracSeg(pl.LightningModule):
         use_dist_to_centroid: bool = False,
         use_tversky_loss: bool = False,
         tversky_alpha: float = 0.7,
+        use_focal_loss: bool = False,
+        focal_gamma: float = 2.0,
+        focal_dice_alpha: float = 0.5,
         **kwargs,
     ):
         super().__init__()
@@ -366,6 +369,9 @@ class CNNFracSeg(pl.LightningModule):
         self.use_geo_features     = use_geo_features
         self.use_tversky_loss     = use_tversky_loss
         self.tversky_alpha        = tversky_alpha
+        self.use_focal_loss       = use_focal_loss
+        self.focal_gamma          = focal_gamma
+        self.focal_dice_alpha     = focal_dice_alpha
         self._optimizer           = optimizer
         self._lr_scheduler        = lr_scheduler
 
@@ -432,7 +438,10 @@ class CNNFracSeg(pl.LightningModule):
         gt      = output_dict["coarse_seg_gt"].float()   # (N_sum_valid,)
         gt_long = output_dict["coarse_seg_gt"]           # (N_sum_valid,) long
 
-        if self.use_tversky_loss:
+        if self.use_focal_loss:
+            loss = dice_focal_loss(pred, gt, gamma=self.focal_gamma,
+                                   alpha=self.focal_dice_alpha)
+        elif self.use_tversky_loss:
             loss = tversky_loss(pred, gt, alpha=self.tversky_alpha,
                                 beta=1.0 - self.tversky_alpha)
         else:
