@@ -1,11 +1,14 @@
+import functools
 from typing import List
 
 import hydra
 import lightning as L
 import torch
+import torch.serialization
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig, OmegaConf
 
+torch.serialization.add_safe_globals([functools.partial])
 OmegaConf.register_new_resolver("getIndex", lambda lst, idx: lst[idx])
 
 
