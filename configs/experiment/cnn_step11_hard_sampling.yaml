@@ -31,7 +31,7 @@ experiment_name: cnn_step11_hard_sampling
 tags: ["cnn", "ablation", "step11", "focal_loss", "weighted_sampling"]
 
 trainer:
-  max_epochs: 30
+  max_epochs: 130   # 99 epochs Step 9 déjà faits + 30 epochs de fine-tuning
 
 model:
   use_normals: true
