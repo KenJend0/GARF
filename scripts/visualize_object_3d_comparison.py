@@ -161,7 +161,11 @@ def run_cnn_inference(raw: dict, dataset, ckpt: str, threshold: float, device: t
     pred_flat = out["coarse_seg_pred"].float().cpu().numpy()   # (N_total,)
     gt_flat   = out["coarse_seg_gt"].long().cpu().numpy()      # (N_total,)
 
-    # Split into per-fragment arrays
+    # Utiliser les coordonnées GT du transform — même ordre de points que les prédictions
+    # (le transform applique shuffle, les gt coords sont shufflées dans le même ordre)
+    # data["pointclouds_gt"] shape: (max_parts, N, 3) numpy
+    xyz_gt_transformed = data["pointclouds_gt"]  # (max_parts, N, 3)
+
     num_parts = raw["num_parts"]
     N = dataset.num_points_to_sample
 
@@ -172,7 +176,7 @@ def run_cnn_inference(raw: dict, dataset, ckpt: str, threshold: float, device: t
         g = gt_flat[start:end].astype(bool)
         preds_b.append(p > threshold)
         gts_b.append(g)
-        xyz_list.append(raw["pointclouds_gt"][i])
+        xyz_list.append(xyz_gt_transformed[i])   # coordonnées cohérentes avec les prédictions
 
     return preds_b, gts_b, xyz_list
 
@@ -400,28 +404,41 @@ def main():
     num_parts = raw["num_parts"]
     print(f"Object: {obj_name}  ({num_parts} fragments)")
 
-    # GT arrays
-    gt_list  = [raw["fracture_surface_gt"][i].astype(bool) for i in range(num_parts)]
-    xyz_list = [raw["pointclouds_gt"][i] for i in range(num_parts)]
-
     panels = []
 
-    # --- Panel GT ---
-    gt_colors = [colorize_gt_only(g) for g in gt_list]
     try:
         import open3d as o3d
-        gt_pcd = build_open3d_pcd(xyz_list, gt_colors)
-        panels.append(("Ground Truth", gt_pcd))
+        has_o3d = True
     except ImportError:
         print("[warn] open3d not installed — install with: pip install open3d")
+        has_o3d = False
+
+    # --- Panel CNN (run first pour obtenir xyz_list dans le bon système de coords) ---
+    cnn_preds = cnn_gts = xyz_list = None
+    if args.ckpt and not args.gt_only:
+        print(f"\nRunning CNN inference (threshold={args.threshold})...")
+        cnn_preds, cnn_gts, xyz_list = run_cnn_inference(raw, dataset, args.ckpt,
+                                                          args.threshold, device)
+        print_fragment_metrics("CNN", cnn_preds, cnn_gts)
+
+    # Si pas de CNN, construire xyz_list depuis les coords GT (brutes)
+    if xyz_list is None:
+        xyz_list = [raw["pointclouds_gt"][i] for i in range(num_parts)]
+        gt_list  = [raw["fracture_surface_gt"][i].astype(bool) for i in range(num_parts)]
+    else:
+        # Utiliser les GT labels depuis le CNN (même ordre de points que les prédictions)
+        gt_list = cnn_gts
+
+    # --- Panel GT (utilise xyz_list cohérent avec les prédictions) ---
+    if has_o3d:
+        gt_colors = [colorize_gt_only(g) for g in gt_list]
+        gt_pcd = build_open3d_pcd(xyz_list, gt_colors)
+        panels.append(("Ground Truth", gt_pcd))
+    else:
         gt_pcd = None
 
     # --- Panel CNN ---
-    if args.ckpt and not args.gt_only:
-        print(f"\nRunning CNN inference (threshold={args.threshold})...")
-        cnn_preds, cnn_gts, _ = run_cnn_inference(raw, dataset, args.ckpt,
-                                                   args.threshold, device)
-        print_fragment_metrics("CNN", cnn_preds, cnn_gts)
+    if cnn_preds is not None:
         cnn_colors = [colorize_fragment(p, g) for p, g in zip(cnn_preds, cnn_gts)]
         if gt_pcd is not None:
             cnn_pcd = build_open3d_pcd(xyz_list, cnn_colors)
