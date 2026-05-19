@@ -183,61 +183,80 @@ def run_cnn_inference(raw: dict, dataset, ckpt: str, threshold: float, device: t
 
 def run_garf_inference(raw: dict, dataset, ckpt: str, threshold: float, device: torch.device):
     """
-    Exécute le modèle FracSeg (PTv3) depuis un checkpoint GARF.
-    Instancie FracSeg via Hydra (même approche qu'eval_segmentation.py).
+    Exécute FracSeg (PTv3) depuis un checkpoint GARF.
+
+    FracSeg attend le format BreakingBadWeighted (points concatenés, pas stackés).
+    On applique donc BreakingBadWeighted.transform() sur les données brutes.
     """
     from hydra import compose, initialize_config_dir
     from hydra.utils import instantiate as hydra_instantiate
-
-    config_dir = str(Path(__file__).resolve().parent.parent / "configs")
+    from hydra.core.global_hydra import GlobalHydra
+    from assembly.data.breaking_bad.weighted import BreakingBadWeighted
 
     # Extraire les poids feature_extractor si checkpoint GARF complet
     ckpt_data = torch.load(ckpt, map_location="cpu", weights_only=False)
     keys = list(ckpt_data.get("state_dict", {}).keys())
     is_garf = any(k.startswith("feature_extractor.") for k in keys)
+    state_dict = {
+        k.replace("feature_extractor.", ""): v
+        for k, v in ckpt_data["state_dict"].items()
+        if k.startswith("feature_extractor.")
+    } if is_garf else ckpt_data.get("state_dict", ckpt_data)
 
-    if is_garf:
-        state_dict = {
-            k.replace("feature_extractor.", ""): v
-            for k, v in ckpt_data["state_dict"].items()
-            if k.startswith("feature_extractor.")
-        }
-    else:
-        state_dict = ckpt_data.get("state_dict", ckpt_data)
-
-    # Instancier FracSeg depuis la config Hydra (fournit les args d'architecture)
+    # Instancier FracSeg via Hydra
+    config_dir = str(Path(__file__).resolve().parent.parent / "configs")
+    GlobalHydra.instance().clear()
     with initialize_config_dir(config_dir=config_dir, version_base="1.3"):
         cfg = compose(config_name="eval", overrides=["experiment=eval_frac_seg"])
+    GlobalHydra.instance().clear()
 
     model = hydra_instantiate(cfg.model)
     model.load_state_dict(state_dict, strict=False)
     model.eval().to(device)
 
-    data = dataset.transform(raw.copy())
+    # Créer une instance légère de BreakingBadWeighted pour accéder à son transform
+    # (format concatené requis par FracSeg, contrairement au format stacké de Uniform)
+    weighted_ds = object.__new__(BreakingBadWeighted)
+    weighted_ds.max_parts = dataset.max_parts
+    weighted_ds.num_points_to_sample = dataset.num_points_to_sample
+    weighted_ds.num_removal = 0
+    weighted_ds.num_redundancy = 0
+    weighted_ds.random_anchor = False
+    weighted_ds.multi_ref = False
+
+    data = weighted_ds.transform(raw.copy())
+
+    # Construire le batch au format FracSeg (concatené, pas stacké)
+    def to_tensor(v):
+        if isinstance(v, np.ndarray):
+            return torch.tensor(v).unsqueeze(0).to(device)
+        return v
+
     batch = {
-        k: torch.tensor(v).unsqueeze(0).to(device) if isinstance(v, np.ndarray) else v
-        for k, v in data.items()
+        "pointclouds":          to_tensor(data["pointclouds"]),
+        "pointclouds_normals":  to_tensor(data["pointclouds_normals"]),
+        "points_per_part":      to_tensor(data["points_per_part"]),
+        "fracture_surface_gt":  to_tensor(data["fracture_surface_gt"].astype(np.int64)),
+        "graph":                to_tensor(data["graph"]),
     }
-    for k in ["name", "removal_pieces", "redundant_pieces"]:
-        if k in data:
-            batch[k] = [data[k]]
 
     with torch.no_grad():
         out = model(batch)
 
-    pred_flat = out["coarse_seg_pred"].float().cpu().numpy()
-    gt_flat   = out["coarse_seg_gt"].long().cpu().numpy()
+    pred_flat = out["coarse_seg_pred"].float().cpu().numpy()   # (N_valid_total,)
+    gt_flat   = out["coarse_seg_gt"].long().cpu().numpy()      # (N_total,)
 
-    num_parts = raw["num_parts"]
+    # Extraire par fragment — N uniforme par fragment valide
     N = dataset.num_points_to_sample
+    num_parts = raw["num_parts"]
+    xyz_concat = data["pointclouds_gt"]   # (N_total, 3) concatené, même ordre que GT
+
     preds_b, gts_b, xyz_list = [], [], []
     for i in range(num_parts):
         start, end = i * N, (i + 1) * N
-        p = pred_flat[start:end]
-        g = gt_flat[start:end].astype(bool)
-        preds_b.append(p > threshold)
-        gts_b.append(g)
-        xyz_list.append(raw["pointclouds_gt"][i])
+        preds_b.append(pred_flat[start:end] > threshold)
+        gts_b.append(gt_flat[start:end].astype(bool))
+        xyz_list.append(xyz_concat[start:end])
 
     return preds_b, gts_b, xyz_list
 
