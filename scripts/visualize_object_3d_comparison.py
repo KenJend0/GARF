@@ -129,87 +129,148 @@ def load_object_data(data_root: str, name: str = None, index: int = None,
 # Inference helpers
 # ---------------------------------------------------------------------------
 
+def _make_cnn_batch_no_rotation(raw: dict, dataset, device: torch.device):
+    """
+    Prépare un batch CNN sans rotation aléatoire ni shuffle.
+    → Chaque fragment est centré puis normalisé, mais dans l'ordre original des points.
+    → Les coordonnées GT retournées sont celles de raw["pointclouds_gt"] (assemblées, non tournées).
+
+    Returns:
+        batch   : dict prêt pour CNNFracSeg.forward()
+        xyz_list: list de (N, 3) — coordonnées GT originales (non tournées) par fragment
+        gt_list : list de (N,) bool — labels fracture dans le même ordre de points
+    """
+    num_parts = raw["num_parts"]
+    N         = dataset.num_points_to_sample
+    max_parts = dataset.max_parts
+
+    xyz_list = [raw["pointclouds_gt"][i].astype(np.float32)          for i in range(num_parts)]
+    nrm_list = [raw["pointclouds_normals_gt"][i].astype(np.float32)  for i in range(num_parts)]
+    gt_list  = [raw["fracture_surface_gt"][i].astype(bool)           for i in range(num_parts)]
+
+    # Centrer + normaliser chaque fragment pour le modèle (sans rotation ni shuffle)
+    pointclouds_model = []
+    normals_model     = []
+    for i in range(num_parts):
+        xyz = xyz_list[i].copy()
+        xyz -= xyz.mean(axis=0)           # centrage
+        s = np.max(np.abs(xyz))
+        if s > 0:
+            xyz /= s                      # normalisation
+        pointclouds_model.append(xyz)
+        normals_model.append(nrm_list[i].copy())
+
+    # Padding à max_parts
+    pc_pad  = np.zeros((max_parts, N, 3), dtype=np.float32)
+    nm_pad  = np.zeros((max_parts, N, 3), dtype=np.float32)
+    fr_pad  = np.zeros((max_parts, N),    dtype=np.int8)
+    ppp     = np.zeros(max_parts,         dtype=np.int64)
+    graph   = raw["graph"].astype(np.float32)
+
+    for i in range(num_parts):
+        pc_pad[i] = pointclouds_model[i]
+        nm_pad[i] = normals_model[i]
+        fr_pad[i] = gt_list[i].astype(np.int8)
+        ppp[i]    = N
+
+    batch = {
+        "pointclouds":         torch.tensor(pc_pad).unsqueeze(0).to(device),
+        "pointclouds_normals": torch.tensor(nm_pad).unsqueeze(0).to(device),
+        "points_per_part":     torch.tensor(ppp).unsqueeze(0).to(device),
+        "fracture_surface_gt": torch.tensor(fr_pad.reshape(1, -1)).to(device),
+        "graph":               torch.tensor(graph).unsqueeze(0).to(device),
+        "name":                [raw.get("name", "")],
+        "removal_pieces":      [raw.get("removal_pieces", "")],
+        "redundant_pieces":    [raw.get("redundant_pieces", "")],
+    }
+    return batch, xyz_list, gt_list
+
+
 def run_cnn_inference(raw: dict, dataset, ckpt: str, threshold: float, device: torch.device):
     """
-    Exécute le modèle CNN sur tous les fragments d'un objet.
-
-    Retourne:
-        preds_b : list de (N,) bool — prédiction binaire par fragment
-        gt_b    : list de (N,) bool — GT binaire par fragment
-        xyz_list: list de (N, 3) float — coordonnées 3D par fragment
+    Exécute CNNFracSeg sans rotation aléatoire.
+    Les coordonnées xyz retournées sont les coordonnées GT originales (assemblées).
     """
     from assembly.models.cnn_segmentation_model import CNNFracSeg
 
     model = CNNFracSeg.load_from_checkpoint(ckpt, map_location=device, weights_only=False)
     model.eval().to(device)
 
-    data = dataset.transform(raw.copy())
-
-    # Build a batch of size 1
-    batch = {
-        k: torch.tensor(v).unsqueeze(0).to(device) if isinstance(v, np.ndarray) else v
-        for k, v in data.items()
-    }
-    # String keys
-    for k in ["name", "removal_pieces", "redundant_pieces"]:
-        if k in data:
-            batch[k] = [data[k]]
+    batch, xyz_list, gt_list = _make_cnn_batch_no_rotation(raw, dataset, device)
 
     with torch.no_grad():
         out = model(batch)
 
-    pred_flat = out["coarse_seg_pred"].float().cpu().numpy()   # (N_total,)
-    gt_flat   = out["coarse_seg_gt"].long().cpu().numpy()      # (N_total,)
-
-    # Utiliser les coordonnées GT du transform — même ordre de points que les prédictions
-    # (le transform applique shuffle, les gt coords sont shufflées dans le même ordre)
-    # data["pointclouds_gt"] shape: (max_parts, N, 3) numpy
-    xyz_gt_transformed = data["pointclouds_gt"]  # (max_parts, N, 3)
+    pred_flat = out["coarse_seg_pred"].float().cpu().numpy()
+    gt_flat   = out["coarse_seg_gt"].long().cpu().numpy()
 
     num_parts = raw["num_parts"]
-    N = dataset.num_points_to_sample
+    N         = dataset.num_points_to_sample
 
-    preds_b, gts_b, xyz_list = [], [], []
+    preds_b, gts_b = [], []
     for i in range(num_parts):
         start, end = i * N, (i + 1) * N
-        p = pred_flat[start:end]
-        g = gt_flat[start:end].astype(bool)
-        preds_b.append(p > threshold)
-        gts_b.append(g)
-        xyz_list.append(xyz_gt_transformed[i])   # coordonnées cohérentes avec les prédictions
+        preds_b.append(pred_flat[start:end] > threshold)
+        gts_b.append(gt_flat[start:end].astype(bool))
 
     return preds_b, gts_b, xyz_list
 
 
 def run_garf_inference(raw: dict, dataset, ckpt: str, threshold: float, device: torch.device):
     """
-    Exécute FracSeg (PTv3) depuis un checkpoint GARF.
-
-    GARF a été entraîné avec BreakingBadWeighted (5000 pts TOTAL par objet).
-    On recharge les données via BreakingBadWeighted pour respecter cette distribution.
+    Exécute FracSeg (PTv3) sans rotation aléatoire.
+    Utilise les MÊMES points que CNN (coordonnées GT brutes) en subsamplant à 5000 pts total.
+    → Tous les panels (GT, CNN, GARF) partagent le même système de coordonnées.
     """
     from hydra import compose, initialize_config_dir
     from hydra.utils import instantiate as hydra_instantiate
     from hydra.core.global_hydra import GlobalHydra
-    from assembly.data.breaking_bad.weighted import BreakingBadWeighted
 
-    # Recharger l'objet via BreakingBadWeighted (5000 pts total, format concatené)
-    print("  [GARF] Loading object with BreakingBadWeighted (5000 pts total)...")
-    weighted_ds = BreakingBadWeighted(
-        split=dataset.split,
-        data_root=dataset.data_root,
-        category=dataset.category,
-        num_points_to_sample=5000,   # distribution d'entraînement GARF
-        mesh_sample_strategy="uniform",
-        min_points_per_part=dataset.min_points_per_part,
-        max_parts=dataset.max_parts,
-    )
-    obj_name = raw["name"]
-    idx = weighted_ds.data_list.index(obj_name)
-    weighted_raw = weighted_ds.get_data(idx)
-    data = weighted_ds.transform(weighted_raw)
+    num_parts = raw["num_parts"]
+    N_uniform = dataset.num_points_to_sample   # 5000 pts/fragment (CNN)
+    max_parts = dataset.max_parts
+    N_total_garf = 5000                        # total pts pour GARF (distribution entraînement)
 
-    # Extraire les poids feature_extractor si checkpoint GARF complet
+    # Nombre de points par fragment pour GARF (répartition uniforme entre fragments)
+    pts_per_frag = max(1, N_total_garf // num_parts)
+    pts_per_frag = min(pts_per_frag, N_uniform)  # ne pas dépasser ce qu'on a
+
+    # Sous-échantillonner les points GT (même base que CNN, subsample pour GARF)
+    rng = np.random.default_rng(seed=0)  # seed fixe → reproducible
+    xyz_list, gt_list, pc_model, nm_model, n_per_frag = [], [], [], [], []
+    for i in range(num_parts):
+        xyz_full = raw["pointclouds_gt"][i].astype(np.float32)
+        nrm_full = raw["pointclouds_normals_gt"][i].astype(np.float32)
+        gt_full  = raw["fracture_surface_gt"][i].astype(bool)
+
+        # Subsample à pts_per_frag
+        idx = rng.choice(len(xyz_full), size=pts_per_frag, replace=False)
+        xyz = xyz_full[idx]
+        nrm = nrm_full[idx]
+        gt  = gt_full[idx]
+
+        xyz_list.append(xyz)
+        gt_list.append(gt)
+        n_per_frag.append(pts_per_frag)
+
+        # Centrer + normaliser pour le modèle (sans rotation)
+        xyz_c = xyz - xyz.mean(axis=0)
+        s = np.max(np.abs(xyz_c))
+        if s > 0:
+            xyz_c /= s
+        pc_model.append(xyz_c)
+        nm_model.append(nrm.copy())
+
+    # Concaténer en format FracSeg (flat, pas stacké)
+    pc_concat  = np.concatenate(pc_model).astype(np.float32)
+    nm_concat  = np.concatenate(nm_model).astype(np.float32)
+    gt_concat  = np.concatenate(gt_list).astype(np.int64)
+
+    ppp = np.zeros(max_parts, dtype=np.int64)
+    for i in range(num_parts):
+        ppp[i] = n_per_frag[i]
+
+    # Extraire les poids feature_extractor
     ckpt_data = torch.load(ckpt, map_location="cpu", weights_only=False)
     keys = list(ckpt_data.get("state_dict", {}).keys())
     is_garf = any(k.startswith("feature_extractor.") for k in keys)
@@ -230,17 +291,12 @@ def run_garf_inference(raw: dict, dataset, ckpt: str, threshold: float, device: 
     model.load_state_dict(state_dict, strict=False)
     model.eval().to(device)
 
-    def to_tensor(v):
-        if isinstance(v, np.ndarray):
-            return torch.tensor(v).unsqueeze(0).to(device)
-        return v
-
     batch = {
-        "pointclouds":         to_tensor(data["pointclouds"]),
-        "pointclouds_normals": to_tensor(data["pointclouds_normals"]),
-        "points_per_part":     to_tensor(data["points_per_part"]),
-        "fracture_surface_gt": to_tensor(data["fracture_surface_gt"].astype(np.int64)),
-        "graph":               to_tensor(data["graph"]),
+        "pointclouds":         torch.tensor(pc_concat).unsqueeze(0).to(device),
+        "pointclouds_normals": torch.tensor(nm_concat).unsqueeze(0).to(device),
+        "points_per_part":     torch.tensor(ppp).unsqueeze(0).to(device),
+        "fracture_surface_gt": torch.tensor(gt_concat).unsqueeze(0).to(device),
+        "graph":               torch.tensor(raw["graph"].astype(np.float32)).unsqueeze(0).to(device),
     }
 
     with torch.no_grad():
@@ -249,20 +305,12 @@ def run_garf_inference(raw: dict, dataset, ckpt: str, threshold: float, device: 
     pred_flat = out["coarse_seg_pred"].float().cpu().numpy()
     gt_flat   = out["coarse_seg_gt"].long().cpu().numpy()
 
-    # points_per_part indique le nb de points par fragment (variable avec Weighted)
-    points_per_part = data["points_per_part"]  # (max_parts,) paddé
-    xyz_concat = data["pointclouds_gt"]        # (N_total, 3) concatené
-    num_parts = raw["num_parts"]
-
-    preds_b, gts_b, xyz_list = [], [], []
+    preds_b, gts_b = [], []
     offset = 0
     for i in range(num_parts):
-        n_i = int(points_per_part[i])
-        if n_i == 0:
-            break
+        n_i = n_per_frag[i]
         preds_b.append(pred_flat[offset:offset + n_i] > threshold)
         gts_b.append(gt_flat[offset:offset + n_i].astype(bool))
-        xyz_list.append(xyz_concat[offset:offset + n_i])
         offset += n_i
 
     return preds_b, gts_b, xyz_list
@@ -439,35 +487,30 @@ def main():
         print("[warn] open3d not installed — install with: pip install open3d")
         has_o3d = False
 
-    # --- Panel CNN (run first pour obtenir xyz_list dans le bon système de coords) ---
-    cnn_preds = cnn_gts = xyz_list = None
-    if args.ckpt and not args.gt_only:
-        print(f"\nRunning CNN inference (threshold={args.threshold})...")
-        cnn_preds, cnn_gts, xyz_list = run_cnn_inference(raw, dataset, args.ckpt,
-                                                          args.threshold, device)
-        print_fragment_metrics("CNN", cnn_preds, cnn_gts)
+    # Coordonnées GT brutes (assemblées, aucune rotation) — base commune pour tous les panels
+    xyz_raw  = [raw["pointclouds_gt"][i].astype(np.float32)   for i in range(num_parts)]
+    gt_raw   = [raw["fracture_surface_gt"][i].astype(bool)    for i in range(num_parts)]
 
-    # Si pas de CNN, construire xyz_list depuis les coords GT (brutes)
-    if xyz_list is None:
-        xyz_list = [raw["pointclouds_gt"][i] for i in range(num_parts)]
-        gt_list  = [raw["fracture_surface_gt"][i].astype(bool) for i in range(num_parts)]
-    else:
-        # Utiliser les GT labels depuis le CNN (même ordre de points que les prédictions)
-        gt_list = cnn_gts
-
-    # --- Panel GT (utilise xyz_list cohérent avec les prédictions) ---
+    # --- Panel GT ---
     if has_o3d:
-        gt_colors = [colorize_gt_only(g) for g in gt_list]
-        gt_pcd = build_open3d_pcd(xyz_list, gt_colors)
+        gt_colors = [colorize_gt_only(g) for g in gt_raw]
+        gt_pcd = build_open3d_pcd(xyz_raw, gt_colors)
         panels.append(("Ground Truth", gt_pcd))
     else:
         gt_pcd = None
 
     # --- Panel CNN ---
+    cnn_preds = cnn_gts = None
+    if args.ckpt and not args.gt_only:
+        print(f"\nRunning CNN inference (threshold={args.threshold})...")
+        cnn_preds, cnn_gts, _ = run_cnn_inference(raw, dataset, args.ckpt,
+                                                   args.threshold, device)
+        print_fragment_metrics("CNN", cnn_preds, cnn_gts)
+
     if cnn_preds is not None:
-        cnn_colors = [colorize_fragment(p, g) for p, g in zip(cnn_preds, cnn_gts)]
-        if gt_pcd is not None:
-            cnn_pcd = build_open3d_pcd(xyz_list, cnn_colors)
+        cnn_colors = [colorize_fragment(p, g) for p, g in zip(cnn_preds, gt_raw)]
+        if has_o3d:
+            cnn_pcd = build_open3d_pcd(xyz_raw, cnn_colors)  # même xyz que GT
             panels.append((f"CNN (thr={args.threshold})", cnn_pcd))
     else:
         if not args.gt_only and not args.ckpt:
@@ -480,9 +523,12 @@ def main():
             garf_preds, garf_gts, garf_xyz = run_garf_inference(raw, dataset, args.garf_ckpt,
                                                                   args.threshold, device)
             print_fragment_metrics("GARF", garf_preds, garf_gts)
-            garf_colors = [colorize_fragment(p, g) for p, g in zip(garf_preds, garf_gts)]
-            if gt_pcd is not None:
-                garf_pcd = build_open3d_pcd(garf_xyz, garf_colors)  # coords GARF propres
+            # gt_raw_sub : sous-ensemble de gt_raw (mêmes indices que garf_xyz)
+            # garf_xyz est déjà un sous-ensemble de xyz_raw (même seed=0, même indices)
+            gt_raw_sub = garf_gts   # GT labels dans le même ordre que garf_xyz
+            garf_colors = [colorize_fragment(p, g) for p, g in zip(garf_preds, gt_raw_sub)]
+            if has_o3d:
+                garf_pcd = build_open3d_pcd(garf_xyz, garf_colors)
                 panels.append((f"GARF (thr={args.threshold})", garf_pcd))
         except Exception as e:
             print(f"[warn] GARF inference failed: {e}")
