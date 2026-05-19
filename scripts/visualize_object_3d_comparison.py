@@ -179,67 +179,63 @@ def run_cnn_inference(raw: dict, dataset, ckpt: str, threshold: float, device: t
 
 def run_garf_inference(raw: dict, dataset, ckpt: str, threshold: float, device: torch.device):
     """
-    Exécute le modèle FracSeg (PTv3) extrait d'un checkpoint GARF.
-    Retourne preds_b, gts_b, xyz_list (même format que run_cnn_inference).
+    Exécute le modèle FracSeg (PTv3) depuis un checkpoint GARF.
+    Instancie FracSeg via Hydra (même approche qu'eval_segmentation.py).
     """
-    import tempfile, os
-    from assembly.models.pretraining.frac_seg import FracSeg
+    from hydra import compose, initialize_config_dir
+    from hydra.utils import instantiate as hydra_instantiate
 
-    # Détecter si c'est un checkpoint GARF complet
+    config_dir = str(Path(__file__).resolve().parent.parent / "configs")
+
+    # Extraire les poids feature_extractor si checkpoint GARF complet
     ckpt_data = torch.load(ckpt, map_location="cpu", weights_only=False)
     keys = list(ckpt_data.get("state_dict", {}).keys())
     is_garf = any(k.startswith("feature_extractor.") for k in keys)
 
     if is_garf:
-        frac_seg_state = {
+        state_dict = {
             k.replace("feature_extractor.", ""): v
             for k, v in ckpt_data["state_dict"].items()
             if k.startswith("feature_extractor.")
         }
-        tmp = tempfile.NamedTemporaryFile(suffix=".ckpt", delete=False)
-        tmp.close()
-        import lightning as L
-        torch.save({"state_dict": frac_seg_state,
-                    "pytorch-lightning_version": L.__version__}, tmp.name)
-        load_path = tmp.name
     else:
-        load_path = ckpt
-        tmp = None
+        state_dict = ckpt_data.get("state_dict", ckpt_data)
 
-    try:
-        model = FracSeg.load_from_checkpoint(load_path, map_location=device, weights_only=False)
-        model.eval().to(device)
+    # Instancier FracSeg depuis la config Hydra (fournit les args d'architecture)
+    with initialize_config_dir(config_dir=config_dir, version_base="1.3"):
+        cfg = compose(config_name="eval", overrides=["experiment=eval_frac_seg"])
 
-        data = dataset.transform(raw.copy())
-        batch = {
-            k: torch.tensor(v).unsqueeze(0).to(device) if isinstance(v, np.ndarray) else v
-            for k, v in data.items()
-        }
-        for k in ["name", "removal_pieces", "redundant_pieces"]:
-            if k in data:
-                batch[k] = [data[k]]
+    model = hydra_instantiate(cfg.model)
+    model.load_state_dict(state_dict, strict=False)
+    model.eval().to(device)
 
-        with torch.no_grad():
-            out = model(batch)
+    data = dataset.transform(raw.copy())
+    batch = {
+        k: torch.tensor(v).unsqueeze(0).to(device) if isinstance(v, np.ndarray) else v
+        for k, v in data.items()
+    }
+    for k in ["name", "removal_pieces", "redundant_pieces"]:
+        if k in data:
+            batch[k] = [data[k]]
 
-        pred_flat = out["coarse_seg_pred"].float().cpu().numpy()
-        gt_flat   = out["coarse_seg_gt"].long().cpu().numpy()
+    with torch.no_grad():
+        out = model(batch)
 
-        num_parts = raw["num_parts"]
-        N = dataset.num_points_to_sample
-        preds_b, gts_b, xyz_list = [], [], []
-        for i in range(num_parts):
-            start, end = i * N, (i + 1) * N
-            p = pred_flat[start:end]
-            g = gt_flat[start:end].astype(bool)
-            preds_b.append(p > threshold)
-            gts_b.append(g)
-            xyz_list.append(raw["pointclouds_gt"][i])
+    pred_flat = out["coarse_seg_pred"].float().cpu().numpy()
+    gt_flat   = out["coarse_seg_gt"].long().cpu().numpy()
 
-        return preds_b, gts_b, xyz_list
-    finally:
-        if tmp is not None:
-            os.unlink(tmp.name)
+    num_parts = raw["num_parts"]
+    N = dataset.num_points_to_sample
+    preds_b, gts_b, xyz_list = [], [], []
+    for i in range(num_parts):
+        start, end = i * N, (i + 1) * N
+        p = pred_flat[start:end]
+        g = gt_flat[start:end].astype(bool)
+        preds_b.append(p > threshold)
+        gts_b.append(g)
+        xyz_list.append(raw["pointclouds_gt"][i])
+
+    return preds_b, gts_b, xyz_list
 
 
 # ---------------------------------------------------------------------------
