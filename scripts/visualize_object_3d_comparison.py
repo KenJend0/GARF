@@ -407,10 +407,16 @@ def export_plotly_html(panels: list, out_path: Path, title: str = "Fracture 3D")
             row=1, col=col,
         )
 
+    # Caméra identique pour tous les panels (évite l'auto-ajustement Plotly)
+    camera = dict(eye=dict(x=1.8, y=1.8, z=1.0), up=dict(x=0, y=0, z=1))
+    scene_cfg = dict(aspectmode="cube", camera=camera)
+    scene_updates = {f"scene{'' if i == 0 else i+1}": scene_cfg
+                     for i in range(len(panels))}
+
     fig.update_layout(
         title=title,
-        scene=dict(aspectmode="data"),
         height=700,
+        **scene_updates,
     )
     fig.write_html(str(out_path))
     print(f"  Saved HTML: {out_path}")
