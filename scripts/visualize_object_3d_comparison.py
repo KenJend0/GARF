@@ -477,12 +477,12 @@ def main():
     if args.garf_ckpt and not args.gt_only:
         print(f"\nRunning GARF/FracSeg inference (threshold={args.threshold})...")
         try:
-            garf_preds, garf_gts, _ = run_garf_inference(raw, dataset, args.garf_ckpt,
-                                                          args.threshold, device)
+            garf_preds, garf_gts, garf_xyz = run_garf_inference(raw, dataset, args.garf_ckpt,
+                                                                  args.threshold, device)
             print_fragment_metrics("GARF", garf_preds, garf_gts)
             garf_colors = [colorize_fragment(p, g) for p, g in zip(garf_preds, garf_gts)]
             if gt_pcd is not None:
-                garf_pcd = build_open3d_pcd(xyz_list, garf_colors)
+                garf_pcd = build_open3d_pcd(garf_xyz, garf_colors)  # coords GARF propres
                 panels.append((f"GARF (thr={args.threshold})", garf_pcd))
         except Exception as e:
             print(f"[warn] GARF inference failed: {e}")
