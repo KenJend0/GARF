@@ -185,13 +185,29 @@ def run_garf_inference(raw: dict, dataset, ckpt: str, threshold: float, device: 
     """
     Exécute FracSeg (PTv3) depuis un checkpoint GARF.
 
-    FracSeg attend le format BreakingBadWeighted (points concatenés, pas stackés).
-    On applique donc BreakingBadWeighted.transform() sur les données brutes.
+    GARF a été entraîné avec BreakingBadWeighted (5000 pts TOTAL par objet).
+    On recharge les données via BreakingBadWeighted pour respecter cette distribution.
     """
     from hydra import compose, initialize_config_dir
     from hydra.utils import instantiate as hydra_instantiate
     from hydra.core.global_hydra import GlobalHydra
     from assembly.data.breaking_bad.weighted import BreakingBadWeighted
+
+    # Recharger l'objet via BreakingBadWeighted (5000 pts total, format concatené)
+    print("  [GARF] Loading object with BreakingBadWeighted (5000 pts total)...")
+    weighted_ds = BreakingBadWeighted(
+        split=dataset.split,
+        data_root=dataset.data_root,
+        category=dataset.category,
+        num_points_to_sample=5000,   # distribution d'entraînement GARF
+        mesh_sample_strategy="uniform",
+        min_points_per_part=dataset.min_points_per_part,
+        max_parts=dataset.max_parts,
+    )
+    obj_name = raw["name"]
+    idx = weighted_ds.data_list.index(obj_name)
+    weighted_raw = weighted_ds.get_data(idx)
+    data = weighted_ds.transform(weighted_raw)
 
     # Extraire les poids feature_extractor si checkpoint GARF complet
     ckpt_data = torch.load(ckpt, map_location="cpu", weights_only=False)
@@ -214,49 +230,40 @@ def run_garf_inference(raw: dict, dataset, ckpt: str, threshold: float, device: 
     model.load_state_dict(state_dict, strict=False)
     model.eval().to(device)
 
-    # Créer une instance légère de BreakingBadWeighted pour accéder à son transform
-    # (format concatené requis par FracSeg, contrairement au format stacké de Uniform)
-    weighted_ds = object.__new__(BreakingBadWeighted)
-    weighted_ds.max_parts = dataset.max_parts
-    weighted_ds.num_points_to_sample = dataset.num_points_to_sample
-    weighted_ds.num_removal = 0
-    weighted_ds.num_redundancy = 0
-    weighted_ds.random_anchor = False
-    weighted_ds.multi_ref = False
-
-    data = weighted_ds.transform(raw.copy())
-
-    # Construire le batch au format FracSeg (concatené, pas stacké)
     def to_tensor(v):
         if isinstance(v, np.ndarray):
             return torch.tensor(v).unsqueeze(0).to(device)
         return v
 
     batch = {
-        "pointclouds":          to_tensor(data["pointclouds"]),
-        "pointclouds_normals":  to_tensor(data["pointclouds_normals"]),
-        "points_per_part":      to_tensor(data["points_per_part"]),
-        "fracture_surface_gt":  to_tensor(data["fracture_surface_gt"].astype(np.int64)),
-        "graph":                to_tensor(data["graph"]),
+        "pointclouds":         to_tensor(data["pointclouds"]),
+        "pointclouds_normals": to_tensor(data["pointclouds_normals"]),
+        "points_per_part":     to_tensor(data["points_per_part"]),
+        "fracture_surface_gt": to_tensor(data["fracture_surface_gt"].astype(np.int64)),
+        "graph":               to_tensor(data["graph"]),
     }
 
     with torch.no_grad():
         out = model(batch)
 
-    pred_flat = out["coarse_seg_pred"].float().cpu().numpy()   # (N_valid_total,)
-    gt_flat   = out["coarse_seg_gt"].long().cpu().numpy()      # (N_total,)
+    pred_flat = out["coarse_seg_pred"].float().cpu().numpy()
+    gt_flat   = out["coarse_seg_gt"].long().cpu().numpy()
 
-    # Extraire par fragment — N uniforme par fragment valide
-    N = dataset.num_points_to_sample
+    # points_per_part indique le nb de points par fragment (variable avec Weighted)
+    points_per_part = data["points_per_part"]  # (max_parts,) paddé
+    xyz_concat = data["pointclouds_gt"]        # (N_total, 3) concatené
     num_parts = raw["num_parts"]
-    xyz_concat = data["pointclouds_gt"]   # (N_total, 3) concatené, même ordre que GT
 
     preds_b, gts_b, xyz_list = [], [], []
+    offset = 0
     for i in range(num_parts):
-        start, end = i * N, (i + 1) * N
-        preds_b.append(pred_flat[start:end] > threshold)
-        gts_b.append(gt_flat[start:end].astype(bool))
-        xyz_list.append(xyz_concat[start:end])
+        n_i = int(points_per_part[i])
+        if n_i == 0:
+            break
+        preds_b.append(pred_flat[offset:offset + n_i] > threshold)
+        gts_b.append(gt_flat[offset:offset + n_i].astype(bool))
+        xyz_list.append(xyz_concat[offset:offset + n_i])
+        offset += n_i
 
     return preds_b, gts_b, xyz_list
 
