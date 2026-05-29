@@ -378,6 +378,7 @@ def parse_args():
     p.add_argument("--experiment",  required=True,  help="Hydra experiment name (e.g. cnn_step9_geo_features)")
     p.add_argument("--out_dir",     default="/tmp/student7/analysis", help="Output directory for plots")
     p.add_argument("--split",       default="val",  choices=["val", "test"])
+    p.add_argument("--categories",  default=None,   help="Comma-separated categories override, e.g. artifact")
     p.add_argument("--n_vis",       type=int, default=6, help="Qualitative examples per category")
     p.add_argument("--max_batches", type=int, default=300, help="Max batches to process (0=all)")
     p.add_argument("--batch_size",  type=int, default=4)
@@ -389,15 +390,20 @@ def parse_args():
 
 def load_config_and_model(args):
     config_dir = str(Path(__file__).resolve().parent.parent / "configs")
+    overrides = [
+        f"experiment={args.experiment}",
+        f"data.data_root={args.data_root}",
+        f"data.batch_size={args.batch_size}",
+        f"data.num_workers={args.num_workers}",
+    ]
+    if args.categories is not None:
+        cats = args.categories.split(",")
+        cats_str = "[" + ",".join(cats) + "]"
+        overrides.append(f"data.categories={cats_str}")
     with initialize_config_dir(config_dir=config_dir, version_base="1.3"):
         cfg = compose(
             config_name="train",
-            overrides=[
-                f"experiment={args.experiment}",
-                f"data.data_root={args.data_root}",
-                f"data.batch_size={args.batch_size}",
-                f"data.num_workers={args.num_workers}",
-            ],
+            overrides=overrides,
         )
     return cfg
 
