@@ -375,8 +375,15 @@ def show_open3d(panels: list, title: str = "Fracture Visualization"):
 # Plotly HTML export
 # ---------------------------------------------------------------------------
 
-def export_plotly_html(panels: list, out_path: Path, title: str = "Fracture 3D"):
-    """Exporte une visualisation Plotly 3D interactive en HTML."""
+def export_plotly_html(panels: list, out_path: Path, title: str = "Fracture 3D",
+                       stats: list = None):
+    """
+    Exporte une visualisation Plotly 3D interactive en HTML.
+
+    panels : list of (label, pcd_o3d)
+    stats  : optional list of dicts (one per panel) with keys tp/fp/fn/tn/f1/prec/rec
+             or None for panels without prediction (e.g. GT-only).
+    """
     try:
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
@@ -415,9 +422,63 @@ def export_plotly_html(panels: list, out_path: Path, title: str = "Fracture 3D")
 
     fig.update_layout(
         title=title,
-        height=700,
+        height=760,
+        margin=dict(b=120),
         **scene_updates,
     )
+
+    # Stats annotations below each panel
+    if stats:
+        col_centers = [(i + 0.5) / n_panels for i in range(n_panels)]
+        for i, (m, cx) in enumerate(zip(stats, col_centers)):
+            if m is None:
+                # GT panel — just show fracture point count
+                total = sum(np.asarray(panels[i][1].colors)[:, 0].size
+                            for _ in [panels[i]])
+                pts_all = np.asarray(panels[i][1].points)
+                cols_all = np.asarray(panels[i][1].colors)
+                # yellow points = GT fracture (R≈1, G≈0.84, B≈0)
+                frac_pts = int(
+                    np.sum(
+                        (cols_all[:, 0] > 0.9) &
+                        (cols_all[:, 1] > 0.7) &
+                        (cols_all[:, 1] < 0.95) &
+                        (cols_all[:, 2] < 0.1)
+                    )
+                )
+                intact_pts = len(pts_all) - frac_pts
+                text = (
+                    f"<b>Fracture pts:</b> {frac_pts:,}  |  "
+                    f"<b>Intact pts:</b> {intact_pts:,}  |  "
+                    f"<b>Total:</b> {len(pts_all):,}"
+                )
+            else:
+                total = m['tp'] + m['fp'] + m['fn'] + m['tn']
+                text = (
+                    f"<b style='color:#4CAF50'>TP</b> {m['tp']:,}  "
+                    f"<b style='color:#F44336'>FP</b> {m['fp']:,}  "
+                    f"<b style='color:#2196F3'>FN</b> {m['fn']:,}  "
+                    f"<b>TN</b> {m['tn']:,}"
+                    f"<br>"
+                    f"F1 <b>{m['f1']:.3f}</b>  |  "
+                    f"Prec <b>{m['prec']:.3f}</b>  |  "
+                    f"Rec <b>{m['rec']:.3f}</b>  |  "
+                    f"FDR <b>{m['fdr']:.3f}</b>  |  "
+                    f"Total <b>{total:,}</b>"
+                )
+            fig.add_annotation(
+                x=cx, y=-0.08,
+                xref="paper", yref="paper",
+                text=text,
+                showarrow=False,
+                font=dict(size=12, family="monospace"),
+                align="center",
+                bgcolor="rgba(245,245,245,0.9)",
+                bordercolor="#CCCCCC",
+                borderwidth=1,
+                borderpad=8,
+            )
+
     fig.write_html(str(out_path))
     print(f"  Saved HTML: {out_path}")
 
@@ -426,7 +487,7 @@ def export_plotly_html(panels: list, out_path: Path, title: str = "Fracture 3D")
 # Metrics summary
 # ---------------------------------------------------------------------------
 
-def print_fragment_metrics(label: str, preds_b_list, gts_b_list):
+def compute_metrics(preds_b_list, gts_b_list) -> dict:
     tp = fp = fn = tn = 0
     for p, g in zip(preds_b_list, gts_b_list):
         tp += int((p & g).sum())
@@ -437,8 +498,14 @@ def print_fragment_metrics(label: str, preds_b_list, gts_b_list):
     rec  = tp / max(tp + fn, 1)
     f1   = 2 * prec * rec / max(prec + rec, 1e-8)
     fdr  = fp / max(fp + tp, 1)
-    print(f"  [{label}]  F1={f1:.3f}  Prec={prec:.3f}  Rec={rec:.3f}"
-          f"  FDR={fdr:.3f}  TP={tp:,}  FP={fp:,}  FN={fn:,}")
+    return dict(tp=tp, fp=fp, fn=fn, tn=tn,
+                f1=f1, prec=prec, rec=rec, fdr=fdr)
+
+
+def print_fragment_metrics(label: str, preds_b_list, gts_b_list):
+    m = compute_metrics(preds_b_list, gts_b_list)
+    print(f"  [{label}]  F1={m['f1']:.3f}  Prec={m['prec']:.3f}  Rec={m['rec']:.3f}"
+          f"  FDR={m['fdr']:.3f}  TP={m['tp']:,}  FP={m['fp']:,}  FN={m['fn']:,}")
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +552,7 @@ def main():
     print(f"Object: {obj_name}  ({num_parts} fragments)")
 
     panels = []
+    panel_stats = []   # one entry per panel: None for GT, dict for CNN/GARF
 
     try:
         import open3d as o3d
@@ -502,6 +570,7 @@ def main():
         gt_colors = [colorize_gt_only(g) for g in gt_raw]
         gt_pcd = build_open3d_pcd(xyz_raw, gt_colors)
         panels.append(("Ground Truth", gt_pcd))
+        panel_stats.append(None)   # GT has no prediction stats
     else:
         gt_pcd = None
 
@@ -518,6 +587,7 @@ def main():
         if has_o3d:
             cnn_pcd = build_open3d_pcd(xyz_raw, cnn_colors)  # même xyz que GT
             panels.append((f"CNN (thr={args.threshold})", cnn_pcd))
+            panel_stats.append(compute_metrics(cnn_preds, gt_raw))
     else:
         if not args.gt_only and not args.ckpt:
             print("[info] No --ckpt provided — showing GT only.")
@@ -529,13 +599,12 @@ def main():
             garf_preds, garf_gts, garf_xyz = run_garf_inference(raw, dataset, args.garf_ckpt,
                                                                   args.threshold, device)
             print_fragment_metrics("GARF", garf_preds, garf_gts)
-            # gt_raw_sub : sous-ensemble de gt_raw (mêmes indices que garf_xyz)
-            # garf_xyz est déjà un sous-ensemble de xyz_raw (même seed=0, même indices)
             gt_raw_sub = garf_gts   # GT labels dans le même ordre que garf_xyz
             garf_colors = [colorize_fragment(p, g) for p, g in zip(garf_preds, gt_raw_sub)]
             if has_o3d:
                 garf_pcd = build_open3d_pcd(garf_xyz, garf_colors)
                 panels.append((f"GARF (thr={args.threshold})", garf_pcd))
+                panel_stats.append(compute_metrics(garf_preds, garf_gts))
         except Exception as e:
             print(f"[warn] GARF inference failed: {e}")
 
@@ -544,7 +613,8 @@ def main():
 
     if args.export_html and panels:
         html_path = out_dir / f"{safe_name}_comparison.html"
-        export_plotly_html(panels, html_path, title=f"Fracture 3D — {obj_name}")
+        export_plotly_html(panels, html_path, title=f"Fracture 3D — {obj_name}",
+                           stats=panel_stats)
 
     if not args.no_display and panels:
         show_open3d(panels, title=f"Fracture 3D — {obj_name}")
