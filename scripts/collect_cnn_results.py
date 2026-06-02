@@ -119,6 +119,18 @@ HARDCODED: dict[str, dict[str, dict]] = {
         "precision": {"val/coarse_seg_acc": 0.8948, "val/coarse_seg_f1": 0.8536, "val/coarse_seg_precision": 0.7930, "val/coarse_seg_recall": 0.9307},
         "recall":    {"val/coarse_seg_acc": 0.8149, "val/coarse_seg_f1": 0.7776, "val/coarse_seg_precision": 0.6595, "val/coarse_seg_recall": 0.9637},
     },
+    # Steps 10-11 : CSVLogger output perdu — métriques récupérées via analyze_errors.py
+    # (100 batches × batch_size=2 = 909 fragments, num_points=5000)
+    "cnn_step10_precision": {
+        "f1":        {"val/coarse_seg_acc": 0.8268, "val/coarse_seg_f1": 0.6563, "val/coarse_seg_precision": 0.7482, "val/coarse_seg_recall": 0.6501},
+        "precision": {"val/coarse_seg_acc": 0.8268, "val/coarse_seg_f1": 0.6563, "val/coarse_seg_precision": 0.7482, "val/coarse_seg_recall": 0.6501},
+        "recall":    {"val/coarse_seg_acc": 0.8268, "val/coarse_seg_f1": 0.6563, "val/coarse_seg_precision": 0.7482, "val/coarse_seg_recall": 0.6501},
+    },
+    "cnn_step11_hard_sampling": {
+        "f1":        {"val/coarse_seg_acc": 0.9030, "val/coarse_seg_f1": 0.8839, "val/coarse_seg_precision": 0.8797, "val/coarse_seg_recall": 0.9089},
+        "precision": {"val/coarse_seg_acc": 0.9030, "val/coarse_seg_f1": 0.8839, "val/coarse_seg_precision": 0.8797, "val/coarse_seg_recall": 0.9089},
+        "recall":    {"val/coarse_seg_acc": 0.9030, "val/coarse_seg_f1": 0.8839, "val/coarse_seg_precision": 0.8797, "val/coarse_seg_recall": 0.9089},
+    },
 }
 
 VAL_METRICS = [

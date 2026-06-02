@@ -243,9 +243,11 @@ def project_fragment(
             d_max = torch.full((H * W,), float("-inf"), device=device, dtype=dtype)
             d_min.scatter_reduce_(0, home_px, depth_norm, reduce="amin", include_self=True)
             d_max.scatter_reduce_(0, home_px, depth_norm, reduce="amax", include_self=True)
-            empty_px = cnt == 0
-            d_min[empty_px] = 0.0
-            d_max[empty_px] = 0.0
+            # Fix ALL non-finite pixels: covers both truly empty pixels (cnt==0) AND
+            # bilinear secondary-corner pixels that appear in cnt>0 but not in home_px.
+            # Those would keep inf/-inf, which propagates NaN through BatchNorm.
+            d_min[~torch.isfinite(d_min)] = 0.0
+            d_max[~torch.isfinite(d_max)] = 0.0
             images[v, ov + 1] = d_min.view(H, W)
             images[v, ov + 2] = d_max.view(H, W)
             images[v, ov + 3] = (d_max - d_min).clamp(min=0.0).view(H, W)
