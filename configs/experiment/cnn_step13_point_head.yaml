@@ -1,0 +1,69 @@
+# @package _global_
+# configs/experiment/cnn_step13_point_head.yaml
+#
+# Step 13 — PointHead MLP (fix structurel du problème d'overlapping)
+#
+# Problème : la backprojection 2D→3D naïve assigne à chaque point la prédiction
+# du pixel dans lequel il projette. Plusieurs points dans le même pixel reçoivent
+# une prédiction identique (ou quasi-identique via bilinéaire).
+#
+# Solution : remplacer la backprojection par un MLP point-wise qui reçoit :
+#   - f_2D_i : feature vector (64 dims) bilinéairement interpolé depuis la
+#              feature map du décodeur U-Net (16ch → 64ch via conv 1×1)
+#   - f_3D_i : xyz_norm(3) + normals(3) + geo_features(3) = 9 dims
+#
+# Architecture PointHead :
+#   Linear(73→128) ReLU → Linear(128→64) ReLU → Linear(64→1) → sigmoid
+#
+# La sortie finale est N_points × 1 (point-wise) au lieu de 64×64×1 + backproj.
+# Le U-Net reste figé comme extracteur de features — seul le PointHead est nouveau.
+#
+# LR différentiel :
+#   CNN backbone (pré-entraîné Step 12) : lr = 5e-5
+#   PointHead (nouveau)                 : lr = 1e-4 (multiplier = 2.0)
+#
+# Fine-tuning depuis Step 12, 30 epochs.
+# Objectif : Boundary F1 > 72%, Hausdorff significativement réduit.
+
+defaults:
+  - cnn_ablation_shared
+  - _self_
+
+experiment_name: cnn_step13_point_head
+tags: ["cnn", "ablation", "step13", "point_head", "per_point_pred"]
+
+trainer:
+  max_epochs: 30
+
+model:
+  # Même architecture que Step 12
+  resolution: 128
+  use_normals: true
+  splat_sigma: 1.5
+  use_bilinear: true
+  use_global_context: true
+  use_view_attn: false
+  backbone: unet
+  unet_depth: 4
+  feature_fusion: "max"
+  use_geo_features: true
+  geo_k: 16
+  use_overlap_channels: true
+  use_focal_loss: true
+  focal_gamma: 2.0
+  focal_dice_alpha: 0.5
+
+  # Phase 3 : PointHead
+  use_point_head: true
+  point_head_feat_dim: 64       # feature map projetée : decoder(16ch) → 64ch via 1×1 conv
+  point_head_hidden_dim: 128    # MLP hidden width
+  lr_point_head_multiplier: 2.0 # PointHead lr = base_lr × 2.0
+
+  # lr réduit pour CNN pré-entraîné, PointHead reçoit 2× via multiplier
+  optimizer:
+    lr: 5e-5
+
+  pretrained_ckpt: /storage/student7/teyssir/code/output/cnn_step12_overlap_aware/last.ckpt
+
+data:
+  weight_hard_examples: true

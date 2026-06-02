@@ -223,6 +223,109 @@ def _chamfer(pred_prob: np.ndarray, gt: np.ndarray, xyz: np.ndarray) -> float:
     return float(d_p2g + d_g2p)
 
 
+def compute_occupancy_correlation(
+    records: list,
+    count_list: list,   # list of K tensors (V, H*W) — from out["count_list"]
+    pix_corners_list: list,  # list of K tensors (N_k, V, 4) long
+) -> dict:
+    """
+    Analyse de corrélation entre l'occupancy pixel (nb points/pixel) et l'erreur.
+
+    Pour chaque point, récupère l'occupancy de son pixel home (view 0, corner 0)
+    et calcule :
+      - Histogramme de distribution de l'occupancy
+      - % de points dans des pixels à occupancy > 3 (zone de conflit)
+      - Erreur moyenne par bin d'occupancy (fracture misclassifiée ?)
+
+    Returns dict with summary stats, also attaches "occupancy" key to each record.
+    """
+    all_occ    = []
+    all_errors = []   # 1 = mauvaise prédiction, 0 = bonne
+
+    for rec, cnt_kv, corners_k in zip(records, count_list, pix_corners_list):
+        # cnt_kv : (V, H*W), corners_k : (N_k, V, 4)
+        cnt_v0   = cnt_kv[0]                            # (H*W,) — view 0
+        home_px  = corners_k[:, 0, 0].cpu().long()      # (N_k,) — floor-rounded pixel, view 0
+        occ      = cnt_v0[home_px].cpu().numpy()        # (N_k,) — occupancy per point
+
+        pred = (rec["_pred"].numpy() > 0.5).astype(int)
+        gt   = rec["_gt"].numpy().astype(int)
+        err  = (pred != gt).astype(float)
+
+        all_occ.append(occ)
+        all_errors.append(err)
+        rec["_occupancy"] = occ
+
+    all_occ    = np.concatenate(all_occ)
+    all_errors = np.concatenate(all_errors)
+
+    threshold = 3
+    high_occ_mask = all_occ > threshold
+    pct_high_occ  = high_occ_mask.mean() * 100
+
+    # Error rate by occupancy bin
+    bins   = [1, 2, 3, 5, 10, 30, int(all_occ.max()) + 1]
+    labels = ["1", "2", "3", "4-5", "6-10", "11+"]
+    bin_stats = []
+    for lo, hi, label in zip(bins[:-1], bins[1:], labels):
+        mask = (all_occ >= lo) & (all_occ < hi)
+        if mask.sum() == 0:
+            continue
+        bin_stats.append({
+            "bin": label,
+            "n_pts": int(mask.sum()),
+            "error_rate": float(all_errors[mask].mean()),
+            "pct_of_total": float(mask.mean() * 100),
+        })
+
+    corr = float(np.corrcoef(all_occ, all_errors)[0, 1]) if len(all_occ) > 10 else float("nan")
+
+    return {
+        "pct_high_occ": pct_high_occ,
+        "threshold": threshold,
+        "corr_occ_error": corr,
+        "bin_stats": bin_stats,
+    }
+
+
+def print_occupancy_summary(occ_stats: dict) -> None:
+    print("\n" + "=" * 58)
+    print("OCCUPANCY ↔ ERROR CORRELATION")
+    print("=" * 58)
+    print(f"  Points dans pixels à occupancy > {occ_stats['threshold']} : "
+          f"{occ_stats['pct_high_occ']:.1f}%")
+    print(f"  Pearson corr(occupancy, error) = {occ_stats['corr_occ_error']:.3f}")
+    print(f"\n  {'Occ bin':<8}  {'n_pts':>8}  {'% total':>8}  {'error rate':>10}")
+    print("  " + "-" * 42)
+    for b in occ_stats["bin_stats"]:
+        print(f"  {b['bin']:<8}  {b['n_pts']:>8,}  {b['pct_of_total']:>7.1f}%"
+              f"  {b['error_rate']:>9.3f}")
+    print()
+
+
+def plot_occupancy_vs_error(records: list, occ_stats: dict, out_dir) -> None:
+    """Bar chart: error rate per occupancy bin."""
+    bins  = [b["bin"]        for b in occ_stats["bin_stats"]]
+    errs  = [b["error_rate"] for b in occ_stats["bin_stats"]]
+    ns    = [b["n_pts"]      for b in occ_stats["bin_stats"]]
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    bars = ax.bar(bins, errs, color="#E64A19", edgecolor="white")
+    for bar, n in zip(bars, ns):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.003,
+                f"n={n:,}", ha="center", va="bottom", fontsize=7)
+    ax.set_xlabel("Points per pixel (occupancy)")
+    ax.set_ylabel("Error rate (misclassified points)")
+    ax.set_title(f"Error rate vs Pixel Occupancy  "
+                 f"(corr={occ_stats['corr_occ_error']:.3f})")
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    out_path = out_dir / "occupancy_vs_error.png"
+    plt.savefig(out_path, dpi=120)
+    plt.close()
+    print(f"  Saved: {out_path}")
+
+
 def compute_geometric_metrics(records: list, xyz_list: list, k_boundary: int = 5) -> None:
     """Compute and attach boundary_f1, boundary_prec, boundary_rec, n_boundary,
     hausdorff, chamfer to every record in-place."""
@@ -634,9 +737,11 @@ def main():
     print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
 
     # --- Inference loop ---
-    all_records = []
-    all_xyz     = []
-    n_parts_per_frag = []
+    all_records       = []
+    all_xyz           = []
+    all_count_list    = []   # for occupancy correlation analysis
+    all_corners_list  = []   # for occupancy correlation analysis
+    n_parts_per_frag  = []
 
     print(f"\nRunning inference on {args.split} set...")
     with torch.no_grad():
@@ -682,10 +787,19 @@ def main():
             # Split by fragment
             records = per_fragment_metrics(pred_flat, gt_flat, frag_sizes)
 
-            for rec, xyz_k, n_parts in zip(records, frag_list, n_parts_in_obj):
+            # Collect count_list and corners for occupancy analysis
+            count_list_batch   = out.get("count_list", [None] * len(records))
+            corners_batch      = out.get("pix_corners_list", [None] * len(records))
+
+            for rec, xyz_k, n_parts, cnt_k, crn_k in zip(
+                records, frag_list, n_parts_in_obj,
+                count_list_batch, corners_batch,
+            ):
                 rec["n_parts"] = n_parts
                 all_records.append(rec)
                 all_xyz.append(xyz_k.cpu())
+                all_count_list.append(cnt_k.cpu() if cnt_k is not None else None)
+                all_corners_list.append(crn_k.cpu() if crn_k is not None else None)
                 n_parts_per_frag.append(n_parts)
 
     print(f"\nAnalyzed {len(all_records)} fragments total.")
@@ -753,6 +867,16 @@ def main():
 
     # --- FP/FN distribution ---
     plot_fp_fn_dist(all_records, out_dir / "fp_fn_distribution.png")
+
+    # --- Occupancy ↔ Error correlation (Phase 1 — requires count_list from model) ---
+    has_occ = all_count_list[0] is not None and all_corners_list[0] is not None
+    if has_occ:
+        print("\n[Occupancy ↔ Error Correlation]")
+        occ_stats = compute_occupancy_correlation(all_records, all_count_list, all_corners_list)
+        print_occupancy_summary(occ_stats)
+        plot_occupancy_vs_error(all_records, occ_stats, out_dir)
+    else:
+        print("\n[Occupancy analysis skipped — count_list not in model output]")
 
     # --- Geometric metrics (Phase 1) ---
     if args.geometric:

@@ -41,7 +41,7 @@ import lightning as pl
 import torchmetrics
 
 from assembly.models.pretraining.loss import dice_loss, tversky_loss, focal_loss, dice_focal_loss
-from assembly.models.projection_3d_to_2d import Project3DTo2D
+from assembly.models.projection_3d_to_2d import Project3DTo2D, _normalize_fragment
 from assembly.models.hybrid_geometry_features import HybridGeometryFeatures
 from assembly.models.projection_mapping_utils import (
     extract_fragment_list,
@@ -49,6 +49,7 @@ from assembly.models.projection_mapping_utils import (
     extract_gt_for_valid_frags,
     extract_batch_idx,
     backproject_pixel_to_points,
+    sample_features_at_points,
 )
 
 
@@ -102,6 +103,62 @@ class ViewAttention(nn.Module):
         return torch.softmax(scores, dim=1)       # (K, V)
 
 
+class PointHead(nn.Module):
+    """
+    Per-point MLP that fuses 2D CNN features with 3D geometric features.
+
+    Replaces naïve 2D→backproject with a point-wise prediction that can
+    distinguish co-located points in the same pixel.
+
+    Architecture:
+        f_3D (feat_3d_dim) → Linear → ReLU → LayerNorm(feat_3d_emb_dim)  ─┐
+                                                                             ├─ concat → MLP → logit
+        f_2D (feat_2d_dim) → LayerNorm(feat_2d_dim) ────────────────────────┘
+
+    The dedicated 3D encoder gives 3D features equal representational capacity
+    to 2D features in the concatenation, preventing the 3D signal from being
+    drowned out when points share identical 2D activations (overlap case).
+    LayerNorm on both branches prevents amplitude dominance.
+
+    Args:
+        feat_2d_dim     : channels of the projected decoder feature map (default 64)
+        feat_3d_dim     : xyz(3) + normals(3) + geo_features(G)
+        feat_3d_emb_dim : output dim of the 3D encoder branch (default 32)
+        hidden_dim      : MLP hidden width (default 128)
+    """
+
+    def __init__(self, feat_2d_dim: int = 64, feat_3d_dim: int = 9,
+                 feat_3d_emb_dim: int = 32, hidden_dim: int = 128):
+        super().__init__()
+        # Dedicated 3D encoder: projects raw geometry into an embedding space
+        self.feat_3d_encoder = nn.Sequential(
+            nn.Linear(feat_3d_dim, feat_3d_emb_dim),
+            nn.ReLU(inplace=True),
+            nn.LayerNorm(feat_3d_emb_dim),
+        )
+        # Normalise 2D features independently (amplitude guard)
+        self.feat_2d_norm = nn.LayerNorm(feat_2d_dim)
+
+        fusion_dim = feat_2d_dim + feat_3d_emb_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(fusion_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, feat_2d: torch.Tensor, feat_3d: torch.Tensor) -> torch.Tensor:
+        """
+        feat_2d : (N, feat_2d_dim)
+        feat_3d : (N, feat_3d_dim)
+        Returns : (N,) logits
+        """
+        f2d = self.feat_2d_norm(feat_2d)
+        f3d = self.feat_3d_encoder(feat_3d)
+        return self.mlp(torch.cat([f2d, f3d], dim=1)).squeeze(-1)
+
+
 class SimpleCNNBackbone(nn.Module):
     """
     Minimal encoder–decoder CNN for per-pixel binary segmentation.
@@ -134,8 +191,9 @@ class SimpleCNNBackbone(nn.Module):
         super().__init__()
 
         channels = [in_ch] + [base_ch * (2 ** i) for i in range(num_blocks)]
-        self.btn_ch = channels[-1]          # bottleneck channel dim (public attribute)
-        self._pool_steps = num_blocks - 1   # last encoder block has no pool
+        self.btn_ch          = channels[-1]       # bottleneck channel dim
+        self.decoder_feat_dim = base_ch * 2       # channels before the final 1×1 head
+        self._pool_steps = num_blocks - 1
 
         encoder_blocks = []
         for i in range(num_blocks):
@@ -178,14 +236,20 @@ class SimpleCNNBackbone(nn.Module):
         """
         return self.context_proj(torch.cat([bottleneck, context_spatial], dim=1))
 
-    def decode(self, x: torch.Tensor, output_hw: tuple) -> torch.Tensor:
+    def decode(self, x: torch.Tensor, output_hw: tuple,
+               return_features: bool = False):
         """
         (B, btn_ch, H', W') → (B, 1, H, W) logits
-        Bilinear upsample avoids checkerboard artifacts from ConvTranspose2d.
+        If return_features=True, also returns (B, decoder_feat_dim, H, W) feature map
+        (the activation before the final 1×1 conv — used by PointHead).
         """
         H, W = output_hw
         x = F.interpolate(x, size=(H, W), mode="bilinear", align_corners=False)
-        return self.decoder_conv(x)
+        feat   = self.decoder_conv[0](x)    # (B, decoder_feat_dim, H, W)
+        logits = self.decoder_conv[1](feat)  # (B, 1, H, W)
+        if return_features:
+            return logits, feat
+        return logits
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Standard forward without context (used when use_global_context=False)."""
@@ -224,7 +288,8 @@ class UNetBackbone(nn.Module):
 
         # Build encoder channel sizes: [in_ch, base_ch, base_ch*2, ..., base_ch*2^(depth-1)]
         enc_chs = [in_ch] + [base_ch * (2 ** i) for i in range(depth)]
-        self.btn_ch = enc_chs[-1]
+        self.btn_ch           = enc_chs[-1]
+        self.decoder_feat_dim = base_ch       # channels of last decoder level (= enc_chs[1])
 
         # Encoder blocks
         self.enc_blocks = nn.ModuleList([
@@ -264,13 +329,18 @@ class UNetBackbone(nn.Module):
     def inject_context(self, bottleneck, context_spatial):
         return self.context_proj(torch.cat([bottleneck, context_spatial], dim=1))
 
-    def decode(self, bottleneck: torch.Tensor, skips: list, output_hw: tuple):
+    def decode(self, bottleneck: torch.Tensor, skips: list, output_hw: tuple,
+               return_features: bool = False):
         x = bottleneck
         for block, skip in zip(self.dec_blocks, reversed(skips)):
             x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
             x = block(torch.cat([x, skip], dim=1))
         x = F.interpolate(x, size=output_hw, mode="bilinear", align_corners=False)
-        return self.head(x)
+        # x is (B, base_ch=decoder_feat_dim, H, W) at full resolution
+        logits = self.head(x)
+        if return_features:
+            return logits, x
+        return logits
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         H, W = x.shape[-2], x.shape[-1]
@@ -351,6 +421,10 @@ class CNNFracSeg(pl.LightningModule):
         geo_k: int = 16,
         use_dist_to_centroid: bool = False,
         use_overlap_channels: bool = False,
+        use_point_head: bool = False,
+        point_head_feat_dim: int = 64,
+        point_head_hidden_dim: int = 128,
+        lr_point_head_multiplier: float = 2.0,
         use_tversky_loss: bool = False,
         tversky_alpha: float = 0.7,
         use_focal_loss: bool = False,
@@ -369,12 +443,14 @@ class CNNFracSeg(pl.LightningModule):
 
         self.num_views            = num_views
         self.resolution           = resolution
-        self.use_normals          = use_normals
-        self.use_global_context   = use_global_context
-        self.use_view_attn        = use_view_attn
-        self.feature_fusion       = feature_fusion
-        self.use_geo_features     = use_geo_features
-        self.use_tversky_loss     = use_tversky_loss
+        self.use_normals              = use_normals
+        self.use_global_context       = use_global_context
+        self.use_view_attn            = use_view_attn
+        self.feature_fusion           = feature_fusion
+        self.use_geo_features         = use_geo_features
+        self.use_point_head           = use_point_head
+        self.lr_point_head_multiplier = lr_point_head_multiplier
+        self.use_tversky_loss         = use_tversky_loss
         self.tversky_alpha        = tversky_alpha
         self.use_focal_loss       = use_focal_loss
         self.focal_gamma          = focal_gamma
@@ -430,6 +506,20 @@ class CNNFracSeg(pl.LightningModule):
             # Project V concatenated bottleneck channels back to btn_ch
             self.fusion_proj = nn.Conv2d(
                 num_views * self.cnn.btn_ch, self.cnn.btn_ch, kernel_size=1, bias=False
+            )
+
+        if use_point_head:
+            # 1×1 conv: decoder_feat_dim → point_head_feat_dim (projects features to 64ch)
+            self.feat_proj = nn.Conv2d(
+                self.cnn.decoder_feat_dim, point_head_feat_dim, kernel_size=1, bias=False
+            )
+            # 3D feature dim: xyz(3) + normals(3 if enabled) + geo(G if enabled)
+            feat_3d_dim = 3 + (3 if use_normals else 0) + (geo_dim if use_geo_features else 0)
+            self.point_head = PointHead(
+                feat_2d_dim=point_head_feat_dim,
+                feat_3d_dim=feat_3d_dim,
+                feat_3d_emb_dim=32,
+                hidden_dim=point_head_hidden_dim,
             )
 
     # ------------------------------------------------------------------
@@ -604,9 +694,12 @@ class CNNFracSeg(pl.LightningModule):
             ]
 
         # 3. Orthographic projection → (K, V, C, H, W) + corner/weight maps
-        images, pix_corners_list, pix_weights_list, _ = self.projector(
+        images, pix_corners_list, pix_weights_list, count_list = self.projector(
             frag_list, normal_list, geo_features_list
         )
+        # Expose projection maps for downstream analysis (analyze_errors.py)
+        out["count_list"]      = count_list        # list of K (V, H*W) — point density
+        out["pix_corners_list"] = pix_corners_list  # list of K (N_k, V, 4) — pixel indices
 
         # 4. CNN encode — all K*V views in one batched call (weight sharing)
         V = self.num_views
@@ -700,19 +793,54 @@ class CNNFracSeg(pl.LightningModule):
             # Fusion already captured view weighting — disable prediction-level weighting
             view_weights = None
 
-        # 7. Decode → per-pixel logits → sigmoid → (K*V, 1, H, W)
+        # 7. Decode → per-pixel logits (+ feature map when PointHead is enabled)
         if _skips is not None:
-            logits_flat = self.cnn.decode(bottleneck, _skips, (H, W))  # UNet
+            dec_out = self.cnn.decode(bottleneck, _skips, (H, W),
+                                      return_features=self.use_point_head)
         else:
-            logits_flat = self.cnn.decode(bottleneck, (H, W))          # SimpleCNN
-        seg_flat     = torch.sigmoid(logits_flat).squeeze(1)       # (K*V, H, W)
-        seg_per_frag = seg_flat.view(K, V, H, W)                   # (K, V, H, W)
+            dec_out = self.cnn.decode(bottleneck, (H, W),
+                                      return_features=self.use_point_head)
 
-        # 8. Bilinear + view-attention backprojection → (N_sum_valid,)
-        # view_weights is None when feature_fusion != "none" (fusion already done)
-        coarse_seg_pred = backproject_pixel_to_points(
-            seg_per_frag, pix_corners_list, pix_weights_list, view_weights
-        )
+        if self.use_point_head:
+            logits_flat, feat_flat = dec_out     # (K*V, 1, H, W), (K*V, D, H, W)
+        else:
+            logits_flat = dec_out
+
+        # 8. Per-point prediction
+        if self.use_point_head:
+            # 8a. Project feature map: decoder_feat_dim → point_head_feat_dim
+            feat_proj_flat = self.feat_proj(feat_flat)             # (K*V, C_feat, H, W)
+            feat_proj_kv   = feat_proj_flat.view(
+                K, V, -1, H, W)                                    # (K, V, C_feat, H, W)
+
+            # 8b. Bilinear sample feature map per point
+            feat_2d_list = sample_features_at_points(
+                feat_proj_kv, pix_corners_list, pix_weights_list, view_weights
+            )   # list of K tensors (N_k, C_feat)
+
+            # 8c. Build 3D features per fragment: xyz_norm + normals + geo
+            feat_3d_list = []
+            for k in range(K):
+                xyz_norm = _normalize_fragment(frag_list[k])   # (N_k, 3)
+                parts = [xyz_norm]
+                if normal_list is not None:
+                    parts.append(normal_list[k])
+                if geo_features_list is not None:
+                    parts.append(geo_features_list[k])
+                feat_3d_list.append(torch.cat(parts, dim=1))
+
+            # 8d. Concat all fragments, run MLP, sigmoid
+            feat_2d_all = torch.cat(feat_2d_list,  dim=0)     # (N_sum, C_feat)
+            feat_3d_all = torch.cat(feat_3d_list,  dim=0)     # (N_sum, feat_3d_dim)
+            point_logits   = self.point_head(feat_2d_all, feat_3d_all)  # (N_sum,)
+            coarse_seg_pred = torch.sigmoid(point_logits)
+        else:
+            # Classic path: 2D sigmoid map → bilinear + view-attention backproject
+            seg_flat     = torch.sigmoid(logits_flat).squeeze(1)
+            seg_per_frag = seg_flat.view(K, V, H, W)
+            coarse_seg_pred = backproject_pixel_to_points(
+                seg_per_frag, pix_corners_list, pix_weights_list, view_weights
+            )
 
         out["coarse_seg_pred"]        = coarse_seg_pred
         out["coarse_seg_pred_binary"] = (coarse_seg_pred > 0.5)
@@ -763,7 +891,30 @@ class CNNFracSeg(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        optimizer = self._optimizer(self.parameters())
+        if self.use_point_head and self.lr_point_head_multiplier != 1.0:
+            # Differential LR: pre-trained backbone gets base lr,
+            # new PointHead gets base_lr × multiplier (typically 2×).
+            base_lr = self._optimizer.keywords.get("lr", 1e-4)
+            wd      = self._optimizer.keywords.get("weight_decay", 1e-5)
+            pretrained_params = (
+                list(self.projector.parameters())
+                + list(self.cnn.parameters())
+                + list(self.feat_proj.parameters())
+                + (list(self.view_attn.parameters()) if self.use_view_attn else [])
+                + (list(self.fusion_proj.parameters())
+                   if self.feature_fusion == "concat" else [])
+                + (list(self.geo_extractor.parameters())
+                   if self.use_geo_features else [])
+            )
+            optimizer = torch.optim.AdamW([
+                {"params": pretrained_params,
+                 "lr": base_lr},
+                {"params": list(self.point_head.parameters()),
+                 "lr": base_lr * self.lr_point_head_multiplier},
+            ], weight_decay=wd)
+        else:
+            optimizer = self._optimizer(self.parameters())
+
         if self._lr_scheduler is None:
             return {"optimizer": optimizer}
         scheduler = self._lr_scheduler(optimizer)

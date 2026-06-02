@@ -111,6 +111,59 @@ def extract_batch_idx(valid_pcs: torch.Tensor) -> torch.Tensor:
     return torch.where(valid_pcs)[0]
 
 
+def sample_features_at_points(
+    feature_map: torch.Tensor,               # (K, V, C_feat, H, W)
+    pix_corners_list: list,                  # list of K tensors (N_i, V, 4) long
+    pix_weights_list: list,                  # list of K tensors (N_i, V, 4) float
+    view_attn_weights: torch.Tensor = None,  # (K, V) softmax scores, or None
+) -> list:
+    """
+    Sample C_feat-dimensional feature vectors at each 3D point's projected 2D
+    location, then fuse across V views.
+
+    Identical bilinear gather + view fusion logic as backproject_pixel_to_points,
+    but operates on feature vectors (C_feat dims) instead of scalar predictions.
+
+    Used by PointHead (Phase 3): extracts per-point 2D context from the CNN
+    feature map before passing to the point-wise MLP.
+
+    Returns:
+        list of K tensors (N_k, C_feat)
+    """
+    K, V, C_feat, H, W = feature_map.shape
+
+    result = []
+    for k in range(K):
+        corners_k = pix_corners_list[k]                          # (N_k, V, 4) long
+        weights_k = pix_weights_list[k]                          # (N_k, V, 4) float
+        feat_flat = feature_map[k].reshape(V, C_feat, H * W)    # (V, C_feat, H*W)
+
+        N_k = corners_k.shape[0]
+
+        # (V, N_k*4) — same reshape as backproject_pixel_to_points
+        corners_vn4 = corners_k.permute(1, 0, 2).reshape(V, N_k * 4)
+        weights_vn4 = weights_k.permute(1, 0, 2).reshape(V, N_k * 4)
+
+        # Gather features at each bilinear corner: (V, C_feat, N_k*4)
+        idx = corners_vn4.unsqueeze(1).expand(-1, C_feat, -1)
+        feat_corners = feat_flat.gather(2, idx)
+
+        # Apply bilinear weights and sum over 4 corners → (V, C_feat, N_k)
+        w = weights_vn4.unsqueeze(1).expand(-1, C_feat, -1)
+        feat_per_view = (feat_corners * w).reshape(V, C_feat, N_k, 4).sum(dim=3)
+
+        # Multi-view fusion → (C_feat, N_k)
+        if view_attn_weights is not None:
+            alpha = view_attn_weights[k].view(V, 1, 1)
+            fused = (feat_per_view * alpha).sum(dim=0)
+        else:
+            fused = feat_per_view.mean(dim=0)
+
+        result.append(fused.T)   # (N_k, C_feat)
+
+    return result
+
+
 def backproject_pixel_to_points(
     pixel_seg: torch.Tensor,             # (K, V, H, W)   sigmoid predictions [0,1]
     pix_corners_list: list,              # list of K tensors (N_i, V, 4) long

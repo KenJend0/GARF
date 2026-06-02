@@ -51,6 +51,8 @@ STEPS = [
     ("cnn_step9_geo_features",          "Step 9  + GeoFeatures"),
     ("cnn_step10_precision",            "Step 10 + Tversky+DistCentroid"),
     ("cnn_step11_hard_sampling",        "Step 11 + FocalLoss+HardSampling"),
+    ("cnn_step12_overlap_aware",        "Step 12 + OverlapChannels"),
+    ("cnn_step13_point_head",           "Step 13 + PointHead MLP"),
 ]
 
 # Hard-coded results for steps whose CSV output is no longer available.
