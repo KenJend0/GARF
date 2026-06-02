@@ -18,6 +18,15 @@ Usage:
         --split val \
         --n_vis 6 \
         --max_batches 200
+
+    # + geometric metrics (Phase 1 — Boundary F1 / Hausdorff / Chamfer)
+    python scripts/analyze_errors.py \
+        --ckpt /storage/student7/teyssir/checkpoints/cnn_step11_last.ckpt \
+        --data_root /storage/student7/teyssir/data/breaking_bad_vol.hdf5 \
+        --experiment cnn_step11 \
+        --out_dir /tmp/student7/analysis/step11_geo \
+        --geometric \
+        --k_boundary 5
 """
 
 import argparse
@@ -36,6 +45,18 @@ import numpy as np
 import torch
 import torch.serialization
 torch.serialization.add_safe_globals([functools.partial])
+
+try:
+    from scipy.spatial import cKDTree
+    _SCIPY_OK = True
+except ImportError:
+    _SCIPY_OK = False
+
+try:
+    from sklearn.neighbors import NearestNeighbors
+    _SKLEARN_OK = True
+except ImportError:
+    _SKLEARN_OK = False
 
 # Make sure codebase is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -144,6 +165,178 @@ def bin_stats(records, key, n_bins=4):
 
 
 # ---------------------------------------------------------------------------
+# Geometric metrics (Phase 1)
+# ---------------------------------------------------------------------------
+
+def _boundary_mask(xyz: np.ndarray, gt_labels: np.ndarray, k: int = 5) -> np.ndarray:
+    """Boolean mask — True for points whose k-NN neighbourhood contains both classes."""
+    if not _SKLEARN_OK or len(xyz) < k + 1:
+        return np.zeros(len(xyz), dtype=bool)
+    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="kd_tree").fit(xyz)
+    _, idxs = nbrs.kneighbors(xyz)
+    neighbor_labels = gt_labels[idxs[:, 1:]]          # (N, k)
+    return (neighbor_labels != gt_labels[:, None]).any(axis=1)
+
+
+def _boundary_f1(pred_prob: np.ndarray, gt: np.ndarray,
+                 xyz: np.ndarray, k: int = 5):
+    """F1 / Precision / Recall computed only on boundary points."""
+    mask = _boundary_mask(xyz, gt, k=k)
+    n_boundary = mask.sum()
+    if n_boundary < 2:
+        return float("nan"), float("nan"), float("nan"), int(n_boundary)
+    p = (pred_prob[mask] > 0.5)
+    g = gt[mask].astype(bool)
+    tp = int((p & g).sum())
+    fp = int((p & ~g).sum())
+    fn = int((~p & g).sum())
+    prec = safe_div(tp, tp + fp)
+    rec  = safe_div(tp, tp + fn)
+    f1   = safe_div(2 * prec * rec, prec + rec)
+    return f1, prec, rec, int(n_boundary)
+
+
+def _hausdorff(pred_prob: np.ndarray, gt: np.ndarray, xyz: np.ndarray) -> float:
+    """One-sided + two-sided Hausdorff distance (in point-cloud units) between
+    predicted fracture set and GT fracture set."""
+    if not _SCIPY_OK:
+        return float("nan")
+    pred_pts = xyz[pred_prob > 0.5]
+    gt_pts   = xyz[gt.astype(bool)]
+    if len(pred_pts) == 0 or len(gt_pts) == 0:
+        return float("nan")
+    d_p2g = cKDTree(gt_pts).query(pred_pts)[0].max()
+    d_g2p = cKDTree(pred_pts).query(gt_pts)[0].max()
+    return float(max(d_p2g, d_g2p))
+
+
+def _chamfer(pred_prob: np.ndarray, gt: np.ndarray, xyz: np.ndarray) -> float:
+    """Symmetric Chamfer distance between predicted and GT fracture point sets."""
+    if not _SCIPY_OK:
+        return float("nan")
+    pred_pts = xyz[pred_prob > 0.5]
+    gt_pts   = xyz[gt.astype(bool)]
+    if len(pred_pts) == 0 or len(gt_pts) == 0:
+        return float("nan")
+    d_p2g = cKDTree(gt_pts).query(pred_pts)[0].mean()
+    d_g2p = cKDTree(pred_pts).query(gt_pts)[0].mean()
+    return float(d_p2g + d_g2p)
+
+
+def compute_geometric_metrics(records: list, xyz_list: list, k_boundary: int = 5) -> None:
+    """Compute and attach boundary_f1, boundary_prec, boundary_rec, n_boundary,
+    hausdorff, chamfer to every record in-place."""
+    if not (_SCIPY_OK or _SKLEARN_OK):
+        print("  [warn] scipy/sklearn not available — skipping geometric metrics")
+        return
+
+    for rec, xyz in zip(records, xyz_list):
+        pred = rec["_pred"].numpy() if hasattr(rec["_pred"], "numpy") else np.asarray(rec["_pred"])
+        gt   = rec["_gt"].numpy()   if hasattr(rec["_gt"],   "numpy") else np.asarray(rec["_gt"])
+        xyz_np = xyz.numpy() if hasattr(xyz, "numpy") else np.asarray(xyz)
+
+        bf1, bprec, brec, nb = _boundary_f1(pred, gt, xyz_np, k=k_boundary)
+        rec["boundary_f1"]   = bf1
+        rec["boundary_prec"] = bprec
+        rec["boundary_rec"]  = brec
+        rec["n_boundary"]    = nb
+        rec["hausdorff"]     = _hausdorff(pred, gt, xyz_np)
+        rec["chamfer"]       = _chamfer(pred, gt, xyz_np)
+
+
+def print_geometric_summary(records: list) -> None:
+    bf1s = [r["boundary_f1"] for r in records if not np.isnan(r["boundary_f1"])]
+    hds  = [r["hausdorff"]   for r in records if not np.isnan(r["hausdorff"])]
+    cds  = [r["chamfer"]     for r in records if not np.isnan(r["chamfer"])]
+
+    print("\n" + "=" * 62)
+    print("GEOMETRIC METRICS (fragment-level, boundary k=5)")
+    print("=" * 62)
+    print(f"  {'Metric':<22}  {'Mean':>8}  {'Median':>8}  {'Std':>8}  n")
+    print("  " + "-" * 56)
+    if bf1s:
+        print(f"  {'Boundary F1':<22}  {np.mean(bf1s):>8.4f}  {np.median(bf1s):>8.4f}  {np.std(bf1s):>8.4f}  {len(bf1s)}")
+    if hds:
+        print(f"  {'Hausdorff distance':<22}  {np.mean(hds):>8.4f}  {np.median(hds):>8.4f}  {np.std(hds):>8.4f}  {len(hds)}")
+    if cds:
+        print(f"  {'Chamfer distance':<22}  {np.mean(cds):>8.4f}  {np.median(cds):>8.4f}  {np.std(cds):>8.4f}  {len(cds)}")
+
+    # Quick correlation: high-F1 fragments — is boundary_f1 also high?
+    paired = [(r["f1"], r["boundary_f1"]) for r in records
+              if not np.isnan(r["boundary_f1"])]
+    if len(paired) > 10:
+        f1v  = np.array([x[0] for x in paired])
+        bf1v = np.array([x[1] for x in paired])
+        corr = np.corrcoef(f1v, bf1v)[0, 1]
+        print(f"\n  Pearson corr(F1, Boundary F1) = {corr:.3f}")
+
+    print()
+
+
+def plot_geometric_distributions(records: list, out_dir: Path) -> None:
+    """Three-panel figure: Boundary F1, Hausdorff, Chamfer distributions."""
+    bf1s = [r["boundary_f1"] for r in records if not np.isnan(r["boundary_f1"])]
+    hds  = [r["hausdorff"]   for r in records if not np.isnan(r["hausdorff"])]
+    cds  = [r["chamfer"]     for r in records if not np.isnan(r["chamfer"])]
+
+    if not bf1s:
+        return
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    axes[0].hist(bf1s, bins=40, color="#00897B", edgecolor="white", linewidth=0.5)
+    axes[0].axvline(np.mean(bf1s), color="red",    linestyle="--", label=f"mean={np.mean(bf1s):.3f}")
+    axes[0].axvline(np.median(bf1s), color="orange", linestyle="--", label=f"median={np.median(bf1s):.3f}")
+    axes[0].set_xlabel("Boundary F1")
+    axes[0].set_ylabel("Number of fragments")
+    axes[0].set_title("Boundary F1 Distribution")
+    axes[0].legend(fontsize=8)
+    axes[0].grid(axis="y", alpha=0.3)
+
+    if hds:
+        axes[1].hist(hds, bins=40, color="#E53935", edgecolor="white", linewidth=0.5)
+        axes[1].axvline(np.mean(hds), color="black", linestyle="--", label=f"mean={np.mean(hds):.4f}")
+        axes[1].set_xlabel("Hausdorff distance (point-cloud units)")
+        axes[1].set_title("Hausdorff Distance Distribution")
+        axes[1].legend(fontsize=8)
+        axes[1].grid(axis="y", alpha=0.3)
+
+    if cds:
+        axes[2].hist(cds, bins=40, color="#8E24AA", edgecolor="white", linewidth=0.5)
+        axes[2].axvline(np.mean(cds), color="black", linestyle="--", label=f"mean={np.mean(cds):.4f}")
+        axes[2].set_xlabel("Chamfer distance (point-cloud units)")
+        axes[2].set_title("Chamfer Distance Distribution")
+        axes[2].legend(fontsize=8)
+        axes[2].grid(axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    out_path = out_dir / "geometric_metrics_distributions.png"
+    plt.savefig(out_path, dpi=120)
+    plt.close()
+    print(f"  Saved: {out_path}")
+
+    # Scatter: F1 vs Boundary F1
+    paired = [(r["f1"], r["boundary_f1"]) for r in records
+              if not np.isnan(r["boundary_f1"])]
+    if len(paired) > 5:
+        fig, ax = plt.subplots(figsize=(6, 5))
+        f1v, bf1v = zip(*paired)
+        ax.scatter(f1v, bf1v, s=4, alpha=0.4, color="#00897B")
+        ax.plot([0, 1], [0, 1], "k--", linewidth=0.8, alpha=0.5)
+        ax.set_xlabel("Global F1")
+        ax.set_ylabel("Boundary F1")
+        ax.set_title("Global F1 vs Boundary F1 (points below diagonal = boundary worse)")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
+        out_path2 = out_dir / "f1_vs_boundary_f1_scatter.png"
+        plt.savefig(out_path2, dpi=120)
+        plt.close()
+        print(f"  Saved: {out_path2}")
+
+
+# ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
 
@@ -235,9 +428,7 @@ def analyze_isolated_fp(records, xyz_list, k_neighbors=10, min_cluster_size=5):
     min_cluster_size FP points.
     Returns summary dict.
     """
-    try:
-        from sklearn.neighbors import NearestNeighbors
-    except ImportError:
+    if not _SKLEARN_OK:
         print("  [warn] sklearn not available — skipping isolated FP analysis")
         return {}
 
@@ -385,6 +576,10 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--sweep_threshold", action="store_true",
                    help="Sweep decision threshold and print F1/Prec/Rec table")
+    p.add_argument("--geometric", action="store_true",
+                   help="Compute geometric metrics: Boundary F1, Hausdorff, Chamfer distance")
+    p.add_argument("--k_boundary", type=int, default=5,
+                   help="k for kNN boundary detection (default 5)")
     return p.parse_args()
 
 
@@ -558,6 +753,17 @@ def main():
 
     # --- FP/FN distribution ---
     plot_fp_fn_dist(all_records, out_dir / "fp_fn_distribution.png")
+
+    # --- Geometric metrics (Phase 1) ---
+    if args.geometric:
+        print(f"\n[Geometric Metrics — Boundary F1 / Hausdorff / Chamfer (k={args.k_boundary})]")
+        if not _SKLEARN_OK:
+            print("  [warn] sklearn not found — install it: pip install scikit-learn")
+        if not _SCIPY_OK:
+            print("  [warn] scipy not found — install it: pip install scipy")
+        compute_geometric_metrics(all_records, all_xyz, k_boundary=args.k_boundary)
+        print_geometric_summary(all_records)
+        plot_geometric_distributions(all_records, out_dir)
 
     # --- Isolated FP analysis ---
     print("\n[Isolated FP Cluster Analysis]")
