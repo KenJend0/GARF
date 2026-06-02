@@ -1,0 +1,69 @@
+# @package _global_
+# configs/experiment/cnn_step12_overlap_aware.yaml
+#
+# Step 12 — Overlap-aware channels
+#
+# Diagnostic Phase 1 : Global F1=83.2% mais Boundary F1=68.2% (gap de 15 pts).
+# La backprojection 2D→3D est avec perte : plusieurs points 3D tombent dans le
+# même pixel et reçoivent une prédiction identique. count_flat est déjà calculé
+# dans project_fragment() mais non exposé comme channel CNN.
+#
+# 4 channels ajoutés (après les channels existants) :
+#   count_norm   : nb de points par pixel, normalisé à [0,1] par vue
+#   depth_min    : profondeur du point le plus proche dans ce pixel
+#   depth_max    : profondeur du point le plus loin dans ce pixel
+#   depth_spread : depth_max − depth_min  (> 0 → points à profondeurs mixtes)
+#
+# Le depth_spread est le signal clé : un pixel avec spread élevé contient des
+# points fracture et intact superposés → zone de conflit structurel.
+#
+# Architecture : identique à Step 11 (U-Net depth=4, geo_features, focal+dice).
+# in_ch passe de 8 → 12 (4 nouveaux channels), donc le premier Conv2d change.
+# Fine-tuning depuis Step 11 avec strict=False : la première couche conv est
+# ré-initialisée aléatoirement, toutes les autres couches sont chargées depuis
+# Step 11.
+#
+# Objectif : Boundary F1 > 70% (vs 68.2% baseline Step 11).
+
+defaults:
+  - cnn_ablation_shared
+  - _self_
+
+experiment_name: cnn_step12_overlap_aware
+tags: ["cnn", "ablation", "step12", "overlap_channels", "boundary_f1"]
+
+trainer:
+  max_epochs: 150   # 130 Step 11 + 20 epochs fine-tuning
+
+model:
+  # Architecture identique Step 11 — aucun changement de couches
+  resolution: 128              # idem Step 11 (ne pas changer pour comparaison valide)
+  use_normals: true
+  splat_sigma: 1.5
+  use_bilinear: true
+  use_global_context: true
+  use_view_attn: false
+  backbone: unet
+  unet_depth: 4
+  feature_fusion: "max"
+  use_geo_features: true
+  geo_k: 16
+  # Phase 2 : nouveaux channels (in_ch 8→12, premier Conv2d re-init via hook)
+  use_overlap_channels: true
+  # Loss identique Step 11 — isoler l'effet des channels uniquement
+  use_focal_loss: true
+  focal_gamma: 2.0
+  focal_dice_alpha: 0.5
+
+  # Chargement partiel depuis Step 11 (géré par on_fit_start + _fix_first_conv_shape)
+  # Les 8 anciens channels gardent leurs poids ; les 4 nouveaux démarrent à 0.
+  # Passer le chemin réel en CLI si différent :
+  #   python train.py experiment=cnn_step12_overlap_aware \
+  #     model.pretrained_ckpt=/autre/chemin/step11.ckpt
+  pretrained_ckpt: /storage/student7/teyssir/code/output/cnn_step11_hard_sampling/last.ckpt
+
+  optimizer:
+    lr: 1e-4   # lr réduit pour fine-tuning (évite l'oubli catastrophique)
+
+data:
+  weight_hard_examples: true

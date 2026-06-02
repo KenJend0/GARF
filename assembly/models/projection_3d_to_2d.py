@@ -12,14 +12,18 @@ Views (XYZ convention):
   view 2 — top   : u=X, v=Z, depth=Y
 
 Image channels:
-  ch 0 — depth                        : average depth in [0, 1]
-  ch 1 — occupancy                    : 1.0 where any point landed, else 0.0
-  ch 2 — nx  (if use_normals)         : average world-space normal x
+  ch 0 — depth                           : average depth in [0, 1]
+  ch 1 — occupancy                       : 1.0 where any point landed, else 0.0
+  ch 2 — nx  (if use_normals)            : average world-space normal x
   ch 3 — ny  (if use_normals)
   ch 4 — nz  (if use_normals)
-  ch 5 — curvature   (if geo_features): λ_min / Σλ from local PCA
-  ch 6 — roughness   (if geo_features): mean perpendicular distance to tangent plane
-  ch 7 — consistency (if geo_features): input normal vs PCA normal alignment
+  ch 5 — curvature   (if geo_features)   : λ_min / Σλ from local PCA
+  ch 6 — roughness   (if geo_features)   : mean perpendicular distance to tangent plane
+  ch 7 — consistency (if geo_features)   : input normal vs PCA normal alignment
+  ch N+0 — count_norm (if overlap)       : point count per pixel, normalised by view max
+  ch N+1 — depth_min  (if overlap)       : depth of nearest point in pixel
+  ch N+2 — depth_max  (if overlap)       : depth of farthest point in pixel
+  ch N+3 — depth_spread (if overlap)     : depth_max − depth_min (> 0 → layered overlap)
 
 Projection modes (use_bilinear flag):
   False — floor assignment.
@@ -123,6 +127,7 @@ def project_fragment(
     splat_sigma: float = 1.5,
     splat_kernel: int = 5,
     use_bilinear: bool = False,
+    use_overlap_channels: bool = False,   # add count/depth_min/depth_max/depth_spread channels
 ) -> tuple:
     """
     Project one fragment to V orthographic depth-map images.
@@ -138,7 +143,7 @@ def project_fragment(
     H = W = resolution
     V = num_views
     G = geo_features.shape[1] if geo_features is not None else 0
-    C = 2 + (3 if normals is not None else 0) + G
+    C = 2 + (3 if normals is not None else 0) + G + (4 if use_overlap_channels else 0)
     device = pts.device
     dtype = pts.dtype
 
@@ -227,6 +232,24 @@ def project_fragment(
                 g_acc.scatter_add_(0, flat_c, g_rep * w_flat)
                 images[v, base_ch + g] = (g_acc / cnt.clamp(min=1e-6)).view(H, W)
 
+        # Overlap channels: count (normalised), depth_min, depth_max, depth_spread
+        if use_overlap_channels:
+            ov = 2 + (3 if normals is not None else 0) + G   # first overlap channel index
+            # count normalised to [0, 1] within this view
+            images[v, ov] = (cnt / cnt.max().clamp(min=1e-6)).view(H, W)
+            # depth min/max per pixel — scatter over each point's floor-rounded home pixel
+            home_px = corners[:, 0]      # (N,) — nearest pixel in both floor and bilinear mode
+            d_min = torch.full((H * W,), float("inf"),  device=device, dtype=dtype)
+            d_max = torch.full((H * W,), float("-inf"), device=device, dtype=dtype)
+            d_min.scatter_reduce_(0, home_px, depth_norm, reduce="amin", include_self=True)
+            d_max.scatter_reduce_(0, home_px, depth_norm, reduce="amax", include_self=True)
+            empty_px = cnt == 0
+            d_min[empty_px] = 0.0
+            d_max[empty_px] = 0.0
+            images[v, ov + 1] = d_min.view(H, W)
+            images[v, ov + 2] = d_max.view(H, W)
+            images[v, ov + 3] = (d_max - d_min).clamp(min=0.0).view(H, W)
+
         pix_corners[:, v, :] = corners
         pix_weights[:, v, :] = weights
 
@@ -266,20 +289,23 @@ class Project3DTo2D(nn.Module):
         use_bilinear: bool = False,
         use_geo_features: bool = False,
         geo_features_dim: int = 3,
+        use_overlap_channels: bool = False,
     ):
         super().__init__()
         assert 1 <= num_views <= 3, "num_views must be 1, 2 or 3"
-        self.num_views        = num_views
-        self.resolution       = resolution
-        self.use_normals      = use_normals
-        self.splat_sigma      = splat_sigma
-        self.splat_kernel     = splat_kernel
-        self.use_bilinear     = use_bilinear
-        self.use_geo_features = use_geo_features
+        self.num_views            = num_views
+        self.resolution           = resolution
+        self.use_normals          = use_normals
+        self.splat_sigma          = splat_sigma
+        self.splat_kernel         = splat_kernel
+        self.use_bilinear         = use_bilinear
+        self.use_geo_features     = use_geo_features
+        self.use_overlap_channels = use_overlap_channels
         self.num_channels = (
             2
             + (3 if use_normals else 0)
             + (geo_features_dim if use_geo_features else 0)
+            + (4 if use_overlap_channels else 0)
         )
 
     def forward(
@@ -317,6 +343,7 @@ class Project3DTo2D(nn.Module):
                 splat_sigma=self.splat_sigma,
                 splat_kernel=self.splat_kernel,
                 use_bilinear=self.use_bilinear,
+                use_overlap_channels=self.use_overlap_channels,
             )
             imgs_all.append(imgs)
             crn_all.append(corners)

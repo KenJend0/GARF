@@ -350,15 +350,22 @@ class CNNFracSeg(pl.LightningModule):
         use_geo_features: bool = False,
         geo_k: int = 16,
         use_dist_to_centroid: bool = False,
+        use_overlap_channels: bool = False,
         use_tversky_loss: bool = False,
         tversky_alpha: float = 0.7,
         use_focal_loss: bool = False,
         focal_gamma: float = 2.0,
         focal_dice_alpha: float = 0.5,
+        pretrained_ckpt: str = None,
         **kwargs,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["lr_scheduler"])
+        # pretrained_ckpt is intentionally excluded from hparams: it's only
+        # used for the initial fine-tuning run and must not be re-applied when
+        # resuming from a Step-N checkpoint.
+        self.save_hyperparameters(ignore=["lr_scheduler", "pretrained_ckpt"])
+        self._pretrained_ckpt   = pretrained_ckpt
+        self._pretrained_loaded = False   # set True once weights are loaded
 
         self.num_views            = num_views
         self.resolution           = resolution
@@ -397,6 +404,7 @@ class CNNFracSeg(pl.LightningModule):
             use_bilinear=use_bilinear,
             use_geo_features=use_geo_features,
             geo_features_dim=geo_dim,
+            use_overlap_channels=use_overlap_channels,
         )
 
         if backbone == "unet":
@@ -423,6 +431,90 @@ class CNNFracSeg(pl.LightningModule):
             self.fusion_proj = nn.Conv2d(
                 num_views * self.cnn.btn_ch, self.cnn.btn_ch, kernel_size=1, bias=False
             )
+
+    # ------------------------------------------------------------------
+    # Pretrained weight loading (first-conv shape mismatch handling)
+    # ------------------------------------------------------------------
+
+    def _first_conv_key(self) -> str:
+        """State-dict key for the first Conv2d weight, backbone-agnostic."""
+        if hasattr(self.cnn, "enc_blocks"):
+            return "cnn.enc_blocks.0.0.0.weight"
+        return "cnn.encoder_blocks.0.0.0.weight"
+
+    def _fix_first_conv_shape(self, state_dict: dict) -> None:
+        """
+        Expand (or shrink) the first conv weight in state_dict in-place so its
+        in_ch matches self.projector.num_channels.
+
+        New channels are zero-initialised so the network starts by ignoring
+        them and learns their contribution progressively.
+        """
+        key = self._first_conv_key()
+        if key not in state_dict:
+            return
+        ckpt_w   = state_dict[key]                   # (out_ch, C_old, kH, kW)
+        C_old    = ckpt_w.shape[1]
+        C_new    = self.projector.num_channels
+        if C_old == C_new:
+            return
+        if C_new > C_old:
+            pad = torch.zeros(
+                ckpt_w.shape[0], C_new - C_old, *ckpt_w.shape[2:],
+                dtype=ckpt_w.dtype, device=ckpt_w.device,
+            )
+            state_dict[key] = torch.cat([ckpt_w, pad], dim=1)
+            print(f"[CNNFracSeg] first conv: {C_old}→{C_new} channels "
+                  f"({C_new - C_old} new channels zero-init)")
+        else:
+            state_dict[key] = ckpt_w[:, :C_new, :, :]
+            print(f"[CNNFracSeg] first conv: truncated {C_old}→{C_new} channels")
+
+    def _load_pretrained(self, ckpt_path: str) -> None:
+        """
+        Load backbone weights from a previous-step checkpoint.
+        Handles first-conv channel count mismatch automatically.
+        All other layers must have matching shapes (guaranteed within our
+        ablation series since only in_ch changes between steps).
+        """
+        import os
+        if not os.path.exists(ckpt_path):
+            print(f"[CNNFracSeg] WARNING: pretrained_ckpt not found: {ckpt_path}")
+            return
+        ckpt  = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        state = ckpt.get("state_dict", ckpt)
+        self._fix_first_conv_shape(state)
+        missing, unexpected = self.load_state_dict(state, strict=False)
+        n_ok = len(state) - len(unexpected)
+        print(f"[CNNFracSeg] pretrained weights loaded from {ckpt_path}")
+        print(f"  {n_ok} tensors matched | {len(missing)} missing | "
+              f"{len(unexpected)} unexpected")
+        if missing:
+            print(f"  Missing (first 5): {missing[:5]}")
+
+    # ------------------------------------------------------------------
+    # Lightning hooks
+    # ------------------------------------------------------------------
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        """
+        Called by Lightning when loading ANY checkpoint (resume or eval).
+        Fixes first-conv shape mismatch, then marks pretrained as already
+        loaded so on_fit_start does not overwrite the resumed weights.
+        """
+        self._fix_first_conv_shape(checkpoint.get("state_dict", {}))
+        self._pretrained_loaded = True
+
+    def on_fit_start(self) -> None:
+        """
+        Called once before training begins. Loads pretrained backbone weights
+        when starting a fresh fine-tuning run (no ckpt_path in Trainer.fit).
+        Skipped automatically when resuming from a checkpoint, because
+        on_load_checkpoint sets _pretrained_loaded=True first.
+        """
+        if not self._pretrained_loaded and self._pretrained_ckpt is not None:
+            self._load_pretrained(self._pretrained_ckpt)
+            self._pretrained_loaded = True
 
     # ------------------------------------------------------------------
     # Shared criteria — identical to FracSeg
