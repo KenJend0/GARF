@@ -48,6 +48,7 @@ model:
   feature_fusion: "max"
   use_geo_features: true
   geo_k: 16
+  use_overlap_channels: true
   use_focal_loss: true
   focal_gamma: 2.0
   focal_dice_alpha: 0.5
