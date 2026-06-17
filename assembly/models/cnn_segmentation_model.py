@@ -58,11 +58,19 @@ from assembly.models.projection_mapping_utils import (
 # ---------------------------------------------------------------------------
 
 class _ConvBnRelu(nn.Sequential):
-    """Conv2d → BatchNorm2d → ReLU helper block."""
-    def __init__(self, in_ch: int, out_ch: int, kernel: int = 3, padding: int = 1):
+    """Conv2d → Norm → ReLU helper block.
+    norm_type: 'batch' (default) or 'instance' (domain-invariant, better generalisation).
+    InstanceNorm normalises each image independently → CNN can't rely on
+    dataset-level statistics → learns geometry-based features instead.
+    """
+    def __init__(self, in_ch: int, out_ch: int, kernel: int = 3, padding: int = 1,
+                 norm_type: str = "batch"):
+        norm = (nn.InstanceNorm2d(out_ch, affine=True)
+                if norm_type == "instance"
+                else nn.BatchNorm2d(out_ch))
         super().__init__(
             nn.Conv2d(in_ch, out_ch, kernel, padding=padding, bias=False),
-            nn.BatchNorm2d(out_ch),
+            norm,
             nn.ReLU(inplace=True),
         )
 
@@ -187,19 +195,20 @@ class SimpleCNNBackbone(nn.Module):
         num_blocks : encoder depth (2 or 3)
     """
 
-    def __init__(self, in_ch: int = 2, base_ch: int = 16, num_blocks: int = 3):
+    def __init__(self, in_ch: int = 2, base_ch: int = 16, num_blocks: int = 3,
+                 norm_type: str = "batch"):
         super().__init__()
 
         channels = [in_ch] + [base_ch * (2 ** i) for i in range(num_blocks)]
-        self.btn_ch          = channels[-1]       # bottleneck channel dim
-        self.decoder_feat_dim = base_ch * 2       # channels before the final 1×1 head
+        self.btn_ch          = channels[-1]
+        self.decoder_feat_dim = base_ch * 2
         self._pool_steps = num_blocks - 1
 
         encoder_blocks = []
         for i in range(num_blocks):
             encoder_blocks.append(nn.Sequential(
-                _ConvBnRelu(channels[i], channels[i + 1]),
-                _ConvBnRelu(channels[i + 1], channels[i + 1]),
+                _ConvBnRelu(channels[i], channels[i + 1], norm_type=norm_type),
+                _ConvBnRelu(channels[i + 1], channels[i + 1], norm_type=norm_type),
             ))
         self.encoder_blocks = nn.ModuleList(encoder_blocks)
 
@@ -209,7 +218,7 @@ class SimpleCNNBackbone(nn.Module):
         )
 
         self.decoder_conv = nn.Sequential(
-            _ConvBnRelu(self.btn_ch, base_ch * 2),
+            _ConvBnRelu(self.btn_ch, base_ch * 2, norm_type=norm_type),
             nn.Conv2d(base_ch * 2, 1, kernel_size=1),
         )
 
@@ -282,20 +291,19 @@ class UNetBackbone(nn.Module):
     Context injection is applied at the bottleneck before decoding.
     """
 
-    def __init__(self, in_ch: int = 2, base_ch: int = 16, depth: int = 4):
+    def __init__(self, in_ch: int = 2, base_ch: int = 16, depth: int = 4,
+                 norm_type: str = "batch"):
         super().__init__()
         self.depth = depth
 
-        # Build encoder channel sizes: [in_ch, base_ch, base_ch*2, ..., base_ch*2^(depth-1)]
         enc_chs = [in_ch] + [base_ch * (2 ** i) for i in range(depth)]
         self.btn_ch           = enc_chs[-1]
-        self.decoder_feat_dim = base_ch       # channels of last decoder level (= enc_chs[1])
+        self.decoder_feat_dim = base_ch
 
-        # Encoder blocks
         self.enc_blocks = nn.ModuleList([
             nn.Sequential(
-                _ConvBnRelu(enc_chs[i], enc_chs[i + 1]),
-                _ConvBnRelu(enc_chs[i + 1], enc_chs[i + 1]),
+                _ConvBnRelu(enc_chs[i], enc_chs[i + 1], norm_type=norm_type),
+                _ConvBnRelu(enc_chs[i + 1], enc_chs[i + 1], norm_type=norm_type),
             )
             for i in range(depth)
         ])
@@ -305,12 +313,11 @@ class UNetBackbone(nn.Module):
             2 * self.btn_ch, self.btn_ch, kernel_size=1, bias=False
         )
 
-        # Decoder blocks — input is concat(upsampled, skip)
-        dec_chs = list(reversed(enc_chs[1:]))   # [btn_ch, btn_ch/2, ..., base_ch]
+        dec_chs = list(reversed(enc_chs[1:]))
         self.dec_blocks = nn.ModuleList([
             nn.Sequential(
-                _ConvBnRelu(dec_chs[i] + dec_chs[i + 1], dec_chs[i + 1]),
-                _ConvBnRelu(dec_chs[i + 1], dec_chs[i + 1]),
+                _ConvBnRelu(dec_chs[i] + dec_chs[i + 1], dec_chs[i + 1], norm_type=norm_type),
+                _ConvBnRelu(dec_chs[i + 1], dec_chs[i + 1], norm_type=norm_type),
             )
             for i in range(depth - 1)
         ])
@@ -421,6 +428,8 @@ class CNNFracSeg(pl.LightningModule):
         geo_k: int = 16,
         use_dist_to_centroid: bool = False,
         use_overlap_channels: bool = False,
+        random_rotate: bool = False,
+        norm_type: str = "batch",
         use_point_head: bool = False,
         point_head_feat_dim: int = 64,
         point_head_hidden_dim: int = 128,
@@ -481,6 +490,7 @@ class CNNFracSeg(pl.LightningModule):
             use_geo_features=use_geo_features,
             geo_features_dim=geo_dim,
             use_overlap_channels=use_overlap_channels,
+            random_rotate=random_rotate,
         )
 
         if backbone == "unet":
@@ -488,12 +498,14 @@ class CNNFracSeg(pl.LightningModule):
                 in_ch=self.projector.num_channels,
                 base_ch=base_ch,
                 depth=unet_depth,
+                norm_type=norm_type,
             )
         else:
             self.cnn = SimpleCNNBackbone(
                 in_ch=self.projector.num_channels,
                 base_ch=base_ch,
                 num_blocks=num_blocks,
+                norm_type=norm_type,
             )
 
         if use_view_attn:

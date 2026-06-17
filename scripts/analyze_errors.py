@@ -899,7 +899,7 @@ def main():
 
     # --- Qualitative visualizations ---
     print(f"\nGenerating qualitative visualizations (n_vis={args.n_vis})...")
-    plot_qualitative(all_records, all_xyz, args.n_vis, out_dir, tag="step9")
+    plot_qualitative(all_records, all_xyz, args.n_vis, out_dir, tag=args.experiment)
 
     # --- F1 scatter: fracture_ratio vs F1 (colored by n_parts) ---
     fig, ax = plt.subplots(figsize=(7, 5))

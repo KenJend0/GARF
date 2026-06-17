@@ -1,0 +1,70 @@
+# @package _global_
+# configs/experiment/cnn_step14_generalization.yaml
+#
+# Step 14 — Généralisation inter-domaines
+#
+# Diagnostic Step 13 : F1=92.3% sur everyday, mais F1=82.3% sur artifact.
+# Recall transfère (92%) mais précision s'effondre (78.8% sur artifact).
+# Cause : le U-Net apprend des raccourcis visuels liés aux objets everyday
+# (patterns de projection, texture des images). Ces raccourcis cassent sur
+# des catégories différentes.
+#
+# Deux fixes essentiels :
+#
+#   1. Random SO(3) rotation avant projection (training only)
+#      → Le CNN ne peut plus apprendre "une fracture d'assiette ressemble à X
+#        en vue de face". Il doit apprendre des features géométriques
+#        universelles indépendantes de l'orientation et de la forme.
+#
+#   2. Instance Normalization au lieu de BatchNorm dans le U-Net
+#      → BN encode les statistiques de la distribution d'entraînement (everyday).
+#      → IN normalise chaque image indépendamment → agnostique au domaine.
+#      → Le CNN ne peut plus s'appuyer sur les statistiques globales du dataset.
+#
+#   3. Entraînement sur les deux catégories (everyday + artifact)
+#
+# Fine-tuning depuis Step 13, lr=5e-5, 20 epochs.
+# Objectif : artifact F1 > 90%, everyday F1 stable.
+
+defaults:
+  - cnn_ablation_shared
+  - _self_
+
+experiment_name: cnn_step14_generalization
+tags: ["cnn", "ablation", "step14", "generalization", "instance_norm", "random_rotate"]
+
+trainer:
+  max_epochs: 20
+
+model:
+  resolution: 128
+  use_normals: true
+  splat_sigma: 1.5
+  use_bilinear: true
+  use_global_context: true
+  use_view_attn: false
+  backbone: unet
+  unet_depth: 4
+  feature_fusion: "max"
+  use_geo_features: true
+  geo_k: 16
+  use_focal_loss: true
+  focal_gamma: 2.0
+  focal_dice_alpha: 0.5
+  use_point_head: true
+  point_head_feat_dim: 64
+  point_head_hidden_dim: 128
+  lr_point_head_multiplier: 2.0
+
+  # Step 14 : généralisation
+  random_rotate: true       # SO(3) rotation aléatoire avant projection (training only)
+  norm_type: instance       # InstanceNorm → features domain-invariantes
+
+  optimizer:
+    lr: 5e-5
+
+  pretrained_ckpt: /storage/student7/teyssir/code/output/cnn_step13_point_head/last-v3.ckpt
+
+data:
+  categories: ["everyday", "artifact"]   # les deux catégories
+  weight_hard_examples: true

@@ -1,0 +1,1240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fracture Surface Segmentation — Progress Report</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: 'Inter', sans-serif;
+  background: #F0F0F0;
+  color: #111;
+  line-height: 1.55;
+}
+
+.slide {
+  width: 1100px;
+  min-height: 620px;
+  margin: 32px auto;
+  background: #fff;
+  box-shadow: 0 2px 24px rgba(0,0,0,.10);
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+.slide-inner {
+  flex: 1;
+  padding: 52px 60px 44px;
+  display: flex;
+  flex-direction: column;
+}
+.slide-num {
+  position: absolute;
+  bottom: 22px; right: 36px;
+  font-size: 12px; color: #AAA; letter-spacing: .5px;
+}
+.slide-accent { height: 4px; width: 100%; background: #1A1A2E; }
+.slide-accent.blue { background: #1D4ED8; }
+
+h1 { font-size: 52px; font-weight: 800; letter-spacing: -2px; line-height: 1.05; }
+h2 { font-size: 32px; font-weight: 700; letter-spacing: -1px; line-height: 1.1; }
+h3 { font-size: 15px; font-weight: 700; text-transform: uppercase; letter-spacing: 1.2px; color: #666; margin-bottom: 14px; }
+p  { font-size: 15px; color: #444; line-height: 1.65; }
+
+.eyebrow {
+  font-size: 11px; font-weight: 600; letter-spacing: 2px;
+  text-transform: uppercase; color: #1D4ED8; margin-bottom: 18px;
+}
+.divider { width: 48px; height: 3px; background: #1D4ED8; margin: 20px 0; }
+
+.row { display: flex; gap: 0; }
+.col { flex: 1; }
+.col + .col { padding-left: 52px; border-left: 1px solid #E5E7EB; margin-left: 52px; }
+.mt { margin-top: 28px; }
+.mt-sm { margin-top: 14px; }
+
+/* Cover */
+.cover-slide {
+  background: #0F1629; color: #fff;
+  padding: 72px 64px; min-height: 620px;
+  position: relative; overflow: hidden;
+  display: flex; flex-direction: column; justify-content: flex-end;
+}
+.cover-bg {
+  position: absolute; top: -80px; right: -80px;
+  width: 520px; height: 520px; border-radius: 50%;
+  background: radial-gradient(circle, rgba(29,78,216,.35) 0%, transparent 70%);
+  pointer-events: none;
+}
+.cover-label { font-size: 11px; font-weight: 600; letter-spacing: 2.5px; text-transform: uppercase; color: #60A5FA; margin-bottom: 28px; }
+.cover h1 { color: #fff; margin-bottom: 16px; }
+.cover h1 em { color: #60A5FA; font-style: normal; }
+.cover-desc { font-size: 17px; color: rgba(255,255,255,.6); max-width: 600px; margin-bottom: 48px; line-height: 1.6; }
+.cover-stats { display: flex; gap: 40px; border-top: 1px solid rgba(255,255,255,.1); padding-top: 32px; }
+.cover-stat-val { font-size: 30px; font-weight: 800; color: #fff; letter-spacing: -1px; }
+.cover-stat-lbl { font-size: 12px; color: rgba(255,255,255,.45); margin-top: 2px; }
+
+/* Tables */
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+thead tr { border-bottom: 2px solid #111; }
+thead th { padding: 10px 14px; text-align: left; font-size: 11px; font-weight: 600; letter-spacing: .8px; text-transform: uppercase; color: #666; }
+tbody tr { border-bottom: 1px solid #F0F0F0; }
+tbody tr:last-child { border-bottom: none; }
+tbody td { padding: 12px 14px; font-size: 14px; }
+tbody td.mono { font-family: 'JetBrains Mono', monospace; font-size: 13px; }
+tbody tr.best td { font-weight: 600; }
+tbody tr.best { background: #F9FAFB; }
+
+/* Bars */
+.bar-group { display: flex; flex-direction: column; gap: 14px; }
+.bar-meta { display: flex; justify-content: space-between; margin-bottom: 6px; }
+.bar-name { font-size: 13px; font-weight: 500; color: #333; }
+.bar-val  { font-size: 13px; font-weight: 700; font-family: 'JetBrains Mono'; }
+.bar-track { height: 8px; background: #F0F0F0; border-radius: 4px; overflow: hidden; }
+.bar-fill  { height: 100%; border-radius: 4px; }
+
+/* Pipeline */
+.pipeline { display: flex; align-items: center; gap: 0; margin: 20px 0; }
+.pipe-box { flex: 1; border: 1px solid #E5E7EB; border-radius: 8px; padding: 14px 12px; text-align: center; background: #FAFAFA; }
+.pipe-box.hl { background: #EFF6FF; border-color: #BFDBFE; }
+.pipe-title { font-size: 12px; font-weight: 700; color: #111; margin-bottom: 4px; }
+.pipe-sub   { font-size: 11px; color: #888; line-height: 1.4; }
+.pipe-arrow { color: #CCC; font-size: 18px; padding: 0 6px; flex-shrink: 0; }
+
+/* Steps timeline */
+.steps { display: flex; flex-direction: column; }
+.step-row { display: flex; align-items: stretch; }
+.step-left {
+  width: 110px; flex-shrink: 0; text-align: right;
+  padding: 7px 18px 7px 0; border-right: 2px solid #E5E7EB;
+  display: flex; flex-direction: column; justify-content: center; align-items: flex-end;
+}
+.step-left .lbl  { font-size: 11px; font-weight: 600; color: #999; letter-spacing: .5px; }
+.step-left .num  { font-size: 19px; font-weight: 800; color: #1D4ED8; font-family: 'JetBrains Mono'; }
+.step-left .num.gray  { color: #CCC; }
+.step-left .num.green { color: #15803D; }
+.step-left .num.red   { color: #DC2626; }
+.step-dot { width: 10px; height: 10px; border-radius: 50%; background: #1D4ED8; border: 2px solid #fff; box-shadow: 0 0 0 2px #1D4ED8; flex-shrink: 0; margin: auto 0; position: relative; left: -6px; }
+.step-dot.gray  { background: #CCC; box-shadow: 0 0 0 2px #CCC; }
+.step-dot.green { background: #15803D; box-shadow: 0 0 0 2px #15803D; width: 14px; height: 14px; left: -8px; }
+.step-dot.red   { background: #DC2626; box-shadow: 0 0 0 2px #DC2626; }
+.step-right { padding: 7px 0 7px 16px; flex: 1; display: flex; flex-direction: column; justify-content: center; }
+.step-title { font-size: 13px; font-weight: 600; color: #111; }
+.step-sub   { font-size: 12px; color: #888; }
+.step-row.s9  .step-left { border-right-color: #1D4ED8; }
+.step-row.s11 .step-left { border-right-color: #15803D; }
+
+/* Code */
+.code { font-family: 'JetBrains Mono', monospace; background: #0F1629; color: #CBD5E1; border-radius: 8px; padding: 16px 20px; font-size: 12.5px; line-height: 1.75; }
+.code .c { color: #475569; }
+.code .k { color: #7DD3FC; }
+.code .v { color: #86EFAC; }
+
+/* Insight / callout */
+.insight {
+  border-left: 3px solid #1D4ED8; padding: 14px 18px;
+  background: #F8FAFC; font-size: 14px; color: #1E3A8A;
+  font-weight: 500; border-radius: 0 6px 6px 0; margin-top: 20px;
+}
+
+/* Object cards */
+.obj-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 16px; }
+.obj-card { border: 1px solid #E5E7EB; border-radius: 10px; overflow: hidden; }
+.obj-card.win { border-color: #86EFAC; }
+.obj-top { height: 90px; background: #F5F5F5; display: flex; align-items: center; justify-content: center; font-size: 38px; }
+.obj-top.win { background: #F0FDF4; }
+.obj-body { padding: 13px; }
+.obj-name  { font-size: 13px; font-weight: 700; margin-bottom: 8px; }
+.obj-row   { display: flex; justify-content: space-between; margin-bottom: 3px; }
+.obj-lbl   { font-size: 12px; color: #888; }
+.obj-score { font-size: 13px; font-weight: 700; font-family: 'JetBrains Mono'; }
+.score-w   { color: #15803D; }
+.score-l   { color: #999; }
+.obj-note  { font-size: 11px; color: #888; margin-top: 8px; line-height: 1.4; }
+.obj-link  { display: block; margin-top: 10px; font-size: 11px; font-weight: 600; color: #1D4ED8; text-decoration: none; border-top: 1px solid #F0F0F0; padding-top: 10px; }
+.obj-link:hover { text-decoration: underline; }
+
+/* Finding boxes */
+.finding {
+  border-left: 3px solid #E5E7EB;
+  padding: 10px 14px; border-radius: 0 6px 6px 0;
+  margin-bottom: 10px;
+}
+.finding-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .8px; margin-bottom: 4px; }
+.finding p { font-size: 13px; color: #444; }
+
+mark { background: #FEF08A; padding: 1px 4px; border-radius: 3px; font-weight: 600; }
+.dot-row { display: flex; gap: 18px; flex-wrap: wrap; }
+.dot-item { display: flex; align-items: center; gap: 7px; font-size: 13px; color: #444; }
+.dot { width: 10px; height: 10px; border-radius: 50%; }
+
+/* ── SLIDESHOW MODE ──────────────────────────────────────────────── */
+html {
+  height: 100%;
+  overflow: hidden;
+}
+body {
+  height: 100vh;
+  overflow: hidden;
+  background: #1A1A2E;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding-bottom: 52px; /* nav bar height */
+  margin: 0;
+}
+
+/* Hide all slides; JS adds .active to the current one */
+.slide          { display: none; margin: 0; }
+.slide.active   { display: flex; }
+
+/* transform-origin so scaling anchors to the top center */
+.slide {
+  transform-origin: top center;
+}
+
+/* ── NAVIGATION BAR ─────────────────────────────────────────────── */
+#slide-nav {
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  height: 52px;
+  background: #0F1629;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  z-index: 9999;
+  font-family: 'Inter', sans-serif;
+  border-top: 1px solid rgba(255,255,255,.08);
+}
+#slide-nav button {
+  background: none;
+  border: 1px solid rgba(255,255,255,.22);
+  color: #fff;
+  padding: 6px 18px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 13px;
+  font-family: 'Inter', sans-serif;
+  letter-spacing: .3px;
+  transition: background .15s, border-color .15s;
+}
+#slide-nav button:hover:not(:disabled) { background: rgba(255,255,255,.10); border-color: rgba(255,255,255,.4); }
+#slide-nav button:disabled { opacity: .28; cursor: default; }
+#nav-counter {
+  font-size: 13px;
+  color: rgba(255,255,255,.55);
+  min-width: 56px;
+  text-align: center;
+  font-family: 'JetBrains Mono', monospace;
+}
+#nav-dots {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+#nav-dots span {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: rgba(255,255,255,.25);
+  cursor: pointer;
+  transition: background .15s, transform .15s;
+}
+#nav-dots span.on { background: #60A5FA; transform: scale(1.3); }
+#nav-hint {
+  position: fixed;
+  bottom: 60px; right: 20px;
+  font-size: 11px; color: rgba(255,255,255,.3);
+  font-family: 'Inter', sans-serif;
+  pointer-events: none;
+}
+</style>
+</head>
+<body>
+
+<!-- ══ 1 — COVER ══════════════════════════════════════════════════════════ -->
+<div class="slide">
+  <div class="cover-slide">
+    <div class="cover-bg"></div>
+    <div class="cover-label">Internship Progress Report · June 2026</div>
+    <h1>Fracture Surface<br><em>Segmentation</em></h1>
+    <p class="cover-desc">
+      A systematic study of a lightweight CNN-based approach to fracture zone detection on 3D point clouds —
+      from architecture design to quantitative evaluation and geometric analysis.
+    </p>
+    <div class="cover-stats">
+      <div><div class="cover-stat-val">521 K</div><div class="cover-stat-lbl">parameters</div></div>
+      <div><div class="cover-stat-val">87%</div><div class="cover-stat-lbl">F1 (val set)</div></div>
+      <div><div class="cover-stat-val">11</div><div class="cover-stat-lbl">ablation steps</div></div>
+      <div><div class="cover-stat-val">8 025</div><div class="cover-stat-lbl">objects evaluated</div></div>
+    </div>
+  </div>
+  <div class="slide-num">1 / 10</div>
+</div>
+
+<!-- ══ 1b — VISUAL INTRO ══════════════════════════════════════════════════ -->
+<div class="slide">
+  <div class="slide-accent blue"></div>
+  <div class="slide-inner">
+    <div class="eyebrow">Visual Introduction</div>
+    <h2>From a broken object to a segmentation problem</h2>
+    <div class="divider"></div>
+
+    <div class="row mt">
+      <div class="col">
+        <h3>What is a 3D point cloud?</h3>
+        <p style="font-size:14px;margin-bottom:14px">
+          A 3D scanner does not produce a smooth surface — it produces a <strong>set of discrete points</strong>
+          in space. Each point carries its coordinates (x, y, z) and a surface normal (the direction
+          perpendicular to the surface at that location). Points are <em>not</em> connected to each other.
+        </p>
+        <div style="background:#0F1629;border-radius:10px;padding:18px 22px;font-family:'JetBrains Mono',monospace;font-size:12px;color:#94A3B8;line-height:1.9">
+          <span style="color:#475569"># One fragment = array of N points (x, y, z)</span><br>
+          pts = [<br>
+          &nbsp;&nbsp;[<span style="color:#86EFAC"> 0.12</span>, <span style="color:#86EFAC">-0.43</span>, <span style="color:#86EFAC"> 0.87</span>],&nbsp;&nbsp;<span style="color:#475569"># point 0</span><br>
+          &nbsp;&nbsp;[<span style="color:#86EFAC"> 0.15</span>, <span style="color:#86EFAC">-0.41</span>, <span style="color:#86EFAC"> 0.85</span>],&nbsp;&nbsp;<span style="color:#475569"># point 1</span><br>
+          &nbsp;&nbsp;<span style="color:#475569">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;# ... 4,998 more</span><br>
+          &nbsp;&nbsp;[<span style="color:#86EFAC"> 0.31</span>, <span style="color:#86EFAC"> 0.02</span>, <span style="color:#86EFAC">-0.11</span>],&nbsp;&nbsp;<span style="color:#475569"># point 4999</span><br>
+          ]&nbsp;&nbsp;<span style="color:#475569"># shape: (5,000, 3)</span>
+        </div>
+        <p style="font-size:13px;color:#666;margin-top:12px">
+          An object can break into 2 to 20 fragments. Each fragment = 5,000 points in our pipeline.
+        </p>
+      </div>
+      <div class="col">
+        <h3>Per-point label: fracture or intact?</h3>
+        <p style="font-size:14px;margin-bottom:14px">
+          When an object breaks, each fragment has <strong>two types of surfaces</strong>:
+        </p>
+        <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:16px">
+          <div style="display:flex;align-items:flex-start;gap:14px;padding:12px 16px;background:#FEF9C3;border-radius:8px;border:1px solid #FDE047">
+            <div style="width:16px;height:16px;border-radius:50%;background:#FACC15;flex-shrink:0;margin-top:2px"></div>
+            <div>
+              <div style="font-size:13px;font-weight:700">Label 1 — Fracture surface</div>
+              <div style="font-size:12px;color:#666;margin-top:2px">Surface <em>created by the break</em>. Rough, irregular edge. This is where fragments will be reassembled. Rare: can represent only 2–3% of points.</div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:flex-start;gap:14px;padding:12px 16px;background:#F5F5F5;border-radius:8px;border:1px solid #E5E7EB">
+            <div style="width:16px;height:16px;border-radius:50%;background:#888;flex-shrink:0;margin-top:2px"></div>
+            <div>
+              <div style="font-size:13px;font-weight:700">Label 0 — Intact surface</div>
+              <div style="font-size:12px;color:#666;margin-top:2px"><em>Original</em> surface of the object. Smooth, continuous. It existed before the break. Majority class: typically 90–98% of points.</div>
+            </div>
+          </div>
+        </div>
+        <div class="insight">
+          The task: predict <strong>0 or 1 for every point</strong> in the cloud.
+          No 3D reconstruction — pure per-point binary classification.
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:22px">
+      <h3>High-level pipeline</h3>
+      <div style="display:flex;align-items:center;margin-top:10px;gap:0">
+        <div style="flex:1;background:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px;padding:10px;text-align:center">
+          <div style="font-size:22px;margin-bottom:4px">🏺</div>
+          <div style="font-size:12px;font-weight:700">Broken object</div>
+          <div style="font-size:11px;color:#888">simulated 3D mesh</div>
+        </div>
+        <div style="color:#CCC;font-size:18px;padding:0 7px">→</div>
+        <div style="flex:1;background:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px;padding:10px;text-align:center">
+          <div style="font-size:22px;margin-bottom:4px">✦✦✦</div>
+          <div style="font-size:12px;font-weight:700">N fragments</div>
+          <div style="font-size:11px;color:#888">point clouds</div>
+        </div>
+        <div style="color:#CCC;font-size:18px;padding:0 7px">→</div>
+        <div style="flex:1;background:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px;padding:10px;text-align:center">
+          <div style="font-size:22px;margin-bottom:4px">🖼️</div>
+          <div style="font-size:12px;font-weight:700">CNNFracSeg</div>
+          <div style="font-size:11px;color:#888">segmentation</div>
+        </div>
+        <div style="color:#CCC;font-size:18px;padding:0 7px">→</div>
+        <div style="flex:1;background:#F0FDF4;border:1px solid #86EFAC;border-radius:8px;padding:10px;text-align:center">
+          <div style="display:flex;justify-content:center;gap:3px;flex-wrap:wrap;margin-bottom:4px">
+            <span style="width:9px;height:9px;border-radius:50%;background:#FACC15;display:inline-block"></span>
+            <span style="width:9px;height:9px;border-radius:50%;background:#888;display:inline-block"></span>
+            <span style="width:9px;height:9px;border-radius:50%;background:#888;display:inline-block"></span>
+            <span style="width:9px;height:9px;border-radius:50%;background:#FACC15;display:inline-block"></span>
+            <span style="width:9px;height:9px;border-radius:50%;background:#888;display:inline-block"></span>
+            <span style="width:9px;height:9px;border-radius:50%;background:#FACC15;display:inline-block"></span>
+          </div>
+          <div style="font-size:12px;font-weight:700">Per-point labels</div>
+          <div style="font-size:11px;color:#888">0 or 1 per point</div>
+        </div>
+        <div style="color:#CCC;font-size:18px;padding:0 7px">→</div>
+        <div style="flex:1;background:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px;padding:10px;text-align:center">
+          <div style="font-size:22px;margin-bottom:4px">🔧</div>
+          <div style="font-size:12px;font-weight:700">Assembly</div>
+          <div style="font-size:11px;color:#888">downstream algorithm</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">2 / 10</div>
+</div>
+
+<!-- ══ 2 — CONTEXT & RESEARCH QUESTION ═══════════════════════════════════ -->
+<div class="slide">
+  <div class="slide-accent blue"></div>
+  <div class="slide-inner">
+    <div class="eyebrow">Context</div>
+    <h2>The question we set out to answer</h2>
+    <div class="divider"></div>
+
+    <div class="row mt">
+      <div class="col">
+        <h3>Background</h3>
+        <p style="margin-bottom:14px">
+          Object reassembly from 3D scans requires identifying, for each fragment,
+          which surface was created by the fracture — as opposed to the original intact surface.
+          This binary classification is a prerequisite for any downstream matching or assembly step.
+        </p>
+        <p style="margin-bottom:14px">
+          The GARF baseline uses <strong>PointTransformerV3 (PTv3)</strong>, a state-of-the-art
+          3D transformer — 12.7 M parameters, high accuracy, but computationally heavy.
+        </p>
+        <div class="insight">
+          <strong>Research question:</strong> Can a much lighter model (~500 K params)
+          learn the same task, and where exactly does it succeed or fail compared to PTv3?
+        </div>
+        <p style="margin-top:16px;font-size:14px;color:#666">
+          The goal was not just to build a smaller model, but to <em>understand</em> its behavior —
+          quantitatively and geometrically.
+        </p>
+      </div>
+      <div class="col">
+        <h3>Dataset — Breaking Bad</h3>
+        <table style="margin-bottom:16px">
+          <tbody>
+            <tr><td style="color:#666;font-size:13px">Categories</td><td>everyday (plates, mugs, bowls…) + artifact</td></tr>
+            <tr><td style="color:#666;font-size:13px">Format</td><td>HDF5 — 27 GB</td></tr>
+            <tr><td style="color:#666;font-size:13px">Val set</td><td><strong>8,025 objects</strong> — 33,065 fragments</td></tr>
+            <tr><td style="color:#666;font-size:13px">CNN sampling</td><td>5,000 pts / <em>fragment</em> — constant resolution</td></tr>
+            <tr><td style="color:#666;font-size:13px">GARF sampling</td><td>5,000 pts / <em>object total</em> — shared budget</td></tr>
+            <tr><td style="color:#666;font-size:13px">Label</td><td>Binary per point — fracture (1) / intact (0)</td></tr>
+          </tbody>
+        </table>
+        <p style="font-size:13px;color:#666">
+          No official test split for the <em>everyday</em> category.
+          Threshold calibrated on a val subset via sweep [0.30–0.80], frozen before evaluation.
+        </p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">3 / 10</div>
+</div>
+
+<!-- ══ 3 — ARCHITECTURE ═══════════════════════════════════════════════════ -->
+<div class="slide">
+  <div class="slide-accent blue"></div>
+  <div class="slide-inner">
+    <div class="eyebrow">Approach</div>
+    <h2>Architecture — CNNFracSeg</h2>
+    <div class="divider"></div>
+
+    <div class="pipeline">
+      <div class="pipe-box hl">
+        <div class="pipe-title">Geometric features</div>
+        <div class="pipe-sub">Curvature · Roughness<br>Normal consistency (k=16)</div>
+      </div>
+      <div class="pipe-arrow">→</div>
+      <div class="pipe-box">
+        <div class="pipe-title">3-view projection</div>
+        <div class="pipe-sub">XY · XZ · YZ<br>Orthographic</div>
+      </div>
+      <div class="pipe-arrow">→</div>
+      <div class="pipe-box">
+        <div class="pipe-title">Gaussian splatting</div>
+        <div class="pipe-sub">σ = 1.5<br>Bilinear interp.</div>
+      </div>
+      <div class="pipe-arrow">→</div>
+      <div class="pipe-box">
+        <div class="pipe-title">CNN encoder</div>
+        <div class="pipe-sub">Shared across views<br>Max fusion</div>
+      </div>
+      <div class="pipe-arrow">→</div>
+      <div class="pipe-box">
+        <div class="pipe-title">Global context</div>
+        <div class="pipe-sub">Cross-fragment<br>aggregation</div>
+      </div>
+      <div class="pipe-arrow">→</div>
+      <div class="pipe-box hl">
+        <div class="pipe-title">U-Net decoder</div>
+        <div class="pipe-sub">Depth 4<br>Skip connections</div>
+      </div>
+    </div>
+
+    <div class="row mt">
+      <div class="col">
+        <h3>Design rationale</h3>
+        <table>
+          <tbody>
+            <tr><td style="font-size:13px">3-view projection</td><td style="font-size:13px;color:#666">Allows using standard 2D CNNs on unordered point clouds</td></tr>
+            <tr><td style="font-size:13px">Gaussian splatting</td><td style="font-size:13px;color:#666">Smooth, differentiable mapping from points to pixels</td></tr>
+            <tr><td style="font-size:13px">Geometric features</td><td style="font-size:13px;color:#666">Largest gain in ablation (+4–5 pp F1)</td></tr>
+            <tr><td style="font-size:13px">5,000 pts / fragment</td><td style="font-size:13px;color:#666">Constant resolution regardless of object complexity — key difference vs GARF</td></tr>
+          </tbody>
+        </table>
+        <p style="font-size:13px;color:#666;margin-top:12px">
+          The 2D projection choice is a deliberate trade-off: it makes the model light and simple,
+          but introduces an inherent spatial resolution limit — one pixel covers a 3D region, not a point.
+          This will matter later.
+        </p>
+      </div>
+      <div class="col">
+        <h3>Parameters</h3>
+        <div class="bar-group mt-sm">
+          <div>
+            <div class="bar-meta">
+              <span class="bar-name">CNNFracSeg (ours)</span>
+              <span class="bar-val" style="color:#15803D">521,489</span>
+            </div>
+            <div class="bar-track"><div class="bar-fill" style="width:4%;background:#15803D"></div></div>
+          </div>
+          <div>
+            <div class="bar-meta">
+              <span class="bar-name">GARF PTv3 (baseline)</span>
+              <span class="bar-val" style="color:#999">12,700,000</span>
+            </div>
+            <div class="bar-track"><div class="bar-fill" style="width:100%;background:#E5E7EB"></div></div>
+          </div>
+        </div>
+        <p style="font-size:13px;color:#666;margin-top:14px">
+          The CNN fills 4% of the bar above. At 521 K parameters, it is ~24× lighter than PTv3.
+          The question is: does this compression cost too much in accuracy?
+        </p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">4 / 10</div>
+</div>
+
+<!-- ══ 3b — PROJECTION DETAIL ════════════════════════════════════════════ -->
+<div class="slide">
+  <div class="slide-accent blue"></div>
+  <div class="slide-inner">
+    <div class="eyebrow">Architecture — detail</div>
+    <h2>What the CNN sees: 8 image channels + global context</h2>
+    <div class="divider"></div>
+
+    <div class="row mt">
+      <!-- Col 1 : the 8 channels -->
+      <div class="col">
+        <h3>3D → 2D projection: 8 channels per image</h3>
+        <p style="font-size:12px;color:#666;margin-bottom:10px">
+          Each fragment → 3 orthographic images 128×128 (XY, XZ, YZ). Multiple points per pixel → weighted average.
+        </p>
+        <table>
+          <thead><tr><th>Ch.</th><th>Name</th><th>What each pixel stores</th></tr></thead>
+          <tbody style="font-size:12px">
+            <tr>
+              <td class="mono" style="color:#1D4ED8;font-weight:700">0</td>
+              <td style="font-weight:600">Depth</td>
+              <td style="color:#666">Avg distance from "camera", normalized [0,1] — encodes relief.</td>
+            </tr>
+            <tr>
+              <td class="mono" style="color:#1D4ED8;font-weight:700">1</td>
+              <td style="font-weight:600">Occupancy</td>
+              <td style="color:#666">1.0 if any point landed here, 0.0 otherwise — presence mask.</td>
+            </tr>
+            <tr style="background:#F0FDF4">
+              <td class="mono" style="color:#15803D;font-weight:700">2–4</td>
+              <td style="font-weight:600">nx · ny · nz</td>
+              <td style="color:#666">Avg surface normal (from mesh). Encodes local orientation.</td>
+            </tr>
+            <tr style="background:#FFF7ED">
+              <td class="mono" style="color:#D97706;font-weight:700">5</td>
+              <td style="font-weight:600">Curvature</td>
+              <td style="color:#666">λ_min/Σλ via k-NN PCA (k=16). ≈0 flat, high = edge. Fractures score high.</td>
+            </tr>
+            <tr style="background:#FFF7ED">
+              <td class="mono" style="color:#D97706;font-weight:700">6</td>
+              <td style="font-weight:600">Roughness</td>
+              <td style="color:#666">Mean dist. of neighbors to local tangent plane. High = irregular.</td>
+            </tr>
+            <tr style="background:#FFF7ED">
+              <td class="mono" style="color:#D97706;font-weight:700">7</td>
+              <td style="font-weight:600">Normal consist.</td>
+              <td style="color:#666">Dataset normal vs PCA normal alignment. 1 = smooth, low = ambiguous.</td>
+            </tr>
+          </tbody>
+        </table>
+        <div style="display:flex;gap:14px;margin-top:8px">
+          <div style="display:flex;align-items:center;gap:5px;font-size:11px;color:#444"><span style="width:9px;height:9px;background:#1D4ED8;border-radius:2px;display:inline-block"></span> Base (always)</div>
+          <div style="display:flex;align-items:center;gap:5px;font-size:11px;color:#444"><span style="width:9px;height:9px;background:#15803D;border-radius:2px;display:inline-block"></span> Normals (Step 2+)</div>
+          <div style="display:flex;align-items:center;gap:5px;font-size:11px;color:#444"><span style="width:9px;height:9px;background:#D97706;border-radius:2px;display:inline-block"></span> Geometric (Step 9+)</div>
+        </div>
+      </div>
+
+      <!-- Col 2 : global context -->
+      <div class="col">
+        <h3>Global context — cross-fragment reasoning</h3>
+        <p style="font-size:12px;color:#666;margin-bottom:10px">
+          Without context each fragment is processed alone. With context, it "knows" what the other fragments of the same object look like. <strong>+3 pp F1</strong>.
+        </p>
+
+        <div style="background:#F8FAFC;border:1px solid #E5E7EB;border-radius:10px;padding:12px;font-size:12px">
+          <div style="display:flex;justify-content:space-around;margin-bottom:6px">
+            <div style="text-align:center;background:#EFF6FF;border:1px solid #BFDBFE;border-radius:6px;padding:4px 8px">
+              <div style="font-weight:700;color:#1D4ED8;font-size:11px">Frag 1</div>
+              <div style="color:#888;font-size:10px">bottleneck (128 ch)</div>
+            </div>
+            <div style="text-align:center;background:#EFF6FF;border:1px solid #BFDBFE;border-radius:6px;padding:4px 8px">
+              <div style="font-weight:700;color:#1D4ED8;font-size:11px">Frag 2</div>
+              <div style="color:#888;font-size:10px">bottleneck (128 ch)</div>
+            </div>
+            <div style="text-align:center;background:#EFF6FF;border:1px solid #BFDBFE;border-radius:6px;padding:4px 8px">
+              <div style="font-weight:700;color:#1D4ED8;font-size:11px">Frag 3</div>
+              <div style="color:#888;font-size:10px">bottleneck (128 ch)</div>
+            </div>
+          </div>
+          <div style="text-align:center;color:#94A3B8;font-size:13px;margin-bottom:4px">↓ avg pool → mean over fragments ↓</div>
+          <div style="text-align:center;margin-bottom:4px">
+            <div style="display:inline-block;background:#111;color:#86EFAC;border-radius:5px;padding:4px 14px;font-family:'JetBrains Mono',monospace;font-size:11px">
+              global_feat (128 ch) — whole-object context
+            </div>
+          </div>
+          <div style="text-align:center;color:#94A3B8;font-size:13px;margin-bottom:4px">↓ broadcast + concat + 1×1 conv → injected into every fragment ↓</div>
+          <div style="display:flex;justify-content:space-around">
+            <div style="text-align:center;background:#F0FDF4;border:1px solid #86EFAC;border-radius:6px;padding:4px 8px">
+              <div style="font-weight:700;color:#15803D;font-size:11px">Frag 1</div>
+              <div style="color:#888;font-size:10px">bottleneck + context</div>
+            </div>
+            <div style="text-align:center;background:#F0FDF4;border:1px solid #86EFAC;border-radius:6px;padding:4px 8px">
+              <div style="font-weight:700;color:#15803D;font-size:11px">Frag 2</div>
+              <div style="color:#888;font-size:10px">bottleneck + context</div>
+            </div>
+            <div style="text-align:center;background:#F0FDF4;border:1px solid #86EFAC;border-radius:6px;padding:4px 8px">
+              <div style="font-weight:700;color:#15803D;font-size:11px">Frag 3</div>
+              <div style="color:#888;font-size:10px">bottleneck + context</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="insight" style="margin-top:10px;font-size:13px">
+          Each fragment can now reason at the object level, not just locally.
+          The injected vector encodes the average CNN representation of all other fragments.
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">5 / 10</div>
+</div>
+
+<!-- ══ 4 — ABLATION ═══════════════════════════════════════════════════════ -->
+<div class="slide">
+  <div class="slide-accent blue"></div>
+  <div class="slide-inner">
+    <div class="eyebrow">Systematic Evaluation</div>
+    <h2>Building and testing iteratively — 11 steps</h2>
+    <div class="divider"></div>
+
+    <div class="row mt">
+      <div class="col" style="max-width:310px;flex:0 0 310px">
+        <div class="steps">
+          <div class="step-row">
+            <div class="step-left"><span class="lbl">Start</span><span class="num gray">~68%</span></div>
+            <div class="step-dot gray"></div>
+            <div class="step-right"><div class="step-title">Simple projection, no features</div><div class="step-sub">baseline</div></div>
+          </div>
+          <div class="step-row">
+            <div class="step-left"><span class="num gray">~71%</span></div>
+            <div class="step-dot gray"></div>
+            <div class="step-right"><div class="step-title">+ Surface normals</div></div>
+          </div>
+          <div class="step-row">
+            <div class="step-left"><span class="num gray">~73%</span></div>
+            <div class="step-dot gray"></div>
+            <div class="step-right"><div class="step-title">+ Gaussian splatting + bilinear</div></div>
+          </div>
+          <div class="step-row">
+            <div class="step-left"><span class="num">~78%</span></div>
+            <div class="step-dot"></div>
+            <div class="step-right"><div class="step-title">+ Geometric features</div><div class="step-sub">largest single gain (+4–5 pp)</div></div>
+          </div>
+          <div class="step-row">
+            <div class="step-left"><span class="num">~81%</span></div>
+            <div class="step-dot"></div>
+            <div class="step-right"><div class="step-title">+ Global context + max fusion</div></div>
+          </div>
+          <div class="step-row s9">
+            <div class="step-left"><span class="lbl">Step 9</span><span class="num">84.9%</span></div>
+            <div class="step-dot"></div>
+            <div class="step-right"><div class="step-title">Full architecture + Dice Loss</div><div class="step-sub">first complete evaluation</div></div>
+          </div>
+          <div class="step-row">
+            <div class="step-left"><span class="lbl">Step 10</span><span class="num red">83.4%</span></div>
+            <div class="step-dot red"></div>
+            <div class="step-right"><div class="step-title">Tversky Loss — precision focus</div><div class="step-sub">revealed a precision/recall tension</div></div>
+          </div>
+          <div class="step-row s11">
+            <div class="step-left"><span class="lbl">Step 11</span><span class="num green">86.9%</span></div>
+            <div class="step-dot green"></div>
+            <div class="step-right"><div class="step-title">Focal Loss + WeightedSampler</div><div class="step-sub">targeted fix for hard cases</div></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="col">
+        <h3>What Step 9 taught us — a specific failure</h3>
+        <div class="bar-group" style="margin-bottom:10px;margin-top:6px">
+          <div>
+            <div class="bar-meta"><span class="bar-name">High ratio (&gt;30%)</span><span class="bar-val" style="color:#15803D">94.2%</span></div>
+            <div class="bar-track"><div class="bar-fill" style="width:94%;background:#15803D"></div></div>
+          </div>
+          <div>
+            <div class="bar-meta"><span class="bar-name">Medium ratio (7–30%)</span><span class="bar-val" style="color:#1D4ED8">87.2%</span></div>
+            <div class="bar-track"><div class="bar-fill" style="width:87%;background:#1D4ED8"></div></div>
+          </div>
+          <div>
+            <div class="bar-meta"><span class="bar-name">Low ratio (&lt;7%) — hard cases</span><span class="bar-val" style="color:#DC2626">28.4%</span></div>
+            <div class="bar-track"><div class="bar-fill" style="width:28%;background:#DC2626"></div></div>
+          </div>
+        </div>
+        <p style="font-size:12px;color:#444;margin-bottom:4px"><strong>1.</strong> A 3% fracture → ~2 pixels on 64×64. Gradient drowned by 98% intact pixels.</p>
+        <p style="font-size:12px;color:#444;margin-bottom:8px"><strong>2.</strong> Low-ratio objects are rare — model learns to ignore them.</p>
+        <div class="code" style="padding:12px 16px;font-size:11.5px">
+<span class="c"># Step 11 fix</span>
+<span class="k">L</span> = 0.5 × <span class="v">Dice</span> + 0.5 × <span class="v">Focal</span>(γ=2)   <span class="c"># upweights hard pixels</span>
+<span class="k">weight</span>(obj) = 1 / (ratio + 0.05)               <span class="c"># oversamples hard objects</span></div>
+
+        <!-- Loss function comparison -->
+        <div style="margin-top:8px">
+          <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#666;margin-bottom:6px">Comparison of the 3 loss functions</div>
+          <table style="font-size:11px">
+            <thead><tr><th>Loss</th><th>Formula</th><th>Hard cases</th><th>F1</th></tr></thead>
+            <tbody>
+              <tr>
+                <td style="font-weight:700;color:#1D4ED8">Dice</td>
+                <td style="color:#444">1 − 2·TP / (2·TP+FP+FN)</td>
+                <td style="color:#666">Treats all points equally — blind to local imbalance.</td>
+                <td style="font-weight:700;color:#1D4ED8">84.9%</td>
+              </tr>
+              <tr style="background:#FEF2F2">
+                <td style="font-weight:700;color:#DC2626">Tversky α=0.7</td>
+                <td style="color:#444">1 − TP / (TP+0.7·FP+0.3·FN)</td>
+                <td style="color:#666">Over-penalizes FP → recall collapses on small fractures.</td>
+                <td style="font-weight:700;color:#DC2626">83.4% ↓</td>
+              </tr>
+              <tr style="background:#F0FDF4">
+                <td style="font-weight:700;color:#15803D">Focal γ=2</td>
+                <td style="color:#444">−(1−p)²·log(p) / −p²·log(1−p)</td>
+                <td style="color:#666">Hard uncertain pixels get (1−p)² more gradient — model focuses on difficult cases.</td>
+                <td style="font-weight:700;color:#15803D">86.9% ↑</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- WeightedSampler visual -->
+        <div style="margin-top:8px;background:#F8FAFC;border:1px solid #E5E7EB;border-radius:8px;padding:8px 12px">
+          <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#666;margin-bottom:8px">WeightedRandomSampler — rebalancing the training distribution</div>
+          <div style="display:flex;align-items:center;gap:16px">
+            <div style="flex:1">
+              <div style="font-size:11px;color:#444;margin-bottom:5px">Without sampler:</div>
+              <div style="display:flex;gap:3px;align-items:flex-end;height:40px">
+                <div style="flex:4;background:#1D4ED8;height:95%;border-radius:2px 2px 0 0;position:relative"><span style="position:absolute;top:-13px;width:100%;text-align:center;font-size:9px;font-weight:700;color:#1D4ED8">many</span></div>
+                <div style="flex:2;background:#6B7280;height:50%;border-radius:2px 2px 0 0"></div>
+                <div style="flex:1;background:#DC2626;height:15%;border-radius:2px 2px 0 0;position:relative"><span style="position:absolute;top:-13px;width:100%;text-align:center;font-size:9px;font-weight:700;color:#DC2626">rare</span></div>
+              </div>
+              <div style="display:flex;gap:3px;font-size:9px;color:#888;margin-top:2px">
+                <div style="flex:4;text-align:center">&gt;30%</div>
+                <div style="flex:2;text-align:center">7–30%</div>
+                <div style="flex:1;text-align:center">&lt;7%</div>
+              </div>
+            </div>
+            <div style="color:#94A3B8;font-size:16px">→</div>
+            <div style="flex:1">
+              <div style="font-size:11px;color:#444;margin-bottom:5px">With sampler (w = 1/(ratio+0.05)):</div>
+              <div style="display:flex;gap:3px;align-items:flex-end;height:40px">
+                <div style="flex:4;background:#1D4ED8;height:40%;border-radius:2px 2px 0 0"></div>
+                <div style="flex:2;background:#6B7280;height:45%;border-radius:2px 2px 0 0"></div>
+                <div style="flex:1;background:#15803D;height:85%;border-radius:2px 2px 0 0;position:relative"><span style="position:absolute;top:-13px;width:160%;left:-30%;text-align:center;font-size:9px;font-weight:700;color:#15803D">boosted</span></div>
+              </div>
+              <div style="display:flex;gap:3px;font-size:9px;color:#888;margin-top:2px">
+                <div style="flex:4;text-align:center">&gt;30%</div>
+                <div style="flex:2;text-align:center">7–30%</div>
+                <div style="flex:1;text-align:center">&lt;7%</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <p style="font-size:12px;color:#666;margin-top:6px">
+          Low-ratio F1: 28.4% → <strong>41.8%</strong> (+13.4 pp). Global: 84.9% → <strong>86.9%</strong>.
+          Tversky made it worse — useful negative result.
+        </p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">6 / 10</div>
+</div>
+
+<!-- ══ 5 — QUANTITATIVE RESULTS ═══════════════════════════════════════════ -->
+<div class="slide">
+  <div class="slide-accent blue"></div>
+  <div class="slide-inner">
+    <div class="eyebrow">Quantitative Evaluation</div>
+    <h2>F1 results — and what they mean</h2>
+    <div class="divider"></div>
+
+    <table class="mt">
+      <thead>
+        <tr><th>Model</th><th>Params</th><th>Threshold</th><th>F1 ↑</th><th>FP rate ↓</th><th>Miss rate ↓</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>GARF PTv3</td>
+          <td class="mono">12.7 M</td>
+          <td class="mono">0.5 (default)</td>
+          <td class="mono">~90.9%</td>
+          <td class="mono">—</td>
+          <td class="mono">—</td>
+        </tr>
+        <tr>
+          <td>CNN Step 9 — Dice</td>
+          <td class="mono">523 K</td>
+          <td class="mono">0.65 (calibrated)</td>
+          <td class="mono">84.9%</td>
+          <td class="mono">22.4%</td>
+          <td class="mono">7.1%</td>
+        </tr>
+        <tr class="best">
+          <td><strong>CNN Step 11 — Focal+Hard</strong></td>
+          <td class="mono">523 K</td>
+          <td class="mono">0.55 (calibrated)</td>
+          <td class="mono"><strong>86.9%</strong></td>
+          <td class="mono">16.6%</td>
+          <td class="mono">9.4%</td>
+        </tr>
+      </tbody>
+    </table>
+    <p style="font-size:12px;color:#AAA;margin-top:6px">
+      GARF evaluated at default threshold only — no calibration sweep applied. Calibrating GARF may shift its F1.
+    </p>
+
+    <div class="row mt">
+      <div class="col">
+        <h3>What F1 tells us</h3>
+        <p style="font-size:14px;margin-bottom:12px">
+          At 86.9%, the model correctly classifies the large majority of points.
+          It has learned the fracture signal — where fracture zones tend to be on these objects.
+          The ~4 pp gap with GARF is real but moderate for a 24× smaller model.
+        </p>
+        <p style="font-size:14px;margin-bottom:12px">
+          The FP rate dropped from 22.4% (Step 9) to <strong>16.6%</strong> (Step 11)
+          — the model predicts fracture more conservatively after fine-tuning.
+        </p>
+        <p style="font-size:14px">
+          By fragmentation complexity: the model performs <em>better</em> on objects with more fragments —
+          likely because more-fragmented objects tend to have larger, more visible fracture areas.
+        </p>
+        <div class="bar-group mt-sm">
+          <div>
+            <div class="bar-meta"><span class="bar-name">2 fragments</span><span class="bar-val">63.8%</span></div>
+            <div class="bar-track"><div class="bar-fill" style="width:64%;background:#94A3B8"></div></div>
+          </div>
+          <div>
+            <div class="bar-meta"><span class="bar-name">3–5 fragments</span><span class="bar-val">74.1%</span></div>
+            <div class="bar-track"><div class="bar-fill" style="width:74%;background:#1D4ED8"></div></div>
+          </div>
+          <div>
+            <div class="bar-meta"><span class="bar-name">6+ fragments</span><span class="bar-val" style="color:#15803D">77.5%</span></div>
+            <div class="bar-track"><div class="bar-fill" style="width:78%;background:#15803D"></div></div>
+          </div>
+        </div>
+      </div>
+      <div class="col">
+        <h3>What F1 does not tell us</h3>
+        <p style="font-size:14px;margin-bottom:14px">
+          F1 counts correctly classified points. It does not measure:
+        </p>
+        <table style="margin-bottom:16px">
+          <tbody>
+            <tr><td style="font-size:13px;color:#DC2626;font-weight:600">Boundary precision</td><td style="font-size:13px;color:#666">Is the predicted fracture boundary sharp or diffuse?</td></tr>
+            <tr><td style="font-size:13px;color:#DC2626;font-weight:600">Spatial continuity</td><td style="font-size:13px;color:#666">Is the predicted surface connected and smooth?</td></tr>
+            <tr><td style="font-size:13px;color:#DC2626;font-weight:600">Fine structure</td><td style="font-size:13px;color:#666">Are thin ramified branches captured?</td></tr>
+            <tr><td style="font-size:13px;color:#DC2626;font-weight:600">Geometric usability</td><td style="font-size:13px;color:#666">Is the prediction useful for pairwise fragment matching?</td></tr>
+          </tbody>
+        </table>
+        <div class="insight">
+          To answer these questions, we generated interactive 3D visualizations
+          — and they revealed things that the numbers alone could not.
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">7 / 10</div>
+</div>
+
+<!-- ══ 6 — VISUALIZATIONS ════════════════════════════════════════════════ -->
+<div class="slide">
+  <div class="slide-accent blue"></div>
+  <div class="slide-inner">
+    <div class="eyebrow">Geometric Analysis</div>
+    <h2>What the 3D visualizations show</h2>
+    <div class="divider"></div>
+
+    <div class="dot-row" style="margin-bottom:18px">
+      <div class="dot-item"><div class="dot" style="background:#888"></div>Intact (TN)</div>
+      <div class="dot-item"><div class="dot" style="background:#FACC15"></div>GT fracture</div>
+      <div class="dot-item"><div class="dot" style="background:#16A34A"></div>True positive</div>
+      <div class="dot-item"><div class="dot" style="background:#DC2626"></div>False positive</div>
+      <div class="dot-item"><div class="dot" style="background:#2563EB"></div>False negative</div>
+    </div>
+
+    <div class="obj-grid">
+      <div class="obj-card">
+        <div class="obj-top">🍽️</div>
+        <div class="obj-body">
+          <div class="obj-name">Plate — 2 fragments</div>
+          <div class="obj-row"><span class="obj-lbl">CNN</span><span class="obj-score score-l">0.798 <span style="font-size:10px;color:#aaa">P=0.71 R=0.90</span></span></div>
+          <div class="obj-row"><span class="obj-lbl">GARF</span><span class="obj-score score-w">0.935 <span style="font-size:10px;color:#aaa">P=0.95 R=0.92</span></span></div>
+          <div class="obj-note">GARF has enough resolution (5000/2=2500 pts/frag). CNN finds the zone but with spread FP.</div>
+          <a class="obj-link" href="viz/everyday_Plate_9969f6178dcd67101c75d484f9069623_fractured_32_comparison.html" target="_blank">Open 3D visualization →</a>
+        </div>
+      </div>
+      <div class="obj-card">
+        <div class="obj-top">🥣</div>
+        <div class="obj-body">
+          <div class="obj-name">Bowl — 3 fragments</div>
+          <div class="obj-row"><span class="obj-lbl">CNN</span><span class="obj-score score-l">0.845 <span style="font-size:10px;color:#aaa">P=0.81 R=0.88</span></span></div>
+          <div class="obj-row"><span class="obj-lbl">GARF</span><span class="obj-score score-w">0.900 <span style="font-size:10px;color:#aaa">P=0.99 R=0.82</span></span></div>
+          <div class="obj-note">GARF: FP rate &lt;1% — near-perfect precision. CNN: FP on bowl rim (high curvature intact zone).</div>
+          <a class="obj-link" href="viz/everyday_Bowl_960c5c5bff2d3a4bbced73c51e99f8b2_fractured_47_comparison.html" target="_blank">Open 3D visualization →</a>
+        </div>
+      </div>
+      <div class="obj-card win">
+        <div class="obj-top win">🍽️</div>
+        <div class="obj-body">
+          <div class="obj-name">Plate — 9 fragments ★</div>
+          <div class="obj-row"><span class="obj-lbl">CNN</span><span class="obj-score score-w">0.902 <span style="font-size:10px;color:#aaa">P=0.85 R=0.96</span></span></div>
+          <div class="obj-row"><span class="obj-lbl">GARF</span><span class="obj-score score-l">0.673 <span style="font-size:10px;color:#aaa">P=0.99 R=0.51</span></span></div>
+          <div class="obj-note" style="color:#15803D;font-weight:500">GARF: 5000/9 ≈ 555 pts/fragment — not enough to resolve thin fracture lines. CNN maintains 5000 pts/frag.</div>
+          <a class="obj-link" href="viz/everyday_Plate_9969f6178dcd67101c75d484f9069623_mode_6_comparison.html" target="_blank">Open 3D visualization →</a>
+        </div>
+      </div>
+      <div class="obj-card">
+        <div class="obj-top">☕</div>
+        <div class="obj-body">
+          <div class="obj-name">Mug — 5 fragments</div>
+          <div class="obj-row"><span class="obj-lbl">CNN</span><span class="obj-score score-l">0.305 <span style="font-size:10px;color:#aaa">P=0.89 R=0.19</span></span></div>
+          <div class="obj-row"><span class="obj-lbl">GARF</span><span class="obj-score score-w">0.946 <span style="font-size:10px;color:#aaa">P=0.98 R=0.92</span></span></div>
+          <div class="obj-note">CNN recall = 18.5% — misses most fracture. Circular fracture on cylinder is ambiguous in orthographic projection.</div>
+          <a class="obj-link" href="viz/everyday_Mug_37f56901a07da69dac6b8e58caf61f95_mode_4_comparison.html" target="_blank">Open 3D visualization →</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="row mt" style="gap:0">
+      <div class="col" style="padding-right:40px;border-right:1px solid #E5E7EB">
+        <p style="font-size:14px">
+          <strong>Where CNN wins:</strong> on highly fragmented objects (9 parts), GARF's fixed 5,000-point budget
+          collapses to ~555 pts/fragment. At that resolution, thin fracture lines become invisible.
+          The CNN, with 5,000 pts/fragment regardless of complexity, maintains its resolution.
+        </p>
+      </div>
+      <div class="col" style="padding-left:40px">
+        <p style="font-size:14px">
+          <strong>Where CNN fails:</strong> on the mug (F1=0.305, recall=18.5%), the 3 fixed
+          orthographic views cannot resolve a circular fracture on a cylindrical surface — the fracture
+          collapses onto the intact surface in projection.
+          This is a structural limitation of fixed orthographic views.
+        </p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">8 / 10</div>
+</div>
+
+<!-- ══ 7 — GEOMETRIC FINDINGS ════════════════════════════════════════════ -->
+<div class="slide">
+  <div class="slide-accent blue"></div>
+  <div class="slide-inner">
+    <div class="eyebrow">What the visualizations revealed</div>
+    <h2>F1 is a starting point, not an answer</h2>
+    <div class="divider"></div>
+
+    <div class="row mt">
+      <div class="col">
+        <h3>Findings from visual inspection</h3>
+        <p style="font-size:13px;color:#666;margin-bottom:14px">
+          These observations would not have been possible from the F1 numbers alone.
+        </p>
+
+        <div class="finding" style="border-left-color:#DC2626;background:#FEF2F2">
+          <div class="finding-label" style="color:#DC2626">Prediction is a zone, not a surface</div>
+          <p>The predicted fracture is often thicker and more spread than the real one.
+          One pixel in a 64×64 projection covers a spatial region — the model predicts
+          approximately where the fracture is, not its precise boundary.</p>
+        </div>
+
+        <div class="finding" style="border-left-color:#EA580C;background:#FFF7ED">
+          <div class="finding-label" style="color:#EA580C">FP on high-curvature intact zones</div>
+          <p>Bowl rims, plate edges, mug lips — these look like fractures in projection.
+          They form coherent spatial regions, so post-processing (kNN vote, cluster removal)
+          cannot distinguish them from real fractures. We confirmed ΔF1 ≈ 0 from post-processing.</p>
+        </div>
+
+        <div class="finding" style="border-left-color:#D97706;background:#FFFBEB">
+          <div class="finding-label" style="color:#D97706">Fine branches partially missed</div>
+          <p>Large, compact fracture zones are well detected. Fine ramified branches
+          are partially missed. They represent few points — F1 barely changes —
+          but they define the fracture shape and matter for reassembly matching.</p>
+        </div>
+
+        <div class="finding" style="border-left-color:#7C3AED;background:#F5F3FF">
+          <div class="finding-label" style="color:#7C3AED">Curved surfaces are a structural blind spot</div>
+          <p>The mug failure (recall = 18.5%) is not a training issue — it is a projection issue.
+          A circular fracture on a cylinder is ambiguous in all three orthographic views simultaneously.
+          The architecture cannot resolve this without additional viewpoints.</p>
+        </div>
+      </div>
+
+      <div class="col">
+        <h3>What this means for evaluation</h3>
+        <p style="font-size:14px;margin-bottom:14px">
+          F1 measures pointwise accuracy. For reassembly, what matters is whether
+          the predicted surface is geometrically usable for pairwise fragment matching.
+          These are different things.
+        </p>
+        <table style="margin-bottom:20px">
+          <thead><tr><th>Missing metric</th><th>What it would capture</th></tr></thead>
+          <tbody>
+            <tr><td style="font-size:13px"><strong>Boundary F1</strong></td><td style="font-size:13px;color:#666">Precision on fracture boundary points only — penalizes diffusion</td></tr>
+            <tr><td style="font-size:13px"><strong>Hausdorff distance</strong></td><td style="font-size:13px;color:#666">Maximum geometric error between predicted and GT boundary</td></tr>
+            <tr><td style="font-size:13px"><strong>Chamfer distance</strong></td><td style="font-size:13px;color:#666">Average spatial offset — penalizes systematic shift</td></tr>
+            <tr><td style="font-size:13px"><strong>Normal consistency</strong></td><td style="font-size:13px;color:#666">Normal alignment on predicted fracture — matters for fitting</td></tr>
+          </tbody>
+        </table>
+        <h3>Post-processing result</h3>
+        <p style="font-size:14px">
+          kNN majority vote and small cluster removal were tested and produced <mark>ΔF1 ≈ 0</mark>.
+          This confirms that FP are not isolated noise — they are structurally coherent predictions
+          that require a better loss function or architecture, not a filter.
+        </p>
+        <div class="insight" style="margin-top:16px">
+          The model has learned the <em>signal</em> of fracture segmentation.
+          Whether it has learned the <em>geometry</em> is a question these visualizations
+          helped us ask — and that the current metrics cannot yet answer.
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">9 / 10</div>
+</div>
+
+<!-- ══ 8 — CONCLUSION & NEXT STEPS ═══════════════════════════════════════ -->
+<div class="slide">
+  <div class="slide-accent blue"></div>
+  <div class="slide-inner">
+    <div class="eyebrow">Summary</div>
+    <h2>What we know and where we go from here</h2>
+    <div class="divider"></div>
+
+    <div class="row mt">
+      <div class="col">
+        <h3>What this study established</h3>
+        <div style="display:flex;flex-direction:column;gap:10px;font-size:14px;color:#333">
+          <div style="display:flex;gap:10px;align-items:flex-start">
+            <span style="color:#15803D;font-weight:800;flex-shrink:0">✓</span>
+            <span>A 24× lighter model reaches 86.9% F1 vs ~90.9% for PTv3 — the compression cost is moderate at the global level.</span>
+          </div>
+          <div style="display:flex;gap:10px;align-items:flex-start">
+            <span style="color:#15803D;font-weight:800;flex-shrink:0">✓</span>
+            <span>On highly fragmented objects (9 parts), the CNN outperforms GARF (0.902 vs 0.673) — constant resolution per fragment is a real advantage when GARF's budget runs out.</span>
+          </div>
+          <div style="display:flex;gap:10px;align-items:flex-start">
+            <span style="color:#15803D;font-weight:800;flex-shrink:0">✓</span>
+            <span>The low-ratio failure was diagnosable and partially fixable through Focal Loss + WeightedSampler (+13.4 pp on hard cases).</span>
+          </div>
+          <div style="display:flex;gap:10px;align-items:flex-start">
+            <span style="color:#1D4ED8;font-weight:800;flex-shrink:0">→</span>
+            <span>Visualizations revealed that F1 hides geometric imprecision: diffuse predictions, FP on curved intact zones, and a structural failure on cylindrical fractures.</span>
+          </div>
+          <div style="display:flex;gap:10px;align-items:flex-start">
+            <span style="color:#1D4ED8;font-weight:800;flex-shrink:0">→</span>
+            <span>Post-processing cannot fix these issues — they require changes at the loss or architecture level.</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="col">
+        <h3>Concrete next steps</h3>
+        <div style="display:flex;flex-direction:column;gap:10px;font-size:13px;color:#333">
+          <div style="display:flex;gap:10px;align-items:flex-start">
+            <span style="font-weight:700;color:#1D4ED8;flex-shrink:0;min-width:20px">1.</span>
+            <span><strong>Add geometric metrics.</strong> Boundary F1 and Hausdorff distance should complement F1 to evaluate whether predictions are geometrically usable — not just statistically accurate.</span>
+          </div>
+          <div style="display:flex;gap:10px;align-items:flex-start">
+            <span style="font-weight:700;color:#1D4ED8;flex-shrink:0;min-width:20px">2.</span>
+            <span><strong>Boundary-aware loss.</strong> A term that specifically penalizes errors on fracture boundaries would push toward sharper, more precise predictions.</span>
+          </div>
+          <div style="display:flex;gap:10px;align-items:flex-start">
+            <span style="font-weight:700;color:#1D4ED8;flex-shrink:0;min-width:20px">3.</span>
+            <span><strong>Higher projection resolution.</strong> 64×64 → 128×128 halves spatial ambiguity per pixel. Direct reduction in prediction diffusion, no architectural change.</span>
+          </div>
+          <div style="display:flex;gap:10px;align-items:flex-start">
+            <span style="font-weight:700;color:#1D4ED8;flex-shrink:0;min-width:20px">4.</span>
+            <span><strong>Adaptive viewpoints.</strong> Fixed orthographic projections fail on curved surfaces. Learned or surface-adapted viewpoints could fix the cylindrical fracture blind spot.</span>
+          </div>
+          <div style="display:flex;gap:10px;align-items:flex-start">
+            <span style="font-weight:700;color:#1D4ED8;flex-shrink:0;min-width:20px">5.</span>
+            <span><strong>Zero-shot evaluation.</strong> Test on Fractura and Fantastic Breaks without recalibration — to measure how well the model generalizes beyond Breaking Bad.</span>
+          </div>
+        </div>
+
+        <div style="border-left:3px solid #111;background:#F9FAFB;border-radius:0 6px 6px 0;padding:14px 16px;margin-top:20px;font-size:13px;color:#222;font-weight:500">
+          Without the visualizations, we would not know <em>why</em> the model fails — only that it does.
+          The next steps are concrete precisely because we looked beyond the numbers.
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">10 / 10</div>
+</div>
+
+<!-- ── NAVIGATION BAR ───────────────────────────────────────────────── -->
+<div id="slide-nav">
+  <button id="nav-first" title="First slide">⏮</button>
+  <button id="nav-prev"  title="Previous (←)">← Prev</button>
+  <span   id="nav-counter">1 / 10</span>
+  <div    id="nav-dots"></div>
+  <button id="nav-next"  title="Next (→)">Next →</button>
+  <button id="nav-last"  title="Last slide">⏭</button>
+  <button id="nav-fs"    title="Fullscreen (F)" style="margin-left:12px;font-size:15px;padding:4px 10px">⛶</button>
+</div>
+<div id="nav-hint">← → arrow keys to navigate</div>
+
+<script>
+(function () {
+  const slides = Array.from(document.querySelectorAll('.slide'));
+  const total  = slides.length;
+  let   cur    = 0;
+
+  /* ── dot indicators ── */
+  const dotsEl = document.getElementById('nav-dots');
+  slides.forEach((_, i) => {
+    const d = document.createElement('span');
+    d.title = 'Slide ' + (i + 1);
+    d.addEventListener('click', () => go(i));
+    dotsEl.appendChild(d);
+  });
+
+  /* ── auto-scale: fit the active slide into the viewport ── */
+  function fitSlide() {
+    const s       = slides[cur];
+    const NAV_H   = 52;
+    const MARGIN  = 16; /* breathing room */
+
+    /* reset any previous transform so we measure the natural size */
+    s.style.transform    = '';
+    s.style.marginTop    = '';
+    s.style.marginBottom = '';
+
+    const availW = window.innerWidth  - MARGIN * 2;
+    const availH = window.innerHeight - NAV_H  - MARGIN * 2;
+    const sw     = s.offsetWidth;   /* 1100 px (fixed by CSS) */
+    const sh     = s.offsetHeight;  /* real content height, varies per slide */
+
+    const scale = Math.min(availW / sw, availH / sh, 1);
+
+    if (scale < 0.999) {
+      s.style.transform    = `scale(${scale})`;
+      s.style.transformOrigin = 'top center';
+      /*
+       * transform: scale does NOT shrink the element in layout flow —
+       * the slide still occupies its full natural height, pushing content
+       * down.  We cancel that extra space with a negative bottom margin.
+       */
+      const freed = sh * (1 - scale);
+      s.style.marginBottom = `-${freed}px`;
+      /*
+       * Also pull it up so it visually centres in the available height.
+       */
+      const scaledH  = sh * scale;
+      const topSpace = Math.max(0, (availH - scaledH) / 2);
+      s.style.marginTop = `${topSpace}px`;
+    }
+  }
+
+  function go(idx) {
+    idx = Math.max(0, Math.min(idx, total - 1));
+
+    /* hide previous */
+    slides[cur].classList.remove('active');
+    slides[cur].style.transform    = '';
+    slides[cur].style.marginTop    = '';
+    slides[cur].style.marginBottom = '';
+    dotsEl.children[cur].classList.remove('on');
+
+    cur = idx;
+
+    /* show next */
+    slides[cur].classList.add('active');
+    dotsEl.children[cur].classList.add('on');
+    document.getElementById('nav-counter').textContent = (cur + 1) + ' / ' + total;
+    document.getElementById('nav-prev').disabled  = cur === 0;
+    document.getElementById('nav-first').disabled = cur === 0;
+    document.getElementById('nav-next').disabled  = cur === total - 1;
+    document.getElementById('nav-last').disabled  = cur === total - 1;
+
+    fitSlide();
+  }
+
+  /* ── button listeners ── */
+  document.getElementById('nav-first').addEventListener('click', () => go(0));
+  document.getElementById('nav-prev') .addEventListener('click', () => go(cur - 1));
+  document.getElementById('nav-next') .addEventListener('click', () => go(cur + 1));
+  document.getElementById('nav-last') .addEventListener('click', () => go(total - 1));
+
+  /* ── keyboard navigation ── */
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown' || e.key === ' ')  { e.preventDefault(); go(cur + 1); }
+    if (e.key === 'ArrowLeft'  || e.key === 'ArrowUp')                      { e.preventDefault(); go(cur - 1); }
+    if (e.key === 'Home')                                                    { e.preventDefault(); go(0); }
+    if (e.key === 'End')                                                     { e.preventDefault(); go(total - 1); }
+  });
+
+  /* ── re-fit on window resize ── */
+  window.addEventListener('resize', fitSlide);
+
+  /* ── fullscreen ── */
+  const fsBtn = document.getElementById('nav-fs');
+
+  function toggleFullscreen() {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen();
+    } else {
+      document.exitFullscreen();
+    }
+  }
+
+  fsBtn.addEventListener('click', toggleFullscreen);
+
+  document.addEventListener('fullscreenchange', () => {
+    fsBtn.textContent = document.fullscreenElement ? '✕' : '⛶';
+    fsBtn.title       = document.fullscreenElement ? 'Exit fullscreen (F)' : 'Fullscreen (F)';
+    /* re-fit after the viewport size changes */
+    fitSlide();
+  });
+
+  /* F key toggles fullscreen */
+  document.addEventListener('keydown', e => {
+    if (e.key === 'f' || e.key === 'F') toggleFullscreen();
+  });
+
+  /* ── hide the hint after first interaction ── */
+  document.addEventListener('keydown', () => {
+    document.getElementById('nav-hint').style.display = 'none';
+  }, { once: true });
+
+  go(0);
+})();
+</script>
+</body>
+</html>

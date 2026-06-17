@@ -292,6 +292,7 @@ class Project3DTo2D(nn.Module):
         use_geo_features: bool = False,
         geo_features_dim: int = 3,
         use_overlap_channels: bool = False,
+        random_rotate: bool = False,
     ):
         super().__init__()
         assert 1 <= num_views <= 3, "num_views must be 1, 2 or 3"
@@ -303,6 +304,7 @@ class Project3DTo2D(nn.Module):
         self.use_bilinear         = use_bilinear
         self.use_geo_features     = use_geo_features
         self.use_overlap_channels = use_overlap_channels
+        self.random_rotate        = random_rotate
         self.num_channels = (
             2
             + (3 if use_normals else 0)
@@ -336,6 +338,17 @@ class Project3DTo2D(nn.Module):
         for k, pts in enumerate(frag_list):
             normals_k     = normal_list[k]       if (normal_list       is not None) else None
             geo_k         = geo_features_list[k] if (geo_features_list is not None) else None
+
+            # Random SO(3) rotation during training → forces domain-invariant features
+            if self.random_rotate and self.training:
+                A = torch.randn(3, 3, device=pts.device, dtype=pts.dtype)
+                R, _ = torch.linalg.qr(A)
+                if torch.det(R) < 0:
+                    R[:, 0] = -R[:, 0]
+                pts = pts @ R.T
+                if normals_k is not None:
+                    normals_k = normals_k @ R.T
+
             imgs, corners, weights, cnt = project_fragment(
                 pts,
                 normals=normals_k,
