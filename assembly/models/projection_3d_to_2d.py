@@ -335,16 +335,26 @@ class Project3DTo2D(nn.Module):
         wgt_all  = []
         cnt_all  = []
 
+        # Random SO(3) rotation during training → forces domain-invariant features.
+        # Batched across all K fragments in one call (instead of K individual
+        # QR decompositions in the loop below) to avoid K separate CUDA kernel
+        # launches for what is otherwise a trivial 3×3 operation.
+        rotations = None
+        if self.random_rotate and self.training and len(frag_list) > 0:
+            K = len(frag_list)
+            ref_pts = frag_list[0]
+            A = torch.randn(K, 3, 3, device=ref_pts.device, dtype=ref_pts.dtype)
+            Q, _ = torch.linalg.qr(A)
+            neg_det = torch.det(Q) < 0
+            Q[neg_det, :, 0] = -Q[neg_det, :, 0]
+            rotations = Q
+
         for k, pts in enumerate(frag_list):
             normals_k     = normal_list[k]       if (normal_list       is not None) else None
             geo_k         = geo_features_list[k] if (geo_features_list is not None) else None
 
-            # Random SO(3) rotation during training → forces domain-invariant features
-            if self.random_rotate and self.training:
-                A = torch.randn(3, 3, device=pts.device, dtype=pts.dtype)
-                R, _ = torch.linalg.qr(A)
-                if torch.det(R) < 0:
-                    R[:, 0] = -R[:, 0]
+            if rotations is not None:
+                R = rotations[k]
                 pts = pts @ R.T
                 if normals_k is not None:
                     normals_k = normals_k @ R.T
