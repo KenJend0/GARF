@@ -1,0 +1,69 @@
+# @package _global_
+# configs/experiment/cnn_step15_final_model.yaml
+#
+# Step 15 — Modèle final, entraîné de zéro
+#
+# Combine tous les composants validés par l'ablation Steps 1-14, dans une
+# seule architecture cohérente entraînée from scratch (pas de fine-tuning
+# séquentiel, pour éviter les biais cumulés du warm-start step par step) :
+#
+#   - U-Net (depth=4) + normals + Gaussian splatting + bilinear projection
+#   - Global context (Step 5)
+#   - Feature fusion max (Step 8b)
+#   - Geometric features : curvature, roughness, normal consistency (Step 9)
+#   - Focal Loss + WeightedRandomSampler hard example mining (Step 11)
+#   - PointHead MLP (Step 13) — fix structurel de la backprojection naïve
+#   - Random rotation SO(3) (training only) + InstanceNorm (Step 14)
+#
+# Explicitement exclu : overlap channels (Step 12, régression nette,
+# cf. AVANCEES_POST_PRESENTATION.md section 4 — abandonné).
+#
+# Entraînement sur `everyday` SEULEMENT (pas de mix avec `artifact`).
+# Objectif : mesurer la performance in-domain (everyday) ET la généralisation
+# zero-shot sur artifact (jamais vu pendant l'entraînement), pour estimer
+# combien de la généralisation Step 14 venait du mix de catégories vs des
+# deux mécanismes (rotation/instance norm) eux-mêmes.
+#
+# Pas de pretrained_ckpt : poids initialisés aléatoirement, entraînement long.
+
+defaults:
+  - cnn_ablation_shared
+  - _self_
+
+experiment_name: cnn_step15_final_model
+tags: ["cnn", "final_model", "step15", "from_scratch", "zero_shot_artifact"]
+
+trainer:
+  max_epochs: 150
+
+model:
+  resolution: 128
+  use_normals: true
+  splat_sigma: 1.5
+  use_bilinear: true
+  use_global_context: true
+  use_view_attn: false
+  backbone: unet
+  unet_depth: 4
+  feature_fusion: "max"
+  use_geo_features: true
+  geo_k: 16
+  use_overlap_channels: false      # Step 12 : régression confirmée, exclu volontairement
+  use_focal_loss: true
+  focal_gamma: 2.0
+  focal_dice_alpha: 0.5
+  use_point_head: true
+  point_head_feat_dim: 64
+  point_head_hidden_dim: 128
+  lr_point_head_multiplier: 2.0
+
+  # Step 14 : généralisation, conservés même en entraînement everyday-only
+  random_rotate: true
+  norm_type: instance
+
+  # Pas de pretrained_ckpt — initialisation aléatoire, lr par défaut (1e-4)
+  # cohérent avec Step 1/9 (premiers entraînements from-scratch de la série).
+
+data:
+  categories: ["everyday"]   # entraînement in-domain uniquement
+  weight_hard_examples: true
