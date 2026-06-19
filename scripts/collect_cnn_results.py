@@ -53,6 +53,8 @@ STEPS = [
     ("cnn_step11_hard_sampling",        "Step 11 + FocalLoss+HardSampling"),
     ("cnn_step12_overlap_aware",        "Step 12 + OverlapChannels"),
     ("cnn_step13_point_head",           "Step 13 + PointHead MLP"),
+    ("cnn_step14_generalization",       "Step 14 + RandomRotate+InstanceNorm"),
+    ("cnn_step15_final_model",          "Step 15 + Final model (from scratch)"),
 ]
 
 # Hard-coded results for steps whose CSV output is no longer available.
