@@ -156,10 +156,12 @@ def main(cfg: DictConfig):
     stage = cfg.get("eval_stage", "test")
     if stage == "val":
         trainer.validate(model, datamodule=datamodule, ckpt_path=ckpt_path, weights_only=False)
+        timer_stage = "validate"
     else:
         trainer.test(model, datamodule=datamodule, ckpt_path=ckpt_path, weights_only=False)
+        timer_stage = "test"
 
-    print(f"[eval_segmentation] Time elapsed: {timer.time_elapsed(stage):.1f}s")
+    print(f"[eval_segmentation] Time elapsed: {timer.time_elapsed(timer_stage):.1f}s")
 
     # Cleanup temp file
     if tmp_ckpt is not None:
