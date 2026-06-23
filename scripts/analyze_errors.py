@@ -686,6 +686,12 @@ def parse_args():
                    help="Compute geometric metrics: Boundary F1, Hausdorff, Chamfer distance")
     p.add_argument("--k_boundary", type=int, default=5,
                    help="k for kNN boundary detection (default 5)")
+    p.add_argument("--summary_json", default=None,
+                   help="Optional path to dump a structured JSON summary of all scalar "
+                        "metrics (mean F1, boundary F1, hausdorff, chamfer, best threshold) "
+                        "— consumed by scripts/compare_models.py")
+    p.add_argument("--label", default=None,
+                   help="Display name for this run in the summary JSON (defaults to --experiment)")
     return p.parse_args()
 
 
@@ -743,6 +749,12 @@ def load_config_and_model(args):
         # gives an already per-part-split (B, P, N, 3) tensor, which crashes
         # FracSeg's `B, N, C = pointclouds.shape` unpacking.
         overrides.append("data.sample_method=weighted")
+        # configs/experiment/eval_frac_seg.yaml forces batch_size=1 for FracSeg —
+        # batching multiple objects together degrades accuracy substantially
+        # (Mean F1 dropped ~10pts at batch_size=4 vs 1 in testing), likely due
+        # to per-object offset/graph bookkeeping not being batch-size robust.
+        overrides = [o for o in overrides if not o.startswith("data.batch_size=")]
+        overrides.append("data.batch_size=1")
     with initialize_config_dir(config_dir=config_dir, version_base="1.3"):
         cfg = compose(
             config_name="train",
@@ -1034,6 +1046,40 @@ def main():
                 rec  = safe_div(tp, tp + fn)
                 f1   = safe_div(2 * prec * rec, prec + rec)
                 print(f"  {thresh:>7.2f}  {f1:>7.4f}  {prec:>7.4f}  {rec:>7.4f}")
+
+    # --- Structured summary (optional, for scripts/compare_models.py) ---
+    if args.summary_json:
+        import json as _json
+
+        summary = {
+            "label":      args.label or args.experiment,
+            "model_type": args.model_type,
+            "categories": args.categories,
+            "split":      args.split,
+            "n_fragments": len(records_clean),
+            "params":      sum(p.numel() for p in model.parameters()),
+            "mean_f1":        float(np.mean(f1s)),
+            "mean_precision": float(np.mean(precs)),
+            "mean_recall":    float(np.mean(recs)),
+            "median_f1":      float(np.median(f1s)),
+            "fp_total": int(total_fp), "fn_total": int(total_fn), "tp_total": int(total_tp),
+        }
+        if args.geometric:
+            bf1s = [r["boundary_f1"] for r in all_records if not np.isnan(r["boundary_f1"])]
+            hds  = [r["hausdorff"]   for r in all_records if not np.isnan(r["hausdorff"])]
+            cds  = [r["chamfer"]     for r in all_records if not np.isnan(r["chamfer"])]
+            summary["boundary_f1_mean"] = float(np.mean(bf1s)) if bf1s else None
+            summary["hausdorff_mean"]   = float(np.mean(hds))  if hds  else None
+            summary["chamfer_mean"]     = float(np.mean(cds))  if cds  else None
+        if args.sweep_threshold:
+            summary["best_threshold"] = best_thresh
+            summary["best_f1_pooled"] = best_f1
+
+        summary_path = Path(args.summary_json)
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(summary_path, "w") as fh:
+            _json.dump(summary, fh, indent=2)
+        print(f"\nSaved structured summary to: {summary_path}")
 
     print(f"\nAll outputs saved to: {out_dir}/")
     print("Done.")
