@@ -23,8 +23,16 @@ def extract_fragment_list(
     """
     Reshape flat batch point-cloud tensor into per-fragment lists.
 
-    Assumes uniform sampling: all valid fragments have the same num_pts
-    (enforced by sample_method=uniform in the data config).
+    Fast path: uniform sampling, all valid fragments share the same num_pts
+    (sample_method=uniform — every slot, valid or padding, reserves exactly
+    num_points_to_sample points, so N_total = P * num_pts always holds).
+
+    Slow path: variable per-fragment sizes (sample_method=weighted — total
+    points per object is fixed but split unevenly across the real fragments
+    by surface area, padding slots get exactly 0 points). N_total // P does
+    NOT recover the real per-fragment size here, so each object is sliced
+    using its own points_per_part offsets instead (mirrors how FracSeg's own
+    forward computes points_offset = cumsum(points_per_part[valid_pcs])).
 
     Returns:
         frag_list : list of K tensors (num_pts, 3)   valid fragments only
@@ -34,17 +42,32 @@ def extract_fragment_list(
     P = points_per_part.shape[1]
     valid_pcs = (points_per_part != 0)   # (B, P)
 
-    if pointclouds.dim() == 3:
-        B, N_total, C = pointclouds.shape
-        num_pts = N_total // P
-        pcs = pointclouds.view(B, P, num_pts, C)   # (B, P, num_pts, 3)
-    else:
-        # Already (B, P, num_pts, 3) — accept both layouts defensively
-        pcs = pointclouds
+    if pointclouds.dim() != 3:
+        # Already (B, P, num_pts, 3) — accept this layout defensively
+        valid_frags = pointclouds[valid_pcs]     # (K, num_pts, 3)
+        K = valid_frags.shape[0]
+        return [valid_frags[k] for k in range(K)], valid_pcs, K
 
-    valid_frags = pcs[valid_pcs]     # (K, num_pts, 3)
-    K = valid_frags.shape[0]
-    return [valid_frags[k] for k in range(K)], valid_pcs, K
+    B, N_total, C = pointclouds.shape
+    uniform = bool((points_per_part[valid_pcs] == N_total // P).all())
+
+    if uniform:
+        num_pts = N_total // P
+        pcs = pointclouds.view(B, P, num_pts, C)     # (B, P, num_pts, 3)
+        valid_frags = pcs[valid_pcs]                 # (K, num_pts, 3)
+        K = valid_frags.shape[0]
+        return [valid_frags[k] for k in range(K)], valid_pcs, K
+
+    # Variable per-fragment sizes: slice each object with its real offsets.
+    frag_list = []
+    for b in range(B):
+        offset = 0
+        for p in range(P):
+            size = int(points_per_part[b, p].item())
+            if size > 0:
+                frag_list.append(pointclouds[b, offset:offset + size])
+                offset += size
+    return frag_list, valid_pcs, len(frag_list)
 
 
 def extract_normal_list(
