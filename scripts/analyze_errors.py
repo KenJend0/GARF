@@ -606,6 +606,8 @@ def plot_qualitative(records, xyz_list, n_vis, out_dir, tag):
       [GT fracture] [Prediction] [Error: FP=red, FN=blue, TP=green]
     Uses XY projection for readability.
     """
+    if n_vis <= 0:
+        return
     # Filter fragments with at least some fracture points
     filtered = [(i, r) for i, r in enumerate(records) if r["n_fracture"] > 5]
     if not filtered:
