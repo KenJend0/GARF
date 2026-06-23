@@ -669,7 +669,10 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt",        required=True,  help="Path to .ckpt checkpoint")
     p.add_argument("--data_root",   required=True,  help="Path to breaking_bad_vol.hdf5")
-    p.add_argument("--experiment",  required=True,  help="Hydra experiment name (e.g. cnn_step9_geo_features)")
+    p.add_argument("--experiment",  required=True,  help="Hydra experiment name (e.g. cnn_step9_geo_features) — used for the datamodule config only")
+    p.add_argument("--model_type",  default="cnn", choices=["cnn", "garf"],
+                   help="'cnn' loads CNNFracSeg, 'garf' loads PTv3 FracSeg (extracted from a full GARF "
+                        "checkpoint if needed, e.g. GARF_mini.ckpt)")
     p.add_argument("--out_dir",     default="/tmp/student7/analysis", help="Output directory for plots")
     p.add_argument("--split",       default="val",  choices=["val", "test"])
     p.add_argument("--categories",  default=None,   help="Comma-separated categories override, e.g. artifact")
@@ -684,6 +687,45 @@ def parse_args():
     p.add_argument("--k_boundary", type=int, default=5,
                    help="k for kNN boundary detection (default 5)")
     return p.parse_args()
+
+
+def load_frac_seg_from_garf(garf_ckpt: str, device: torch.device):
+    """
+    Load the PTv3 FracSeg model, either from a standalone FracSeg checkpoint
+    or extracted from a full GARF checkpoint (DenoiserFlowMatching, e.g.
+    GARF_mini.ckpt) — same logic as scripts/compare_models_test.py.
+    """
+    import tempfile
+    from assembly.models.pretraining.frac_seg import FracSeg
+
+    ckpt_data = torch.load(garf_ckpt, map_location="cpu", weights_only=False)
+    keys = list(ckpt_data.get("state_dict", {}).keys())
+    is_garf = any(k.startswith("feature_extractor.") for k in keys)
+
+    if is_garf:
+        frac_seg_state = {
+            k.replace("feature_extractor.", ""): v
+            for k, v in ckpt_data["state_dict"].items()
+            if k.startswith("feature_extractor.")
+        }
+        import lightning as L
+        tmp = tempfile.NamedTemporaryFile(suffix=".ckpt", delete=False)
+        tmp.close()
+        torch.save({"state_dict": frac_seg_state,
+                    "pytorch-lightning_version": L.__version__}, tmp.name)
+        load_path = tmp.name
+        is_tmp = True
+    else:
+        load_path = garf_ckpt
+        is_tmp = False
+
+    try:
+        model = FracSeg.load_from_checkpoint(load_path, map_location=device, weights_only=False)
+    finally:
+        if is_tmp:
+            os.unlink(load_path)
+
+    return model
 
 
 def load_config_and_model(args):
@@ -730,8 +772,11 @@ def main():
 
     # --- Load model ---
     print("Loading model from checkpoint...")
-    from assembly.models.cnn_segmentation_model import CNNFracSeg
-    model = CNNFracSeg.load_from_checkpoint(args.ckpt, map_location=device, weights_only=False)
+    if args.model_type == "garf":
+        model = load_frac_seg_from_garf(args.ckpt, device)
+    else:
+        from assembly.models.cnn_segmentation_model import CNNFracSeg
+        model = CNNFracSeg.load_from_checkpoint(args.ckpt, map_location=device, weights_only=False)
     model.eval()
     model.to(device)
     print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
