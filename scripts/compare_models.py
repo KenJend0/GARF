@@ -77,7 +77,7 @@ def format_table(summaries: list) -> str:
                 row.append(f"{v:,}")
             elif key == "n_fragments" and v is not None:
                 row.append(f"{v:,}")
-            elif key == "categories" and v is not None:
+            elif key in ("label", "categories") and v is not None:
                 row.append(str(v))
             elif key == "best_threshold" and v is not None:
                 row.append(f"{v:.2f}")
