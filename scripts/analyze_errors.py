@@ -691,39 +691,36 @@ def parse_args():
 
 def load_frac_seg_from_garf(garf_ckpt: str, device: torch.device):
     """
-    Load the PTv3 FracSeg model, either from a standalone FracSeg checkpoint
-    or extracted from a full GARF checkpoint (DenoiserFlowMatching, e.g.
-    GARF_mini.ckpt) — same logic as scripts/compare_models_test.py.
-    """
-    import tempfile
-    from assembly.models.pretraining.frac_seg import FracSeg
+    Load the PTv3 FracSeg model from a full GARF checkpoint (DenoiserFlowMatching,
+    e.g. GARF_mini.ckpt) or a standalone FracSeg checkpoint.
 
+    FracSeg is instantiated via Hydra (configs/model/frac_seg.yaml supplies
+    pc_feat_dim/encoder/optimizer) rather than via FracSeg.load_from_checkpoint,
+    because the extracted feature_extractor.* weights carry no hyperparameters
+    for Lightning to reconstruct the constructor args from.
+    """
     ckpt_data = torch.load(garf_ckpt, map_location="cpu", weights_only=False)
     keys = list(ckpt_data.get("state_dict", {}).keys())
     is_garf = any(k.startswith("feature_extractor.") for k in keys)
 
     if is_garf:
-        frac_seg_state = {
+        state = {
             k.replace("feature_extractor.", ""): v
             for k, v in ckpt_data["state_dict"].items()
             if k.startswith("feature_extractor.")
         }
-        import lightning as L
-        tmp = tempfile.NamedTemporaryFile(suffix=".ckpt", delete=False)
-        tmp.close()
-        torch.save({"state_dict": frac_seg_state,
-                    "pytorch-lightning_version": L.__version__}, tmp.name)
-        load_path = tmp.name
-        is_tmp = True
     else:
-        load_path = garf_ckpt
-        is_tmp = False
+        state = ckpt_data.get("state_dict", ckpt_data)
 
-    try:
-        model = FracSeg.load_from_checkpoint(load_path, map_location=device, weights_only=False)
-    finally:
-        if is_tmp:
-            os.unlink(load_path)
+    config_dir = str(Path(__file__).resolve().parent.parent / "configs")
+    with initialize_config_dir(config_dir=config_dir, version_base="1.3"):
+        cfg = compose(config_name="train", overrides=["model=frac_seg"])
+    model = instantiate(cfg.model)
+
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    print(f"  FracSeg weights loaded from {garf_ckpt}")
+    print(f"  {len(state) - len(unexpected)} tensors matched | "
+          f"{len(missing)} missing | {len(unexpected)} unexpected")
 
     return model
 
