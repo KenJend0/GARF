@@ -151,9 +151,15 @@ def main(cfg: DictConfig):
         cfg.get("trainer"), callbacks=callbacks, logger=loggers
     )
 
-    trainer.test(model, datamodule=datamodule, ckpt_path=ckpt_path, weights_only=False)
+    # Some HDF5 splits (e.g. this lab's breaking_bad_vol.hdf5) have no "test"
+    # group at all — pass +eval_stage=val to run on the validation set instead.
+    stage = cfg.get("eval_stage", "test")
+    if stage == "val":
+        trainer.validate(model, datamodule=datamodule, ckpt_path=ckpt_path, weights_only=False)
+    else:
+        trainer.test(model, datamodule=datamodule, ckpt_path=ckpt_path, weights_only=False)
 
-    print(f"[eval_segmentation] Time elapsed: {timer.time_elapsed('test'):.1f}s")
+    print(f"[eval_segmentation] Time elapsed: {timer.time_elapsed(stage):.1f}s")
 
     # Cleanup temp file
     if tmp_ckpt is not None:
