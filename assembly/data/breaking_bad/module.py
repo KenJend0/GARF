@@ -67,7 +67,7 @@ class BreakingBadDataModule(L.LightningDataModule):
         self.test_dataset: Optional[Dataset] = None
 
     def setup(self, stage):
-        if stage == "fit":
+        if stage in ("fit", "validate"):
 
             self.train_dataset = ConcatDataset(
                 [
