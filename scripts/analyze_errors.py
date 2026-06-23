@@ -737,6 +737,12 @@ def load_config_and_model(args):
         cats = args.categories.split(",")
         cats_str = "[" + ",".join(cats) + "]"
         overrides.append(f"data.categories={cats_str}")
+    if args.model_type == "garf":
+        # FracSeg.forward expects the flat concatenated (B, N_total, 3) layout
+        # produced by BreakingBadWeighted — the CNN's sample_method=uniform
+        # gives an already per-part-split (B, P, N, 3) tensor, which crashes
+        # FracSeg's `B, N, C = pointclouds.shape` unpacking.
+        overrides.append("data.sample_method=weighted")
     with initialize_config_dir(config_dir=config_dir, version_base="1.3"):
         cfg = compose(
             config_name="train",
