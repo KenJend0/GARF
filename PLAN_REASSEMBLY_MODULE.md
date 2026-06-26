@@ -294,6 +294,25 @@ RANSAC/Kabsch/formule R_ij-t_ij confirmés corrects). Conforme à la branche pr�
    (normales opposées après transformation, absence de pénétration/overlap absurde,
    score restreint aux points fracture uniquement) pour éviter le faux consensus.
 
+**Sanity check oracle (A, ajouté avant le ratio test, 2026-06-27)** : Kabsch simple (sans
+RANSAC) sur des correspondances NON pilotées par le descripteur (plus proche voisin sous
+la VRAIE pose GT, via `resid_mat.argmin`). Implémenté dans `phase2_geometric_baseline.py`
+(tableau `ORACLE KABSCH SANITY CHECK`, métriques `oracle_rot_err_deg`/`oracle_trans_err`).
+Vérifie que la convention de pose/scale (confirmée en Phase 0) et l'implémentation Kabsch
+elle-même peuvent récupérer `R_ij_gt`/`t_ij_gt` quand on leur donne des correspondances
+parfaites — motivé par le cas `Statue` (CorrPrec=61.72%, Gap négatif, mais Pose@30=0%) qui
+méritait une vérification indépendante du matching avant d'aller plus loin.
+
+**Mutual-NN / ratio test (B, étape 2 du plan)** : ajout de `build_correspondences()` et du
+flag `--corr_mode` (`1nn` baseline, `mutual`, `ratio<R>` type Lowe, `mutual_ratio<R>`) pour
+filtrer les correspondances 1-NN avant RANSAC — moins de candidats mais plus précis,
+objectif indicatif `CorrPrec` 15-25%+ (pas besoin de 80%). À tester dans cet ordre (sur
+`gt_edge`, le masque le plus propre) : `1nn` (référence déjà connue) → `mutual` →
+`ratio0.8` → `ratio0.7` → `ratio0.6` → `mutual_ratio0.8`. Lecture attendue : si `CorrPrec`
+monte fortement mais `Pose@30` reste plat, le problème est le score RANSAC (étape 4) plus
+que les correspondances ; si `CorrPrec` ne bouge presque pas, les descripteurs sont trop
+faibles pour qu'un filtrage de correspondances aide (passer direct à l'étape 3).
+
 **Protocole en deux temps** (ne pas mélanger les deux questions) :
 - **A. Registration sur paires positives** (`graph[i,j]=True` uniquement, ce que fait déjà
   `phase2_geometric_baseline.py`) : rotation/translation error, inlier_ratio,

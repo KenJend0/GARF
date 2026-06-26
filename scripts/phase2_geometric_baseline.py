@@ -41,6 +41,15 @@ pour deux fragments qui vont vraiment ensemble, la baseline retrouve leur pose r
 Le protocole B (discrimination positif/négatif -- distinguer une vraie paire d'une fausse
 via le score de matching) est une question différente, pas encore implémentée ici.
 
+Sanity check oracle (avant d'interpréter tout le reste) : Kabsch simple (sans RANSAC) sur
+des correspondances NON pilotées par le descripteur -- le plus proche voisin de chaque
+point sous la VRAIE pose GT. Teste si la convention de pose/scale/Kabsch elle-même peut
+récupérer R_ij_gt/t_ij_gt, indépendamment du matching. Doit être quasi nul ; si non, le
+bug est dans le pipeline de pose, pas dans le matcher.
+
+`--corr_mode` filtre les correspondances 1-NN en espace descripteur : `1nn` (défaut),
+`mutual` (mutual nearest neighbor), `ratio<R>` (test de Lowe), `mutual_ratio<R>`.
+
 Usage (sur le serveur) :
     python scripts/phase2_geometric_baseline.py \
         --ckpt output/cnn_step15_final_model/last.ckpt \
@@ -180,6 +189,55 @@ def rotation_error_deg(R_est: np.ndarray, R_gt: np.ndarray) -> float:
     return float(np.degrees(np.arccos(cos_angle)))
 
 
+def build_correspondences(d_mat: np.ndarray, mode: str):
+    """Filter 1-NN descriptor correspondences by mode. Returns (i_idx, j_idx) arrays of
+    equal length -- a subset of i's local indices (into the Ni rows of d_mat) paired
+    with their chosen j match, NOT necessarily covering all Ni rows (mutual-NN/ratio
+    test reject ambiguous ones instead of forcing a match for every point).
+
+    Modes:
+      1nn               -- baseline, every i-point keeps its nearest j (no filtering).
+      mutual            -- keep (i,j) only if j is also i's nearest among j's matched
+                            TO it (mutual nearest neighbor) -- standard correspondence
+                            pruning, rejects asymmetric "forced" matches.
+      ratio<R>          -- Lowe's ratio test: keep i only if d(1st nearest)/d(2nd
+                            nearest) < R. Low ratio means the match is unambiguous
+                            relative to the next-best candidate.
+      mutual_ratio<R>   -- intersection of both filters.
+    """
+    Ni, Nj = d_mat.shape
+    best_j = d_mat.argmin(axis=1)
+
+    if mode == "1nn":
+        keep = np.ones(Ni, dtype=bool)
+    elif mode == "mutual":
+        best_i = d_mat.argmin(axis=0)
+        keep = best_i[best_j] == np.arange(Ni)
+    elif mode.startswith("mutual_ratio"):
+        ratio_thresh = float(mode.replace("mutual_ratio", ""))
+        best_i = d_mat.argmin(axis=0)
+        mutual_keep = best_i[best_j] == np.arange(Ni)
+        keep = mutual_keep & _ratio_test_mask(d_mat, ratio_thresh)
+    elif mode.startswith("ratio"):
+        ratio_thresh = float(mode.replace("ratio", ""))
+        keep = _ratio_test_mask(d_mat, ratio_thresh)
+    else:
+        raise ValueError(mode)
+
+    i_idx = np.where(keep)[0]
+    j_idx = best_j[i_idx]
+    return i_idx, j_idx
+
+
+def _ratio_test_mask(d_mat: np.ndarray, ratio_thresh: float) -> np.ndarray:
+    Ni, Nj = d_mat.shape
+    if Nj < 2:
+        return np.ones(Ni, dtype=bool)  # no second-best to compare against
+    sorted_d = np.sort(d_mat, axis=1)
+    d1, d2 = sorted_d[:, 0], sorted_d[:, 1]
+    return (d1 / np.maximum(d2, 1e-12)) < ratio_thresh
+
+
 def build_mask(strategy: str, scores: np.ndarray, gt: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     n_pts = len(scores)
     if strategy == "gt":
@@ -228,6 +286,12 @@ def main():
         help="Reject RANSAC samples whose points don't spread at least this much "
              "(max pairwise distance) -- guards against near-degenerate samples on a "
              "locally flat fracture patch. 0 = disabled (default).",
+    )
+    parser.add_argument(
+        "--corr_mode", default="1nn",
+        help="Correspondence filtering mode: 1nn (baseline, default), mutual "
+             "(mutual nearest neighbor), ratio<R> (Lowe's ratio test, e.g. ratio0.8), "
+             "mutual_ratio<R> (both combined). See build_correspondences().",
     )
     args = parser.parse_args()
     mask_strategies = args.strategies.split(",") if args.strategies else ALL_MASK_STRATEGIES
@@ -409,18 +473,20 @@ def main():
                                            strategy, group, family, f"pose_success_{thresh}", False)
                                 continue
 
-                            # 1-NN correspondence in descriptor space, i -> j
+                            # Correspondences in descriptor space, i -> j, filtered by
+                            # --corr_mode (1nn baseline, or mutual-NN / ratio test to
+                            # trade fewer candidates for higher precision).
                             desc_i = desc_per_k[k_i][idx_i_keep]      # (Ni, D)
                             desc_j = desc_per_k[k_j][idx_j_keep]      # (Nj, D)
                             d_mat = np.linalg.norm(
                                 desc_i[:, None, :] - desc_j[None, :, :], axis=-1
                             )
-                            best_j = d_mat.argmin(axis=1)             # (Ni,)
+                            i_idx_corr, j_idx_corr = build_correspondences(d_mat, args.corr_mode)
 
-                            P_cand = raw_per_k[k_i][idx_i_keep]
-                            P_cand_all = raw_per_k[k_i][idx_i_keep]   # (Ni,3) -- all filtered i points
-                            Q_full = raw_per_k[k_j][idx_j_keep]       # (Nj,3) -- all filtered j points
-                            Q_cand = Q_full[best_j]
+                            P_cand_all = raw_per_k[k_i][idx_i_keep]   # (Ni,3) -- ALL filtered i points
+                            Q_full = raw_per_k[k_j][idx_j_keep]       # (Nj,3) -- ALL filtered j points
+                            P_cand = P_cand_all[i_idx_corr]           # (Nc,3) -- after corr_mode filtering
+                            Q_cand = Q_full[j_idx_corr]
 
                             # Diagnostic 1: is the 1-NN candidate set itself usable at all?
                             # A candidate is "correct" if it's geometrically consistent with
@@ -461,6 +527,29 @@ def main():
                                            strategy, group, family, f"topk_recall_{k_top}",
                                            float(hit[avail_mask].mean()))
 
+                            # Sanity check (A): oracle Kabsch on GT-pose-nearest correspondences
+                            # (NOT descriptor-driven -- for every available i-point, its true
+                            # nearest j-point under the ACTUAL GT pose). Tests whether plain
+                            # Kabsch can recover R_ij_gt/t_ij_gt at all, independent of RANSAC
+                            # and independent of whether the descriptor can find these
+                            # correspondences itself. If this fails, something is wrong in the
+                            # pose convention/scale/direction (Phase 0 said no, but cheap to
+                            # re-verify here on the actual edge data) -- not in the matcher.
+                            if avail_mask.sum() >= MIN_INLIERS:
+                                oracle_best_j = resid_mat.argmin(axis=1)              # (Ni,)
+                                P_oracle = P_cand_all[avail_mask]
+                                Q_oracle = Q_full[oracle_best_j[avail_mask]]
+                                try:
+                                    R_oracle, t_oracle = kabsch(P_oracle, Q_oracle)
+                                    record(results, results_by_group, results_by_family,
+                                           strategy, group, family, "oracle_rot_err_deg",
+                                           rotation_error_deg(R_oracle, R_ij_gt))
+                                    record(results, results_by_group, results_by_family,
+                                           strategy, group, family, "oracle_trans_err",
+                                           float(np.linalg.norm(t_oracle - t_ij_gt)))
+                                except np.linalg.LinAlgError:
+                                    pass
+
                             pose = ransac_pose(
                                 P_cand, Q_cand, rng,
                                 sample_size=args.ransac_sample_size,
@@ -500,8 +589,27 @@ def main():
     print(f"\nAnalyzed {n_edges} adjacent fragment pairs ({args.categories}/{args.split}).")
 
     print("\n" + "=" * 100)
+    print(f"ORACLE KABSCH SANITY CHECK — {args.categories}/{args.split}")
+    print("  Plain Kabsch (no RANSAC) on GT-pose-nearest correspondences (not descriptor-")
+    print("  driven). Tests pose math/convention/scale independent of the matcher. Should")
+    print("  be near-zero error -- if not, the bug is in the pose pipeline, not matching.")
+    print("=" * 100)
+    print(f"  {'Strategy':<12} {'OracleRotErr':>13} {'OracleTransErr':>15} {'n':>6}")
+    for strategy in mask_strategies:
+        d = results[strategy]
+        oracle_rot = d.get("oracle_rot_err_deg", [])
+        oracle_trans = d.get("oracle_trans_err", [])
+        if not oracle_rot:
+            continue
+        print(
+            f"  {strategy:<12} {np.mean(oracle_rot):>13.4f} "
+            f"{np.mean(oracle_trans):>15.6f} {len(oracle_rot):>6}"
+        )
+
+    print("\n" + "=" * 100)
     print(f"PHASE 2 — GEOMETRIC BASELINE MATCHING — {args.categories}/{args.split}")
-    print(f"  (RANSAC sample_size={args.ransac_sample_size}, min_dispersion={args.ransac_min_dispersion})")
+    print(f"  (corr_mode={args.corr_mode}, RANSAC sample_size={args.ransac_sample_size}, "
+          f"min_dispersion={args.ransac_min_dispersion})")
     print("  CorrPrec = inlier ratio of the candidate set under the TRUE GT pose.")
     print("  InlierRatio = inlier ratio under the pose RANSAC actually picked.")
     print("  InlierRatio > CorrPrec means RANSAC's scoring objectively prefers a WRONG")
