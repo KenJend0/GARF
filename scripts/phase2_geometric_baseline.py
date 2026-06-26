@@ -154,9 +154,19 @@ def _hypothesis_score(resid: np.ndarray, inlier_mask: np.ndarray, score_mode: st
     if score_mode == "count":
         return float(n_in), n_in
     if score_mode == "count_minus_mean_residual":
+        # additive penalty -- residuals live in [0, inlier_thresh), typically << the
+        # natural scale of inlier-count differences between competing hypotheses (tens of
+        # points), so score_lambda has to be calibrated very high (hundreds-thousands) to
+        # matter at all. Kept for completeness; count_over_residual below avoids the
+        # calibration problem entirely.
         return n_in - score_lambda * float(resid[inlier_mask].mean()), n_in
     if score_mode == "count_minus_median_residual":
         return n_in - score_lambda * float(np.median(resid[inlier_mask])), n_in
+    if score_mode == "count_over_residual":
+        # Ratio score, no lambda to calibrate: rewards inliers and tight fits
+        # multiplicatively, so a tighter-but-smaller consensus can outscore a
+        # looser-but-larger one proportionally, regardless of the absolute count scale.
+        return n_in / (float(resid[inlier_mask].mean()) + 1e-4), n_in
     raise ValueError(score_mode)
 
 
@@ -322,11 +332,14 @@ def main():
     )
     parser.add_argument(
         "--score_mode", default="count",
-        choices=["count", "count_minus_mean_residual", "count_minus_median_residual"],
+        choices=["count", "count_minus_mean_residual", "count_minus_median_residual", "count_over_residual"],
         help="RANSAC hypothesis scoring. 'count' (default/legacy) = raw inlier count, "
              "which let a loose-but-larger wrong consensus beat a tight-but-smaller "
-             "correct one (InlierRatio > CorrPrec observed). The residual-penalized "
-             "modes subtract score_lambda * (mean/median residual among inliers).",
+             "correct one (InlierRatio > CorrPrec observed). count_minus_*_residual "
+             "subtract score_lambda * residual (needs careful calibration -- residuals "
+             "are tiny relative to count differences, score_lambda=50 had zero effect "
+             "empirically). count_over_residual = n_in / mean_residual, a ratio score "
+             "with no lambda to calibrate, recommended over the additive variants.",
     )
     parser.add_argument(
         "--score_lambda", type=float, default=50.0,

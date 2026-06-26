@@ -338,6 +338,30 @@ tard comme mini-ablation complémentaire si besoin.**
   un bon seuil trouvé. Bon signe attendu : `Gap` baisse fortement, `Pose@30` 5%→10-20%,
   `RotErr` nettement sous 100° (même imparfait, ça validerait que le verrou était le score).
 
+**Résultat sweep `--inlier_thresh` (2026-06-27, `gt_edge`, `score_mode=count`) :**
+`Gap` se referme presque complètement avec le seuil (14.52→6.46→3.24→0.73 pour
+0.05/0.03/0.02/0.01), `OracleRotErr` baisse aussi (11.8°→8.2°→4.7°→3.1°, prévisible :
+seuil plus strict = correspondances oracle plus proches). **Mais `Pose@30`/`RotErr`
+restent quasi plats (4.5-6.6%, 122-128°), sans tendance monotone** — `Pose@30` baisse
+même au seuil le plus strict (0.01). Explication : serrer le seuil élimine le biais de
+score, mais élimine aussi une grande partie des vraies correspondances (`CorrPrec`
+34%→8%) ; à seuil=0.01 avec `sample_size=6`, `P(échantillon tout correct) ≈ 0.083⁶ ≈ 2e-6`
+— RANSAC n'a quasi plus rien de propre à trouver, même sans biais. **Le seuil global seul
+est un compromis, pas un levier** : les deux effets (moins de biais, moins de matière) se
+neutralisent à peu près.
+
+**Résultat `count_minus_mean_residual` à `inlier_thresh=0.03`, `score_lambda=50` :
+AUCUN effet mesurable** (résultats identiques à `score_mode=count` au même seuil, écarts
+dans le bruit du tirage RANSAC). Diagnostic : `score_lambda=50` est beaucoup trop faible
+— le résidu vit dans `[0, 0.03)`, pénalité max `50×0.03=1.5`, alors que l'écart de
+comptage d'inliers entre deux hypothèses concurrentes peut être de plusieurs dizaines de
+points sur un pool de centaines de candidats. Le terme résiduel est noyé, pas un échec de
+l'approche. **Plutôt que deviner `λ` par essais successifs, ajout de `count_over_residual`**
+(`score = n_in / (résidu_moyen + ε)`, dans `_hypothesis_score()`) — score en ratio sans
+paramètre à caler, qui équilibre naturellement comptage et précision quelle que soit
+l'échelle absolue. `count_minus_*_residual` conservés mais nécessiteraient `λ` de l'ordre
+de plusieurs centaines/milliers pour avoir un effet, à éviter sauf besoin spécifique.
+
 **Protocole en deux temps** (ne pas mélanger les deux questions) :
 - **A. Registration sur paires positives** (`graph[i,j]=True` uniquement, ce que fait déjà
   `phase2_geometric_baseline.py`) : rotation/translation error, inlier_ratio,
