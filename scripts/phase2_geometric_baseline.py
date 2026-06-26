@@ -651,6 +651,26 @@ def main():
                                 except np.linalg.LinAlgError:
                                     pass
 
+                                # Normal-orientation diagnostic (Phase 2C, step 1 -- NOT a
+                                # filter yet). For these oracle-correct correspondences
+                                # (geometrically correct under the TRUE pose, NOT descriptor-
+                                # driven), check whether normals are consistently opposed:
+                                # dot(R_ij_gt @ n_i, n_j) approx -1 for a genuine contact.
+                                # Decides whether normals carry exploitable signal before
+                                # using them as a hard filter or a soft score term.
+                                normal_i_oracle = normals_per_k[k_i][idx_i_keep][avail_mask]
+                                normal_j_oracle = normals_per_k[k_j][idx_j_keep][oracle_best_j[avail_mask]]
+                                rotated_normal_i = (R_ij_gt @ normal_i_oracle.T).T
+                                normal_dot = (rotated_normal_i * normal_j_oracle).sum(axis=1)
+                                record(results, results_by_group, results_by_family,
+                                       strategy, group, family, "normal_dot_mean", float(normal_dot.mean()))
+                                record(results, results_by_group, results_by_family,
+                                       strategy, group, family, "normal_dot_median", float(np.median(normal_dot)))
+                                for normal_thresh in (-0.3, -0.5, -0.7):
+                                    record(results, results_by_group, results_by_family,
+                                           strategy, group, family, f"pct_normal_dot_below_{normal_thresh}",
+                                           float((normal_dot < normal_thresh).mean()))
+
                             pose = ransac_pose(
                                 P_cand, Q_cand, rng,
                                 sample_size=args.ransac_sample_size,
@@ -805,6 +825,31 @@ def main():
         print(
             f"  {strategy:<12} {np.mean(sgt):>14.3f} {np.mean(sransac):>14.3f} "
             f"{np.mean(sgap):>+14.3f} {len(sgt):>6}"
+        )
+
+    # --- Normal-orientation diagnostic (Phase 2C step 1, NOT a filter yet) ---
+    print("\n" + "=" * 100)
+    print(f"NORMAL ORIENTATION DIAGNOSTIC — {args.categories}/{args.split}")
+    print("  dot(R_ij_gt @ n_i, n_j) on oracle-correct correspondences (GT pose, not")
+    print("  descriptor-driven). Genuine contact should give dot ~ -1 (opposed normals).")
+    print("  Median strongly negative + many dot<-0.5 => normals exploitable as opposed.")
+    print("  |dot| near 1 but sign unstable => normals not consistently oriented, use")
+    print("  |dot| instead of a strict opposition test. No structure => too noisy, don't")
+    print("  use as a hard filter.")
+    print("=" * 100)
+    print(f"  {'Strategy':<12} {'MeanDot':>9} {'MedianDot':>10} {'%<-0.3':>8} {'%<-0.5':>8} {'%<-0.7':>8} {'n':>6}")
+    for strategy in mask_strategies:
+        d = results[strategy]
+        nd_mean = d.get("normal_dot_mean", [])
+        if not nd_mean:
+            continue
+        nd_median = d.get("normal_dot_median", [])
+        pct_03 = d.get("pct_normal_dot_below_-0.3", [])
+        pct_05 = d.get("pct_normal_dot_below_-0.5", [])
+        pct_07 = d.get("pct_normal_dot_below_-0.7", [])
+        print(
+            f"  {strategy:<12} {np.mean(nd_mean):>9.3f} {np.mean(nd_median):>10.3f} "
+            f"{np.mean(pct_03):>8.2%} {np.mean(pct_05):>8.2%} {np.mean(pct_07):>8.2%} {len(nd_mean):>6}"
         )
 
     # --- Top-K correspondence diagnostic ---

@@ -388,6 +388,41 @@ Prochain test recommandé : comparer `count` / `count_over_mean_residual` /
 Chamfer symétrique) plutôt que continuer à itérer sur des fonctions de score purement
 distance.
 
+**Résultat (2026-06-27) : distance-only épuisé, confirmé sur 3 formules de score.**
+`Pose@30` reste ~5.7-6.3% et `RotErr` ~122-127° pour `count`, `count_times_quality` ET
+`count_over_mean_residual` — quasi identiques. Plus important : **`score_gap` est positif
+dans les trois cas** (`count`: +51.8, `count_times_quality`: +23.4,
+`count_over_mean_residual`: +92.8) — la pose choisie par RANSAC score systématiquement
+plus haut que la vraie pose GT, **sous le même critère**, peu importe la formule. Donc le
+problème n'est pas la formule de score : la distance pure entre points ne suffit pas à
+discriminer une pose fausse d'une pose vraie sur ces surfaces de fracture (une pose fausse
+a réellement un ensemble de points plus proches, en nombre et en qualité moyenne). Chaîne
+de preuve complète : (1) Oracle Kabsch confirme le pipeline de pose sain (RotErr~8.2° à
+tau=0.03) ; (2) `gt_edge` donne un signal de correspondance réel (`CorrPrec`~22.8%, pas
+une absence totale) ; (3) aucune reformulation distance-only ne corrige le biais de score.
+**Décision : passer à une information indépendante de la distance point-point — les
+normales (Phase 2C).**
+
+## Phase 2C — Contrainte sur les normales (en cours)
+
+Étape 1 (diagnostic, pas de filtre dur) — implémenté dans `phase2_geometric_baseline.py`,
+nouveau tableau `NORMAL ORIENTATION DIAGNOSTIC` : sur les correspondances oracle-correctes
+de `gt_edge` (correctes sous la vraie pose GT, pas pilotées par le descripteur), calcule
+`dot(R_ij_gt @ n_i, n_j)` — une vraie zone de contact devrait donner `dot ≈ -1`. Mesure
+`MeanDot`/`MedianDot`/`%dot<-0.3`/`%dot<-0.5`/`%dot<-0.7`. Lecture : médiane nettement
+négative + beaucoup de `dot<-0.5` → normales exploitables comme opposées ; `|dot|` proche
+de 1 mais signe instable → utiliser `|dot|` plutôt qu'un test d'opposition strict ;
+dispersion sans structure → normales trop bruitées, ne pas filtrer dur dessus.
+
+Étapes 2-3 (pas encore implémentées, dépendent du résultat de l'étape 1) :
+- Critère d'inlier combiné : `distance < tau_dist ET dot(R @ n_i, n_j) < tau_normal`,
+  tester `tau_normal ∈ {-0.3, -0.5, -0.7}` en commençant par le plus permissif (-0.3).
+- Score soft normal-aware : `score = n_inliers × mean(clamp(-dot, 0, 1))`, ou combiné
+  avec la qualité de distance (`dist_quality × normal_quality`).
+- Bon signe attendu : `score_gap` diminue fortement (idéalement négatif), `Pose@30`
+  passe au-dessus de 10-15%, `RotErr` nettement sous 120°. `InlierRatio`/`RansacValid`
+  peuvent baisser — acceptable, on préfère moins de poses candidates mais plus fiables.
+
 **Protocole en deux temps** (ne pas mélanger les deux questions) :
 - **A. Registration sur paires positives** (`graph[i,j]=True` uniquement, ce que fait déjà
   `phase2_geometric_baseline.py`) : rotation/translation error, inlier_ratio,
