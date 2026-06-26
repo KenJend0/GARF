@@ -78,6 +78,7 @@ MIN_INLIERS = 3
 # which says RANSAC produced *a* pose, not that it is a *correct* one: 3 inliers can
 # satisfy the residual threshold by geometric coincidence on a wrong pose).
 POSE_SUCCESS_THRESHOLDS = [(15.0, 0.05), (30.0, 0.1)]
+TOPK_DIAG_LIST = [5, 10, 20]
 
 
 def quat_wxyz_to_rotmat(quat_wxyz: np.ndarray) -> np.ndarray:
@@ -294,9 +295,11 @@ def main():
                             best_j = d_mat.argmin(axis=1)             # (Ni,)
 
                             P_cand = raw_per_k[k_i][idx_i_keep]
-                            Q_cand = raw_per_k[k_j][idx_j_keep][best_j]
+                            P_cand_all = raw_per_k[k_i][idx_i_keep]   # (Ni,3) -- all filtered i points
+                            Q_full = raw_per_k[k_j][idx_j_keep]       # (Nj,3) -- all filtered j points
+                            Q_cand = Q_full[best_j]
 
-                            # Diagnostic: is the 1-NN candidate set itself usable at all?
+                            # Diagnostic 1: is the 1-NN candidate set itself usable at all?
                             # A candidate is "correct" if it's geometrically consistent with
                             # the TRUE pose (independent of whether RANSAC/Kabsch can recover
                             # that pose from the candidate set). Distinguishes "descriptor too
@@ -307,6 +310,30 @@ def main():
                             corr_precision = float((resid_under_gt < RANSAC_THRESH).mean())
                             results[strategy]["correspondence_precision"].append(corr_precision)
                             results[strategy]["n_candidates_diag"].append(len(P_cand))
+
+                            # Diagnostic 2: top-K correspondence recall. Among i-points that DO
+                            # have at least one geometrically correct j-point available in the
+                            # filtered set (avail_mask -- isolates the multi-neighbor confound:
+                            # if False, no true match exists here regardless of descriptor
+                            # quality), does the true match appear within the descriptor's
+                            # top-K nearest neighbors? Separates "descriptor has weak signal,
+                            # 1-NN is too strict" from "descriptor has no signal at all".
+                            target_all = (R_ij_gt @ P_cand_all.T).T + t_ij_gt          # (Ni,3)
+                            resid_mat = np.linalg.norm(
+                                target_all[:, None, :] - Q_full[None, :, :], axis=-1
+                            )                                                          # (Ni,Nj)
+                            correct_mat = resid_mat < RANSAC_THRESH                     # (Ni,Nj)
+                            avail_mask = correct_mat.any(axis=1)                        # (Ni,)
+                            results[strategy]["avail_rate"].append(float(avail_mask.mean()))
+                            if avail_mask.any():
+                                rank = np.argsort(d_mat, axis=1)                        # (Ni,Nj)
+                                for k_top in TOPK_DIAG_LIST:
+                                    k_eff = min(k_top, rank.shape[1])
+                                    topk_idx = rank[:, :k_eff]
+                                    hit = np.take_along_axis(correct_mat, topk_idx, axis=1).any(axis=1)
+                                    results[strategy][f"topk_recall_{k_top}"].append(
+                                        float(hit[avail_mask].mean())
+                                    )
 
                             pose = ransac_pose(P_cand, Q_cand, rng)
                             if pose is None:
@@ -367,6 +394,30 @@ def main():
             + " ".join(pose_strs)
             + f" {rot_str} {trans_str} {ir_str} {len(valid):>8}"
         )
+
+    # --- Top-K correspondence diagnostic ---
+    print("\n" + "=" * 100)
+    print(f"TOP-K CORRESPONDENCE DIAGNOSTIC — {args.categories}/{args.split}")
+    print("  avail_rate: fraction of i-points with >=1 geometrically correct j-point in the")
+    print("  filtered set (isolates the multi-neighbor confound). topk_recall_K (computed only")
+    print("  over available points): does the true match appear in the descriptor's top-K?")
+    print("=" * 100)
+    topk_cols = [f"Top{k}" for k in TOPK_DIAG_LIST]
+    header2 = (
+        f"  {'Strategy':<12} {'AvailRate':>10} " + " ".join(f"{c:>10}" for c in topk_cols)
+    )
+    print(header2)
+    print("  " + "-" * (len(header2) - 2))
+    for strategy in MASK_STRATEGIES:
+        d = results[strategy]
+        avail = d.get("avail_rate", [])
+        if not avail:
+            continue
+        topk_strs = []
+        for k in TOPK_DIAG_LIST:
+            vals = d.get(f"topk_recall_{k}", [])
+            topk_strs.append(f"{np.mean(vals):>10.2%}" if vals else f"{'n/a':>10}")
+        print(f"  {strategy:<12} {np.mean(avail):>10.2%} " + " ".join(topk_strs))
 
 
 if __name__ == "__main__":

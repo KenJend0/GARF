@@ -167,18 +167,47 @@ est recalculable directement depuis les points : `scale = max(abs(points))`).
   rotation_error < seuil_rot ET translation_error < seuil_trans (ex: `pose_success@15deg_0.05`,
   `pose_success@30deg_0.1`). C'est la métrique qui compte réellement pour juger le matching.
 
-**Résultat préliminaire (2026-06-26, premier run everyday/val, AVANT le diagnostic
-`correspondence_precision`)** : `ransac_valid_rate=100%` partout y compris `random`
-(confirme que ce critère est trivialement satisfait, cf. ci-dessus) ; `pose_success`
-quasi nul (0-1.6%) **y compris sur le masque GT**, erreur de rotation moyenne ~127-130°
-(proche de la moyenne attendue entre deux rotations SO(3) indépendantes, ~120° — le
-pipeline ne fait essentiellement pas mieux qu'aléatoire). Avant de conclure "matching
-naïf insuffisant", ajout du diagnostic `correspondence_precision` pour distinguer un
-descripteur trop faible d'un problème de masque mélangeant plusieurs interfaces
-(le même confound fragment-level vs pair-specific identifié en Phase 1 : le masque GT
-garde tous les points fracture du fragment, y compris ceux qui touchent un AUTRE voisin
-que celui de l'arête évaluée — ces points n'ont aucune vraie correspondance possible dans
-`j`, et polluent les candidats 1-NN indépendamment de la qualité du descripteur).
+**Résultat Phase 2A (2026-06-26, everyday/val, `scripts/phase2_geometric_baseline.py`) :**
+`ransac_valid_rate=100%` partout y compris `random` (confirme que ce critère est
+trivialement satisfait, cf. ci-dessus — non-informatif) ; `pose_success` quasi nul
+(0-1.6%) **y compris sur le masque GT**, erreur de rotation moyenne ~126-128° (proche de
+la moyenne attendue entre deux rotations SO(3) indépendantes, ~120°). Diagnostic
+`correspondence_precision` : **gt/thresh0.2/0.3/0.5 ≈ 6.4-6.6%, random/all ≈ 2.7%** — soit
+~2.4x plus de bonnes correspondances avec le masque fracture qu'avec des points
+quelconques (le filtre fracture *aide*), et les masques CNN sont quasiment au niveau de
+l'oracle GT (le CNN n'est pas le facteur limitant ici). Mais en absolu, même à l'oracle
+GT, 93.4% des correspondances 1-NN restent fausses — bien trop bas pour un RANSAC à
+échantillon minimal (3 points) : `P(triplet tout correct) ≈ 0.065³ ≈ 0.03%` par tirage,
+~13% sur 500 itérations en théorie, mais en pratique RANSAC peut aussi verrouiller sur un
+faux consensus géométriquement cohérent plutôt que sur le bon triplet, ce qui explique le
+quasi-zéro observé.
+
+**Conclusion Phase 2A officielle :** le filtrage fracture améliore bien la qualité des
+correspondances candidates, et les masques CNN se comportent presque comme le masque GT
+— **le CNN n'est pas le goulot d'étranglement**. En revanche, un matching 1-NN basé sur
+4 descripteurs scalaires invariants (consistency/curvature/roughness/dist_to_centroid)
+est insuffisant pour produire une pose fiable. L'échec vient du module de matching
+géométrique naïf, pas du prior CNN ni d'un bug de convention de pose (code revérifié,
+RANSAC/Kabsch/formule R_ij-t_ij confirmés corrects). Conforme à la branche prévue du plan
+("GT échoue aussi → matching naïf insuffisant").
+
+**Phase 2B — améliorer la génération de correspondances avant de refaire RANSAC/Kabsch**
+(ordre à respecter, chaque étape diagnostique avant d'agir) :
+1. **Diagnostic top-K** (implémenté dans `phase2_geometric_baseline.py`) : `avail_rate`
+   (fraction de points i ayant ≥1 vraie correspondance disponible dans le masque de j —
+   isole le confound multi-voisins) et `topk_recall_{5,10,20}` (la bonne correspondance
+   apparaît-elle dans le top-K du classement descripteur, même si pas en top-1 ?). Si la
+   bonne correspondance n'apparaît même pas en top-20, le descripteur n'a quasi aucun
+   signal ; si elle y apparaît souvent, le 1-NN est juste trop strict.
+2. Mutual nearest neighbor / ratio test (type Lowe) pour réduire le nombre de
+   correspondances tout en augmentant `correspondence_precision` (cible indicative :
+   15-25%, pas besoin de 80%).
+3. Descripteurs plus riches si 1-2 ne suffisent pas : FPFH/SHOT/spin-images,
+   eigenvalues multi-échelle, histogrammes de patch local, ou fusionner avec les features
+   CNN du Step 15 (le plus prometteur — relie le prior appris directement au matching).
+4. RANSAC plus strict après hypothèse de pose : contraintes géométriques additionnelles
+   (normales opposées après transformation, absence de pénétration/overlap absurde,
+   score restreint aux points fracture uniquement) pour éviter le faux consensus.
 
 **Protocole en deux temps** (ne pas mélanger les deux questions) :
 - **A. Registration sur paires positives** (`graph[i,j]=True` uniquement, ce que fait déjà
