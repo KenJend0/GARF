@@ -23,7 +23,14 @@ pointclouds_gt — c'est l'information réellement disponible à l'inférence. L
 de label) pour revenir au repère "centré-roté" où la pose relative GT est définie
 (cf. formule dans PLAN_REASSEMBLY_MODULE.md, Phase 0).
 
-Deux métriques de succès distinctes (à ne pas confondre, cf. plan) :
+Trois métriques distinctes, à ne pas confondre (cf. plan) :
+  - correspondence_precision (diagnostic, calculé indépendamment de RANSAC) : fraction des
+    candidats 1-NN qui sont géométriquement corrects SOUS LA VRAIE POSE GT. Isole "le
+    descripteur/la mise en correspondance produit-elle de vrais matches du tout ?" d'un
+    éventuel échec de RANSAC/Kabsch en aval. Si ce chiffre est ~0%, RANSAC ne peut
+    structurellement pas trouver la bonne pose, quel que soit le nombre d'itérations --
+    ce n'est alors pas un problème de RANSAC mais de descripteur (ou de masque qui mélange
+    plusieurs interfaces, cf. le même problème fragment-level identifié en Phase 1).
   - ransac_valid : RANSAC a trouvé >=3 inliers -- dit seulement qu'une pose a été produite,
     pas qu'elle est correcte (3 inliers peuvent satisfaire le seuil résiduel par hasard).
   - pose_success_(rot_thresh, trans_thresh) : la pose estimée est réellement proche de la
@@ -289,6 +296,18 @@ def main():
                             P_cand = raw_per_k[k_i][idx_i_keep]
                             Q_cand = raw_per_k[k_j][idx_j_keep][best_j]
 
+                            # Diagnostic: is the 1-NN candidate set itself usable at all?
+                            # A candidate is "correct" if it's geometrically consistent with
+                            # the TRUE pose (independent of whether RANSAC/Kabsch can recover
+                            # that pose from the candidate set). Distinguishes "descriptor too
+                            # weak" from "no true correspondence exists among candidates"
+                            # (e.g. fragment touches >1 neighbor, mask mixes multiple interfaces).
+                            pred_under_gt = (R_ij_gt @ P_cand.T).T + t_ij_gt
+                            resid_under_gt = np.linalg.norm(pred_under_gt - Q_cand, axis=1)
+                            corr_precision = float((resid_under_gt < RANSAC_THRESH).mean())
+                            results[strategy]["correspondence_precision"].append(corr_precision)
+                            results[strategy]["n_candidates_diag"].append(len(P_cand))
+
                             pose = ransac_pose(P_cand, Q_cand, rng)
                             if pose is None:
                                 results[strategy]["ransac_valid"].append(False)
@@ -320,7 +339,7 @@ def main():
     print("=" * 100)
     pose_success_cols = [f"Pose@{t[0]:g}d_{t[1]:g}" for t in POSE_SUCCESS_THRESHOLDS]
     header = (
-        f"  {'Strategy':<12} {'RansacValid':>12} "
+        f"  {'Strategy':<12} {'CorrPrec':>10} {'RansacValid':>12} "
         + " ".join(f"{c:>14}" for c in pose_success_cols)
         + f" {'RotErr(deg)':>12} {'TransErr':>10} {'InlierRatio':>12} {'n_edges':>8}"
     )
@@ -332,9 +351,11 @@ def main():
         if not valid:
             continue
         ransac_valid_rate = np.mean(valid)
+        corr_prec = d.get("correspondence_precision", [])
         rot_errs = d.get("rot_err_deg", [])
         trans_errs = d.get("trans_err", [])
         inlier_ratios = d.get("inlier_ratio", [])
+        corr_str = f"{np.mean(corr_prec):>10.2%}" if corr_prec else f"{'n/a':>10}"
         rot_str = f"{np.mean(rot_errs):>12.2f}" if rot_errs else f"{'n/a':>12}"
         trans_str = f"{np.mean(trans_errs):>10.4f}" if trans_errs else f"{'n/a':>10}"
         ir_str = f"{np.mean(inlier_ratios):>12.2%}" if inlier_ratios else f"{'n/a':>12}"
@@ -342,7 +363,7 @@ def main():
             f"{np.mean(d[f'pose_success_{t}']):>14.2%}" for t in POSE_SUCCESS_THRESHOLDS
         ]
         print(
-            f"  {strategy:<12} {ransac_valid_rate:>12.2%} "
+            f"  {strategy:<12} {corr_str} {ransac_valid_rate:>12.2%} "
             + " ".join(pose_strs)
             + f" {rot_str} {trans_str} {ir_str} {len(valid):>8}"
         )

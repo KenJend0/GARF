@@ -155,13 +155,30 @@ les inliers. Stratégies comparées : `gt`, `thresh0.2/0.3/0.5` (issus de la Pha
 non-assemblé après réapplication de `scale` (cf. Phase 0 — pas une fuite de label, `scale`
 est recalculable directement depuis les points : `scale = max(abs(points))`).
 
-**Deux métriques de succès distinctes (à ne pas confondre)** :
+**Trois métriques distinctes (à ne pas confondre)** :
+- `correspondence_precision` (diagnostic) : fraction des candidats 1-NN géométriquement
+  corrects sous la vraie pose GT, calculée indépendamment de RANSAC. Isole "existe-t-il de
+  vraies correspondances parmi les candidats ?" d'un échec RANSAC/Kabsch en aval — si ~0%,
+  RANSAC ne peut structurellement pas réussir, quel que soit le nombre d'itérations.
 - `ransac_valid_rate` : fraction des paires où RANSAC trouve ≥3 inliers. Dit seulement
   que RANSAC a produit *une* pose, pas qu'elle est bonne (3 inliers peuvent correspondre à
   une pose fausse par coïncidence géométrique).
 - `pose_success_rate@(seuil_rot, seuil_trans)` : fraction des paires où la pose estimée a
   rotation_error < seuil_rot ET translation_error < seuil_trans (ex: `pose_success@15deg_0.05`,
   `pose_success@30deg_0.1`). C'est la métrique qui compte réellement pour juger le matching.
+
+**Résultat préliminaire (2026-06-26, premier run everyday/val, AVANT le diagnostic
+`correspondence_precision`)** : `ransac_valid_rate=100%` partout y compris `random`
+(confirme que ce critère est trivialement satisfait, cf. ci-dessus) ; `pose_success`
+quasi nul (0-1.6%) **y compris sur le masque GT**, erreur de rotation moyenne ~127-130°
+(proche de la moyenne attendue entre deux rotations SO(3) indépendantes, ~120° — le
+pipeline ne fait essentiellement pas mieux qu'aléatoire). Avant de conclure "matching
+naïf insuffisant", ajout du diagnostic `correspondence_precision` pour distinguer un
+descripteur trop faible d'un problème de masque mélangeant plusieurs interfaces
+(le même confound fragment-level vs pair-specific identifié en Phase 1 : le masque GT
+garde tous les points fracture du fragment, y compris ceux qui touchent un AUTRE voisin
+que celui de l'arête évaluée — ces points n'ont aucune vraie correspondance possible dans
+`j`, et polluent les candidats 1-NN indépendamment de la qualité du descripteur).
 
 **Protocole en deux temps** (ne pas mélanger les deux questions) :
 - **A. Registration sur paires positives** (`graph[i,j]=True` uniquement, ce que fait déjà
