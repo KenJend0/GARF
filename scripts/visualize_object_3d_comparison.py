@@ -420,10 +420,12 @@ def export_plotly_html(panels: list, out_path: Path, title: str = "Fracture 3D",
     scene_updates = {f"scene{'' if i == 0 else i+1}": scene_cfg
                      for i in range(len(panels))}
 
+    panel_width = 480
     fig.update_layout(
         title=title,
-        height=760,
-        margin=dict(b=120),
+        width=panel_width * n_panels,
+        height=800,
+        margin=dict(b=170),
         **scene_updates,
     )
 
@@ -448,8 +450,8 @@ def export_plotly_html(panels: list, out_path: Path, title: str = "Fracture 3D",
                 )
                 intact_pts = len(pts_all) - frac_pts
                 text = (
-                    f"<b>Fracture pts:</b> {frac_pts:,}  |  "
-                    f"<b>Intact pts:</b> {intact_pts:,}  |  "
+                    f"<b>Fracture pts:</b> {frac_pts:,}<br>"
+                    f"<b>Intact pts:</b> {intact_pts:,}<br>"
                     f"<b>Total:</b> {len(pts_all):,}"
                 )
             else:
@@ -460,19 +462,21 @@ def export_plotly_html(panels: list, out_path: Path, title: str = "Fracture 3D",
                     f"<b style='color:#2196F3'>FN</b> {m['fn']:,}  "
                     f"<b>TN</b> {m['tn']:,}"
                     f"<br>"
-                    f"F1 <b>{m['f1']:.3f}</b>  |  "
-                    f"Prec <b>{m['prec']:.3f}</b>  |  "
-                    f"Rec <b>{m['rec']:.3f}</b>  |  "
-                    f"FDR <b>{m['fdr']:.3f}</b>  |  "
+                    f"F1 <b>{m['f1']:.3f}</b><br>"
+                    f"Prec <b>{m['prec']:.3f}</b><br>"
+                    f"Rec <b>{m['rec']:.3f}</b><br>"
+                    f"FDR <b>{m['fdr']:.3f}</b><br>"
                     f"Total <b>{total:,}</b>"
                 )
             fig.add_annotation(
-                x=cx, y=-0.08,
+                x=cx, y=-0.12,
                 xref="paper", yref="paper",
+                xanchor="center", yanchor="top",
                 text=text,
                 showarrow=False,
-                font=dict(size=12, family="monospace"),
+                font=dict(size=11, family="monospace"),
                 align="center",
+                width=panel_width - 30,
                 bgcolor="rgba(245,245,245,0.9)",
                 bordercolor="#CCCCCC",
                 borderwidth=1,
