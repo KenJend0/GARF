@@ -98,15 +98,42 @@ def kabsch(P: np.ndarray, Q: np.ndarray):
     return Rmat, t
 
 
-def ransac_pose(P_cand: np.ndarray, Q_cand: np.ndarray, rng: np.random.Generator):
-    """RANSAC over candidate correspondences. Returns (R, t, n_inliers) or None."""
+def _is_dispersed(points: np.ndarray, min_dispersion: float) -> bool:
+    """True if the sampled points span at least min_dispersion (max pairwise distance).
+    Rejects near-degenerate (clustered/coplanar-ish) samples, which on a locally flat
+    fracture patch give an ill-conditioned in-plane rotation estimate (Kabsch SVD has
+    little signal to constrain tangential rotation/translation when the sample barely
+    spans the patch)."""
+    if min_dispersion <= 0:
+        return True
+    d = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=-1)
+    return bool(d.max() >= min_dispersion)
+
+
+def ransac_pose(
+    P_cand: np.ndarray, Q_cand: np.ndarray, rng: np.random.Generator,
+    sample_size: int = 3, min_dispersion: float = 0.0, max_resample_attempts: int = 10,
+):
+    """RANSAC over candidate correspondences. Returns (R, t, n_inliers) or None.
+
+    sample_size > 3 makes each hypothesis an over-determined (least-squares) Kabsch fit
+    instead of an exact minimal fit -- less prone to phantom consensus from a single
+    near-degenerate (coplanar/clustered) triplet on a locally flat fracture surface.
+    min_dispersion additionally rejects samples that don't spatially spread across the
+    patch (resampled up to max_resample_attempts times per iteration).
+    """
     n = len(P_cand)
-    if n < MIN_INLIERS:
+    if n < sample_size:
         return None
 
     best_inliers, best_mask = -1, None
     for _ in range(RANSAC_ITERS):
-        sample = rng.choice(n, size=3, replace=False)
+        for _attempt in range(max_resample_attempts):
+            sample = rng.choice(n, size=sample_size, replace=False)
+            if _is_dispersed(P_cand[sample], min_dispersion):
+                break
+        else:
+            continue  # no dispersed sample found within budget, skip this iteration
         try:
             Rmat, t = kabsch(P_cand[sample], Q_cand[sample])
         except np.linalg.LinAlgError:
@@ -167,6 +194,18 @@ def main():
              "Each strategy costs roughly the same O(Ni*Nj) work -- restricting "
              "this is the main lever to cut runtime (a full run took 1h05 for "
              "60 batches / 634 edges / 6 strategies).",
+    )
+    parser.add_argument(
+        "--ransac_sample_size", type=int, default=3,
+        help="RANSAC minimal-sample size for Kabsch (default 3, the rigid-transform "
+             "minimum). >3 gives an over-determined least-squares fit per hypothesis, "
+             "less prone to a single near-degenerate/coplanar sample dominating.",
+    )
+    parser.add_argument(
+        "--ransac_min_dispersion", type=float, default=0.0,
+        help="Reject RANSAC samples whose points don't spread at least this much "
+             "(max pairwise distance) -- guards against near-degenerate samples on a "
+             "locally flat fracture patch. 0 = disabled (default).",
     )
     args = parser.parse_args()
     mask_strategies = args.strategies.split(",") if args.strategies else ALL_MASK_STRATEGIES
@@ -376,7 +415,11 @@ def main():
                                         float(hit[avail_mask].mean())
                                     )
 
-                            pose = ransac_pose(P_cand, Q_cand, rng)
+                            pose = ransac_pose(
+                                P_cand, Q_cand, rng,
+                                sample_size=args.ransac_sample_size,
+                                min_dispersion=args.ransac_min_dispersion,
+                            )
                             if pose is None:
                                 results[strategy]["ransac_valid"].append(False)
                                 for thresh in POSE_SUCCESS_THRESHOLDS:
@@ -404,6 +447,12 @@ def main():
 
     print("\n" + "=" * 100)
     print(f"PHASE 2 — GEOMETRIC BASELINE MATCHING — {args.categories}/{args.split}")
+    print(f"  (RANSAC sample_size={args.ransac_sample_size}, min_dispersion={args.ransac_min_dispersion})")
+    print("  CorrPrec = inlier ratio of the candidate set under the TRUE GT pose.")
+    print("  InlierRatio = inlier ratio under the pose RANSAC actually picked.")
+    print("  InlierRatio > CorrPrec means RANSAC's scoring objectively prefers a WRONG")
+    print("  pose over the true one -- a sampling fix alone won't help, the inlier")
+    print("  threshold/scoring criterion itself needs to change.")
     print("=" * 100)
     pose_success_cols = [f"Pose@{t[0]:g}d_{t[1]:g}" for t in POSE_SUCCESS_THRESHOLDS]
     header = (

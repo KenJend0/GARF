@@ -214,6 +214,31 @@ RANSAC/Kabsch/formule R_ij-t_ij confirmés corrects). Conforme à la branche pr�
    pour isoler l'effet du confound de celui du descripteur. **Pour contrôler le coût**,
    un flag `--strategies` permet de ne lancer qu'un sous-ensemble (chaque stratégie coûte
    ~le même travail O(Ni×Nj) ; restreindre est le levier principal pour réduire le temps).
+
+   **Résultat `gt_edge` (2026-06-27)** : `CorrPrec` 6.56%→28.82% (×4.4), `AvailRate`
+   38%→100% comme attendu (par construction). Mais `pose_success`/`RotErr` ne bougent
+   quasiment pas (`Pose@30°/0.1` 1.26%→4.26%, `RotErr` reste ~127-128°) malgré un
+   `InlierRatio` qui double (20.8%→47.4%). **Test oracle décisif, déductible directement
+   des colonnes déjà calculées** (pas besoin de relancer) : `CorrPrec` est exactement
+   l'inlier ratio sous la VRAIE pose GT (même calcul, même seuil) ; `InlierRatio` est
+   l'inlier ratio sous la pose que RANSAC a choisie. Sur `gt_edge` : `InlierRatio`
+   (47.41%) **>** `CorrPrec` (28.82%) → le critère de score de RANSAC préfère
+   objectivement une pose fausse à la vraie. Donc le sampling seul ne suffira pas, il
+   faut aussi revoir le critère de score. Hypothèse retenue : les surfaces de fracture
+   sont localement quasi-planes — une pose fausse qui glisse/tourne dans le plan de
+   contact peut accumuler autant ou plus d'inliers apparents qu'une pose correcte (faux
+   consensus géométriquement cohérent), surtout avec un triplet minimal proche de la
+   dégénérescence coplanaire.
+
+   **Mitigation testée** : `ransac_pose()` accepte maintenant `sample_size` (>3 → fit
+   Kabsch sur-déterminé par hypothèse, moins sensible à un triplet quasi-coplanaire) et
+   `min_dispersion` (rejette les échantillons trop peu dispersés spatialement). CLI :
+   `--ransac_sample_size`, `--ransac_min_dispersion`. Le tableau de sortie affiche
+   désormais explicitement la légende `CorrPrec` vs `InlierRatio` pour éviter d'avoir à
+   recalculer la comparaison à la main. À tester : 3 (baseline) → 4 dispersé → 6 dispersé
+   (pas direct 8-12 : `CorrPrec³ ≈ 0.024` pour un triplet, donc un échantillon de 8 points
+   tous corrects devient très improbable — il faut un fit robuste qui tolère une partie
+   de faux dans l'échantillon, pas un échantillon plus grand mais toujours minimal/exact).
 2. Mutual nearest neighbor / ratio test (type Lowe) pour réduire le nombre de
    correspondances tout en augmentant `correspondence_precision` (cible indicative :
    15-25%, pas besoin de 80%).
