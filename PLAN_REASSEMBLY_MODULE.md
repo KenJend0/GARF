@@ -74,11 +74,29 @@ But : mesurer si le filtre CNN garde les vrais points de fracture (checkpoint
   (le recall peut s'effondrer sur les objets complexes même s'il est bon sur les objets
   simples — or c'est justement là que le prior serait le plus utile)
 
-Tableau attendu : Split × Fragments × Filtrage → Recall fracture, Precision fracture,
-Points gardés, Reduction ratio.
+**Deux niveaux de recall** (ajout après relecture des résultats Phase 0) :
+- `fragment_fracture_recall@K` : recall sur tous les points fracture GT d'un fragment.
+  `fracture_surface_gt` est un label **fragment-level**, pas pair-specific — un fragment
+  touchant plusieurs voisins a des points fracture vers chacun d'eux, donc ce recall seul
+  ne dit pas si le filtre garde les BONS points pour une paire (i,j) donnée.
+- `edge_contact_recall@K` : pour chaque arête `graph[i,j]=True`, reconstruit les fragments
+  en pose GT (Phase 0 confirmée), définit `contact_i_to_j` = points fracture de i dont le
+  NN dans j est `< eps`, et mesure si le filtre garde ces points spécifiquement. C'est la
+  métrique pertinente pour le matching pair-à-pair (on veut les bons points de contact
+  pour le bon voisin, pas juste "des points cassés"). Tester deux eps : 0.02 (strict) et
+  0.05 (tolérant, déjà utilisé en Phase 0) — si les conclusions diffèrent fortement entre
+  les deux, la définition du contact est sensible, à noter pour l'évaluation pairwise.
 
-Décision : Recall@512 ou @1024 > 90% → bon, passer à la Phase 2. Entre 80-90% →
-exploitable mais garder plus de points. < 80% → corriger le filtre avant de continuer.
+Tableau attendu : Split × Fragments × Filtrage → fragment_fracture_recall,
+edge_contact_recall@eps∈{0.02,0.05}, Precision, Points gardés, Reduction ratio.
+Implémenté dans `scripts/phase1_recall_at_k.py`.
+
+Décision (sur fragment_fracture_recall@512/1024 ET edge_contact_recall@512/1024) :
+- Les deux bons (>90%) → go Phase 2 (baseline géométrique).
+- Fracture recall bon mais edge contact recall mauvais → le CNN détecte la fracture mais
+  pas forcément les zones utiles pour chaque paire spécifique ; matching plus difficile,
+  garder plus de points ou faire du filtrage pair-specific.
+- Fracture recall mauvais → stop, retravailler le filtre avant le matching.
 
 ## Phase 2 — Baseline géométrique (seulement si Phase 0 + Phase 1 passent)
 
