@@ -37,9 +37,13 @@ Avant tout code de matching, confirmer empiriquement (pas juste "le champ existe
   `pointclouds` (l'input désassemblé). Le quaternion stocké est la rotation **inverse**
   (`rot_mat.T`), c'est-à-dire la rotation que le modèle doit prédire pour "défaire" la
   rotation et retrouver l'orientation assemblée.
-- Donc, **formule de reconstruction** : `pointclouds_gt[part] ≈ R(quaternion) @ pointclouds[part] * scale + translation`
-  (le facteur `scale` n'existe que dans `BreakingBadWeighted`, qui renormalise l'input
-  après rotation ; absent dans `BreakingBadUniform`).
+- Donc, **formule de reconstruction** : `pointclouds_gt[part] ≈ R(quaternion) @ (pointclouds[part] * scale[part]) + translation`.
+  Le facteur `scale` (champ `sample["scale"]`) existe dans **les deux** classes (`BreakingBadUniform`
+  ET `BreakingBadWeighted`) : `transform()` divise les points par-fragment par
+  `max(abs(points après rotation))` en toute fin de pipeline, donc il faut le réappliquer
+  avant d'inverser la rotation, sinon le résidu de reconstruction reste de l'ordre de la
+  taille de l'objet (~0.5-0.8) au lieu d'être quasi nul (erreur trouvée lors du premier
+  run de `scripts/phase0_check_pose_convention.py` sur le serveur, corrigée).
 - Pose relative entre deux fragments i,j adjacents (dans le repère assemblé commun) :
   `R_ij = R_j^{-1} @ R_i`, `t_ij = R_j^{-1} @ (t_i - t_j)` (mappe l'input du fragment i vers
   le repère de l'input du fragment j).

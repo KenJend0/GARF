@@ -45,12 +45,18 @@ def quat_wxyz_to_rotmat(quat_wxyz: np.ndarray) -> np.ndarray:
     return R.from_quat(quat_xyzw).as_matrix()
 
 
-def reconstruct_object(pointclouds, quaternions, translations, num_parts):
-    """Applique R(quat) @ p + t à chaque fragment. Retourne une liste de (N,3) reconstruits."""
+def reconstruct_object(pointclouds, quaternions, translations, scale, num_parts):
+    """Applique R(quat) @ (p * scale) + t à chaque fragment. Retourne une liste de (N,3).
+
+    BreakingBadUniform.transform() divise pointclouds par un facteur 'scale' par fragment
+    (np.max(np.abs(pointclouds), axis=(1,2))) APRES la rotation/centrage — il faut donc
+    le réappliquer avant d'inverser la rotation, sinon le résidu reste de l'ordre de la
+    taille de l'objet (~0.5-0.8) au lieu de quasi nul.
+    """
     reconstructed = []
     for part_idx in range(num_parts):
         rot_mat = quat_wxyz_to_rotmat(quaternions[part_idx])
-        pc = pointclouds[part_idx]  # (N, 3), input désassemblé
+        pc = pointclouds[part_idx] * scale[part_idx]  # (N, 3), annule la normalisation
         rec = (rot_mat @ pc.T).T + translations[part_idx][None, :]
         reconstructed.append(rec)
     return reconstructed
@@ -89,13 +95,14 @@ def main():
         pointclouds_gt = sample["pointclouds_gt"]          # (max_parts, N, 3) — assemblé GT
         quaternions = sample["quaternions"]                # (max_parts, 4) — [w,x,y,z]
         translations = sample["translations"]               # (max_parts, 3)
+        scale = sample["scale"]                              # (max_parts, 1)
         fracture_surface_gt = sample["fracture_surface_gt"]  # (max_parts, N)
         graph = sample["graph"]                              # (max_parts, max_parts) bool
 
         print(f"\n=== Objet {obj_idx}: {name} ({num_parts} fragments) ===")
 
         # --- Test 1 : résidu de reconstruction point-à-point ---
-        reconstructed = reconstruct_object(pointclouds, quaternions, translations, num_parts)
+        reconstructed = reconstruct_object(pointclouds, quaternions, translations, scale, num_parts)
         residuals = []
         for part_idx in range(num_parts):
             err = np.linalg.norm(reconstructed[part_idx] - pointclouds_gt[part_idx], axis=1)
