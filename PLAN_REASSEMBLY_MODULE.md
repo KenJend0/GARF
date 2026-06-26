@@ -313,6 +313,31 @@ monte fortement mais `Pose@30` reste plat, le problème est le score RANSAC (ét
 que les correspondances ; si `CorrPrec` ne bouge presque pas, les descripteurs sont trop
 faibles pour qu'un filtrage de correspondances aide (passer direct à l'étape 3).
 
+**Résultat sanity check + mutual-NN (2026-06-27)** : `OracleRotErr`≈11.8°/`OracleTransErr`
+≈0.035 (Kabsch simple sur NN sous la vraie pose GT, pas piloté par le descripteur) — bien
+loin du ~125° quasi-aléatoire observé partout ailleurs. **Confirme que le pipeline de
+pose/scale/Kabsch fonctionne** : le verrou est bien dans la recherche de correspondances +
+le scoring RANSAC, pas dans la convention de pose (résidu non-nul normal, dû à la
+tolérance eps=0.05 de l'oracle, pas un bug). `mutual` vs `1nn` sur la même population
+(717 arêtes) : amélioration marginale (`CorrPrec` 34.09%→35.19%, `Pose@30` 5.02%→5.16%,
+`RotErr` 127.58°→124.20°) — pas assez pour justifier le sweep complet `ratio0.8/0.7/0.6`.
+**Décision : saut direct vers l'étape 4 (scoring RANSAC), sweep `ratio0.7` repoussé à plus
+tard comme mini-ablation complémentaire si besoin.**
+
+**Étape 4 (scoring RANSAC) — implémenté dans `phase2_geometric_baseline.py` :**
+- `--inlier_thresh` (remplace l'ancienne constante fixe `RANSAC_THRESH=0.05`) — appliqué
+  partout de façon cohérente (consensus RANSAC, `CorrPrec`/`avail_rate`/oracle) pour que
+  `Gap = InlierRatio - CorrPrec` reste interprétable au même seuil. À tester : 0.05
+  (référence) → 0.03 → 0.02 → 0.01.
+- `--score_mode` : `count` (comptage brut, défaut/historique — favorise un faux consensus
+  large mais peu précis) vs `count_minus_mean_residual` / `count_minus_median_residual`
+  (pénalise les inliers "lâches" : `score = n_in - λ * résidu_moyen_ou_médian_des_inliers`).
+  `--score_lambda` (défaut 50.0) règle le poids de la pénalité.
+- Ordre de test recommandé : `gt_edge`, `sample_size=6`/`min_dispersion=0.1` comme base,
+  sweep `--inlier_thresh` d'abord (seul, `score_mode=count`), puis `--score_mode` une fois
+  un bon seuil trouvé. Bon signe attendu : `Gap` baisse fortement, `Pose@30` 5%→10-20%,
+  `RotErr` nettement sous 100° (même imparfait, ça validerait que le verrou était le score).
+
 **Protocole en deux temps** (ne pas mélanger les deux questions) :
 - **A. Registration sur paires positives** (`graph[i,j]=True` uniquement, ce que fait déjà
   `phase2_geometric_baseline.py`) : rotation/translation error, inlier_ratio,

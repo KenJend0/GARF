@@ -141,9 +141,29 @@ def _is_dispersed(points: np.ndarray, min_dispersion: float) -> bool:
     return bool(d.max() >= min_dispersion)
 
 
+def _hypothesis_score(resid: np.ndarray, inlier_mask: np.ndarray, score_mode: str, score_lambda: float):
+    """Score a RANSAC hypothesis. 'count' (default/legacy) is the raw inlier count --
+    this is what let a wrong but locally-consistent pose (e.g. sliding along a flat
+    fracture patch) outscore the true pose (InlierRatio > CorrPrec observed empirically).
+    The residual-penalized variants reward inlier count but penalize how loose those
+    inliers are on average, so a tight-but-smaller consensus can beat a loose-but-larger
+    one."""
+    n_in = int(inlier_mask.sum())
+    if n_in == 0:
+        return -np.inf, n_in
+    if score_mode == "count":
+        return float(n_in), n_in
+    if score_mode == "count_minus_mean_residual":
+        return n_in - score_lambda * float(resid[inlier_mask].mean()), n_in
+    if score_mode == "count_minus_median_residual":
+        return n_in - score_lambda * float(np.median(resid[inlier_mask])), n_in
+    raise ValueError(score_mode)
+
+
 def ransac_pose(
     P_cand: np.ndarray, Q_cand: np.ndarray, rng: np.random.Generator,
     sample_size: int = 3, min_dispersion: float = 0.0, max_resample_attempts: int = 10,
+    score_mode: str = "count", score_lambda: float = 0.0,
 ):
     """RANSAC over candidate correspondences. Returns (R, t, n_inliers) or None.
 
@@ -157,7 +177,7 @@ def ransac_pose(
     if n < sample_size:
         return None
 
-    best_inliers, best_mask = -1, None
+    best_score, best_inliers, best_mask = -np.inf, -1, None
     for _ in range(RANSAC_ITERS):
         for _attempt in range(max_resample_attempts):
             sample = rng.choice(n, size=sample_size, replace=False)
@@ -172,9 +192,9 @@ def ransac_pose(
         pred = (Rmat @ P_cand.T).T + t
         resid = np.linalg.norm(pred - Q_cand, axis=1)
         inlier_mask = resid < RANSAC_THRESH
-        n_in = int(inlier_mask.sum())
-        if n_in > best_inliers:
-            best_inliers, best_mask = n_in, inlier_mask
+        score, n_in = _hypothesis_score(resid, inlier_mask, score_mode, score_lambda)
+        if score > best_score:
+            best_score, best_inliers, best_mask = score, n_in, inlier_mask
 
     if best_inliers < MIN_INLIERS:
         return None
@@ -293,8 +313,32 @@ def main():
              "(mutual nearest neighbor), ratio<R> (Lowe's ratio test, e.g. ratio0.8), "
              "mutual_ratio<R> (both combined). See build_correspondences().",
     )
+    parser.add_argument(
+        "--inlier_thresh", type=float, default=0.05,
+        help="Inlier distance threshold (default 0.05, was previously a fixed constant). "
+             "Used consistently everywhere a 'correct' correspondence/inlier is decided: "
+             "RANSAC consensus, CorrPrec/avail_rate/oracle diagnostics. Sweeping this "
+             "tests whether 0.05 is too permissive and lets wrong poses pass as 'inlier'.",
+    )
+    parser.add_argument(
+        "--score_mode", default="count",
+        choices=["count", "count_minus_mean_residual", "count_minus_median_residual"],
+        help="RANSAC hypothesis scoring. 'count' (default/legacy) = raw inlier count, "
+             "which let a loose-but-larger wrong consensus beat a tight-but-smaller "
+             "correct one (InlierRatio > CorrPrec observed). The residual-penalized "
+             "modes subtract score_lambda * (mean/median residual among inliers).",
+    )
+    parser.add_argument(
+        "--score_lambda", type=float, default=50.0,
+        help="Residual penalty weight for --score_mode != count (default 50.0 -- "
+             "residuals are in [0, inlier_thresh), so with inlier_thresh=0.05 the max "
+             "penalty per hypothesis is ~2.5, comparable to a few inliers' worth of score).",
+    )
     args = parser.parse_args()
     mask_strategies = args.strategies.split(",") if args.strategies else ALL_MASK_STRATEGIES
+
+    global RANSAC_THRESH
+    RANSAC_THRESH = args.inlier_thresh
 
     rng = np.random.default_rng(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -554,6 +598,8 @@ def main():
                                 P_cand, Q_cand, rng,
                                 sample_size=args.ransac_sample_size,
                                 min_dispersion=args.ransac_min_dispersion,
+                                score_mode=args.score_mode,
+                                score_lambda=args.score_lambda,
                             )
                             if pose is None:
                                 record(results, results_by_group, results_by_family,
@@ -609,7 +655,8 @@ def main():
     print("\n" + "=" * 100)
     print(f"PHASE 2 — GEOMETRIC BASELINE MATCHING — {args.categories}/{args.split}")
     print(f"  (corr_mode={args.corr_mode}, RANSAC sample_size={args.ransac_sample_size}, "
-          f"min_dispersion={args.ransac_min_dispersion})")
+          f"min_dispersion={args.ransac_min_dispersion}, inlier_thresh={args.inlier_thresh}, "
+          f"score_mode={args.score_mode}, score_lambda={args.score_lambda})")
     print("  CorrPrec = inlier ratio of the candidate set under the TRUE GT pose.")
     print("  InlierRatio = inlier ratio under the pose RANSAC actually picked.")
     print("  InlierRatio > CorrPrec means RANSAC's scoring objectively prefers a WRONG")
