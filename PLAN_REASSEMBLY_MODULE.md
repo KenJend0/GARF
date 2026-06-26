@@ -98,6 +98,25 @@ Décision (sur fragment_fracture_recall@512/1024 ET edge_contact_recall@512/1024
   garder plus de points ou faire du filtrage pair-specific.
 - Fracture recall mauvais → stop, retravailler le filtre avant le matching.
 
+**Résultat (2026-06-26, `scripts/phase1_recall_at_k.py`, everyday/val + artifact/val) :**
+top-K et top-percent (budget fixe) **échouent** le critère — recall 13-73% selon la
+complexité, parce qu'un budget absolu par fragment ne suit pas la quantité réelle de
+surface de fracture (qui croît avec le nombre de fragments/voisins). En revanche, les
+filtres **par seuil de probabilité** (0.2/0.3/0.5) réussissent largement : recall
+fragment ET edge dans 84-98%, stable même sur 11+ fragments, et quasi insensible à eps
+(0.02 vs 0.05) — la définition du contact n'est pas un point fragile. Reduction ratio
+plus modeste (~30-65%, pas 80-95%) mais le signal du CNN (ranking de probabilité) est
+validé : le problème n'était pas le modèle, mais la stratégie de filtrage à budget fixe.
+
+**Critère de décision mis à jour** : on ne cherche plus un budget top-K agressif, mais un
+masque fracture **adaptatif par seuil**, à haut recall, pour construire la baseline
+géométrique. Configuration retenue pour la Phase 2 :
+- threshold 0.3 — configuration principale
+- threshold 0.5 — version plus compacte (plus de reduction, moins de recall/precision)
+- threshold 0.2 — oracle "safe recall" (recall max, moins de reduction)
+- masque fracture GT — référence haute (isole la responsabilité CNN vs matching, cf. plan
+  Phase 2 ci-dessous)
+
 ## Phase 2 — Baseline géométrique (seulement si Phase 0 + Phase 1 passent)
 
 Pipeline minimal, sans réseau appris :
@@ -113,6 +132,17 @@ Lecture des résultats :
 - GT marche, prédit échoue → le problème vient du CNN/filtrage
 - GT échoue aussi → le matching géométrique naïf est insuffisant
 - prédit marche correctement → l'hypothèse du prior CNN est validée
+
+Implémenté dans `scripts/phase2_geometric_baseline.py`. Descripteurs : les 3 scalaires
+rotation/translation-invariants de `HybridGeometryFeatures` (consistency, curvature,
+roughness — pas les normales brutes, non-invariantes entre fragments non-alignés) +
+distance au centroïde du fragment. Correspondances candidates par 1-NN en espace
+descripteur, RANSAC (500 itérations, 3 points, seuil inlier 0.05) + Kabsch pondéré sur
+les inliers. Stratégies comparées : `gt`, `thresh0.2/0.3/0.5` (issus de la Phase 1),
+`random` (même budget que le masque GT), `all`. Métriques : success_rate (RANSAC trouve
+≥3 inliers), rotation error (degrés, géodésique), translation error (L2), inlier_ratio —
+sur le repère d'entrée non-assemblé (le `scale` est ré-appliqué, recalculable depuis les
+points eux-mêmes donc pas une fuite de label).
 
 ## Phase 3 — Matcher appris (en réserve, seulement si Phase 2 montre un vrai signal)
 
