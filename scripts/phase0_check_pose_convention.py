@@ -28,11 +28,14 @@ Usage (sur le serveur, données HDF5 uniquement disponibles là-bas) :
 """
 
 import argparse
+import sys
+from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial import cKDTree
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from assembly.data.breaking_bad import BreakingBadUniform
 
 
