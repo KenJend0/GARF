@@ -44,9 +44,13 @@ Avant tout code de matching, confirmer empiriquement (pas juste "le champ existe
   avant d'inverser la rotation, sinon le résidu de reconstruction reste de l'ordre de la
   taille de l'objet (~0.5-0.8) au lieu d'être quasi nul (erreur trouvée lors du premier
   run de `scripts/phase0_check_pose_convention.py` sur le serveur, corrigée).
-- Pose relative entre deux fragments i,j adjacents (dans le repère assemblé commun) :
-  `R_ij = R_j^{-1} @ R_i`, `t_ij = R_j^{-1} @ (t_i - t_j)` (mappe l'input du fragment i vers
-  le repère de l'input du fragment j).
+- Pose relative entre deux fragments i,j adjacents : `R_ij = R_j^{-1} @ R_i`,
+  `t_ij = R_j^{-1} @ (t_i - t_j)` (mappe l'input du fragment i vers le repère de l'input
+  du fragment j). **Domaine de validité : cette formule s'applique aux coordonnées input
+  après réapplication du facteur `scale`**, c'est-à-dire `q_i = pointclouds[i] * scale[i]`,
+  `q_j = pointclouds[j] * scale[j]`, et alors `q_j ≈ R_ij @ q_i + t_ij`. Sans réappliquer
+  `scale`, la transformation entre fragments normalisés n'est pas strictement rigide si
+  leurs facteurs d'échelle diffèrent (chaque fragment a son propre `scale`, indépendant).
 
 Script de vérification : `scripts/phase0_check_pose_convention.py` — charge 2-3 objets
 réels, reconstruit l'objet assemblé à partir des poses stockées, mesure le résidu
@@ -88,7 +92,8 @@ But : mesurer si le filtre CNN garde les vrais points de fracture (checkpoint
   les deux, la définition du contact est sensible, à noter pour l'évaluation pairwise.
 
 Tableau attendu : Split × Fragments × Filtrage → fragment_fracture_recall,
-edge_contact_recall@eps∈{0.02,0.05}, Precision, Points gardés, Reduction ratio.
+edge_contact_recall@eps∈{0.02,0.05}, Precision, `kept_ratio` (proportion de points
+gardés par le filtre — *pas* la réduction ; réduction effective = `1 - kept_ratio`).
 Implémenté dans `scripts/phase1_recall_at_k.py`.
 
 Décision (sur fragment_fracture_recall@512/1024 ET edge_contact_recall@512/1024) :
@@ -104,33 +109,40 @@ complexité, parce qu'un budget absolu par fragment ne suit pas la quantité ré
 surface de fracture (qui croît avec le nombre de fragments/voisins). En revanche, les
 filtres **par seuil de probabilité** (0.2/0.3/0.5) réussissent largement : recall
 fragment ET edge dans 84-98%, stable même sur 11+ fragments, et quasi insensible à eps
-(0.02 vs 0.05) — la définition du contact n'est pas un point fragile. Reduction ratio
-plus modeste (~30-65%, pas 80-95%) mais le signal du CNN (ranking de probabilité) est
+(0.02 vs 0.05) — la définition du contact n'est pas un point fragile. `kept_ratio` plus
+modeste (~30-65% gardés, pas 5-20%) mais le signal du CNN (ranking de probabilité) est
 validé : le problème n'était pas le modèle, mais la stratégie de filtrage à budget fixe.
 
 **Critère de décision mis à jour** : on ne cherche plus un budget top-K agressif, mais un
 masque fracture **adaptatif par seuil**, à haut recall, pour construire la baseline
-géométrique. Configuration retenue pour la Phase 2 :
-- threshold 0.3 — configuration principale
-- threshold 0.5 — version plus compacte (plus de reduction, moins de recall/precision)
-- threshold 0.2 — oracle "safe recall" (recall max, moins de reduction)
-- masque fracture GT — référence haute (isole la responsabilité CNN vs matching, cf. plan
-  Phase 2 ci-dessous)
+géométrique. Configuration retenue pour la Phase 2 (le seul *oracle* est le masque GT —
+les seuils CNN restent des prédictions, pas des références) :
+- threshold 0.3 — configuration principale, compromis recall/precision
+- threshold 0.5 — version plus compacte : moins de points gardés, recall plus faible,
+  précision plus élevée
+- threshold 0.2 — version high-recall **prédite** : recall maximal, précision plus faible,
+  plus de points gardés (PAS un oracle)
+- masque fracture GT — oracle / référence haute (isole la responsabilité CNN vs matching,
+  cf. plan Phase 2 ci-dessous)
 
 ## Phase 2 — Baseline géométrique (seulement si Phase 0 + Phase 1 passent)
 
 Pipeline minimal, sans réseau appris :
-CNN Step 15 → top-K points fracture → features géométriques simples → correspondances
+CNN Step 15 → masque fracture par seuil de probabilité (threshold 0.2/0.3/0.5, cf. Phase 1
+— PAS top-K, rejeté en Phase 1) → features géométriques simples → correspondances
 candidates → RANSAC → Kabsch/SVD → score de paire.
 
 Comparaison à 3 conditions obligatoire (pour isoler la responsabilité d'un échec) :
-- masque fracture GT → matching
-- masque fracture prédit par le CNN → matching
+- masque fracture GT (oracle) → matching
+- masque fracture prédit par le CNN (threshold) → matching
 - points aléatoires / tous les points → matching
 
 Lecture des résultats :
 - GT marche, prédit échoue → le problème vient du CNN/filtrage
-- GT échoue aussi → le matching géométrique naïf est insuffisant
+- GT échoue aussi → **pas** "le prior CNN ne marche pas" — la conclusion correcte est que
+  le matching géométrique naïf (ces descripteurs simples) est insuffisant. Les descripteurs
+  choisis sont volontairement faibles pour une baseline minimale ; un échec sur GT teste le
+  matching, pas le CNN.
 - prédit marche correctement → l'hypothèse du prior CNN est validée
 
 Implémenté dans `scripts/phase2_geometric_baseline.py`. Descripteurs : les 3 scalaires
@@ -139,10 +151,29 @@ roughness — pas les normales brutes, non-invariantes entre fragments non-align
 distance au centroïde du fragment. Correspondances candidates par 1-NN en espace
 descripteur, RANSAC (500 itérations, 3 points, seuil inlier 0.05) + Kabsch pondéré sur
 les inliers. Stratégies comparées : `gt`, `thresh0.2/0.3/0.5` (issus de la Phase 1),
-`random` (même budget que le masque GT), `all`. Métriques : success_rate (RANSAC trouve
-≥3 inliers), rotation error (degrés, géodésique), translation error (L2), inlier_ratio —
-sur le repère d'entrée non-assemblé (le `scale` est ré-appliqué, recalculable depuis les
-points eux-mêmes donc pas une fuite de label).
+`random` (même budget que le masque GT), `all`. Travaille sur le repère d'entrée
+non-assemblé après réapplication de `scale` (cf. Phase 0 — pas une fuite de label, `scale`
+est recalculable directement depuis les points : `scale = max(abs(points))`).
+
+**Deux métriques de succès distinctes (à ne pas confondre)** :
+- `ransac_valid_rate` : fraction des paires où RANSAC trouve ≥3 inliers. Dit seulement
+  que RANSAC a produit *une* pose, pas qu'elle est bonne (3 inliers peuvent correspondre à
+  une pose fausse par coïncidence géométrique).
+- `pose_success_rate@(seuil_rot, seuil_trans)` : fraction des paires où la pose estimée a
+  rotation_error < seuil_rot ET translation_error < seuil_trans (ex: `pose_success@15deg_0.05`,
+  `pose_success@30deg_0.1`). C'est la métrique qui compte réellement pour juger le matching.
+
+**Protocole en deux temps** (ne pas mélanger les deux questions) :
+- **A. Registration sur paires positives** (`graph[i,j]=True` uniquement, ce que fait déjà
+  `phase2_geometric_baseline.py`) : rotation/translation error, inlier_ratio,
+  ransac_valid_rate, pose_success_rate. Répond à "si deux fragments vont vraiment ensemble,
+  la baseline retrouve-t-elle leur pose relative ?"
+- **B. Discrimination positives/négatives** (à ajouter dans une itération suivante,
+  seulement après A) : échantillonner aussi des paires `graph[i,j]=False`, et mesurer si le
+  score de paire (ex: inlier_ratio ou résidu inverse) sépare vraies et fausses paires
+  (precision/recall du score, ou AUC/AP). Répond à une question différente : "le score de
+  paire permet-il de reconnaître qu'une paire est vraie ?" Ne pas mélanger A et B dans la
+  même mesure.
 
 ## Phase 3 — Matcher appris (en réserve, seulement si Phase 2 montre un vrai signal)
 

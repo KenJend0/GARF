@@ -217,7 +217,7 @@ def main():
                         r, prec = recall_precision(mask, gt)
                         records[filt_name][bucket]["fragment"].append(r)
                         records[filt_name][bucket]["precision"].append(prec)
-                        records[filt_name][bucket]["reduction"].append(mask.mean())
+                        records[filt_name][bucket]["kept_ratio"].append(mask.mean())
 
                 # Per-edge contact metrics
                 for idx_i in range(len(ks_ps)):
@@ -265,7 +265,7 @@ def main():
     header = (
         f"  {'Filtrage':<14} {'Bucket':<8} {'FragRecall':>11} "
         + " ".join(f"{'Edge@'+str(e):>11}" for e in EPS_LIST)
-        + f" {'Precision':>10} {'Reduction':>10} {'n_frags':>8}"
+        + f" {'Precision':>10} {'KeptRatio':>10} {'n_frags':>8}"
     )
     print(header)
     print("  " + "-" * (len(header) - 2))
@@ -276,7 +276,7 @@ def main():
             d = buckets[bucket]
             frag_r = [v for v in d["fragment"] if not np.isnan(v)]
             prec = [v for v in d["precision"] if not np.isnan(v)]
-            red = d["reduction"]
+            kept = d["kept_ratio"]
             if not frag_r:
                 continue
             edge_strs = []
@@ -286,7 +286,7 @@ def main():
             print(
                 f"  {filt_name:<14} {bucket:<8} {np.mean(frag_r):>11.2%} "
                 + " ".join(edge_strs)
-                + f" {np.mean(prec):>10.2%} {np.mean(red):>10.2%} {len(frag_r):>8}"
+                + f" {np.mean(prec):>10.2%} {np.mean(kept):>10.2%} {len(frag_r):>8}"
             )
 
 

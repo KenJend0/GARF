@@ -23,6 +23,17 @@ pointclouds_gt — c'est l'information réellement disponible à l'inférence. L
 de label) pour revenir au repère "centré-roté" où la pose relative GT est définie
 (cf. formule dans PLAN_REASSEMBLY_MODULE.md, Phase 0).
 
+Deux métriques de succès distinctes (à ne pas confondre, cf. plan) :
+  - ransac_valid : RANSAC a trouvé >=3 inliers -- dit seulement qu'une pose a été produite,
+    pas qu'elle est correcte (3 inliers peuvent satisfaire le seuil résiduel par hasard).
+  - pose_success_(rot_thresh, trans_thresh) : la pose estimée est réellement proche de la
+    GT (rotation_error < rot_thresh ET translation_error < trans_thresh).
+
+Protocole A uniquement (registration sur paires positives, graph[i,j]=True) : mesure si,
+pour deux fragments qui vont vraiment ensemble, la baseline retrouve leur pose relative.
+Le protocole B (discrimination positif/négatif -- distinguer une vraie paire d'une fausse
+via le score de matching) est une question différente, pas encore implémentée ici.
+
 Usage (sur le serveur) :
     python scripts/phase2_geometric_baseline.py \
         --ckpt output/cnn_step15_final_model/last.ckpt \
@@ -54,6 +65,12 @@ MASK_STRATEGIES = ["gt", "thresh0.2", "thresh0.3", "thresh0.5", "random", "all"]
 RANSAC_ITERS = 500
 RANSAC_THRESH = 0.05   # inlier distance, same units as Phase 0's eps
 MIN_INLIERS = 3
+
+# pose_success thresholds: (rotation error max in degrees, translation error max).
+# A pair "succeeds" only if BOTH are met -- distinct from ransac_valid (>=3 inliers,
+# which says RANSAC produced *a* pose, not that it is a *correct* one: 3 inliers can
+# satisfy the residual threshold by geometric coincidence on a wrong pose).
+POSE_SUCCESS_THRESHOLDS = [(15.0, 0.05), (30.0, 0.1)]
 
 
 def quat_wxyz_to_rotmat(quat_wxyz: np.ndarray) -> np.ndarray:
@@ -256,7 +273,9 @@ def main():
                             idx_i_keep = np.where(mask_i)[0]
                             idx_j_keep = np.where(mask_j)[0]
                             if len(idx_i_keep) < MIN_INLIERS or len(idx_j_keep) < MIN_INLIERS:
-                                results[strategy]["matched"].append(False)
+                                results[strategy]["ransac_valid"].append(False)
+                                for thresh in POSE_SUCCESS_THRESHOLDS:
+                                    results[strategy][f"pose_success_{thresh}"].append(False)
                                 continue
 
                             # 1-NN correspondence in descriptor space, i -> j
@@ -272,45 +291,60 @@ def main():
 
                             pose = ransac_pose(P_cand, Q_cand, rng)
                             if pose is None:
-                                results[strategy]["matched"].append(False)
+                                results[strategy]["ransac_valid"].append(False)
+                                for thresh in POSE_SUCCESS_THRESHOLDS:
+                                    results[strategy][f"pose_success_{thresh}"].append(False)
                                 continue
 
                             R_est, t_est, n_inliers = pose
                             rot_err = rotation_error_deg(R_est, R_ij_gt)
                             trans_err = float(np.linalg.norm(t_est - t_ij_gt))
 
-                            results[strategy]["matched"].append(True)
+                            # ransac_valid: RANSAC found >=3 inliers (produced *a* pose).
+                            # pose_success: that pose is actually close to GT -- distinct,
+                            # since 3 inliers can satisfy the residual threshold on a wrong pose.
+                            results[strategy]["ransac_valid"].append(True)
                             results[strategy]["rot_err_deg"].append(rot_err)
                             results[strategy]["trans_err"].append(trans_err)
                             results[strategy]["n_candidates"].append(len(P_cand))
                             results[strategy]["inlier_ratio"].append(n_inliers / len(P_cand))
+                            for thresh in POSE_SUCCESS_THRESHOLDS:
+                                rot_thresh, trans_thresh = thresh
+                                success = (rot_err < rot_thresh) and (trans_err < trans_thresh)
+                                results[strategy][f"pose_success_{thresh}"].append(success)
 
     print(f"\nAnalyzed {n_edges} adjacent fragment pairs ({args.categories}/{args.split}).")
 
     print("\n" + "=" * 100)
     print(f"PHASE 2 — GEOMETRIC BASELINE MATCHING — {args.categories}/{args.split}")
     print("=" * 100)
+    pose_success_cols = [f"Pose@{t[0]:g}d_{t[1]:g}" for t in POSE_SUCCESS_THRESHOLDS]
     header = (
-        f"  {'Strategy':<12} {'SuccessRate':>12} {'RotErr(deg)':>12} "
-        f"{'TransErr':>10} {'InlierRatio':>12} {'n_edges':>8}"
+        f"  {'Strategy':<12} {'RansacValid':>12} "
+        + " ".join(f"{c:>14}" for c in pose_success_cols)
+        + f" {'RotErr(deg)':>12} {'TransErr':>10} {'InlierRatio':>12} {'n_edges':>8}"
     )
     print(header)
     print("  " + "-" * (len(header) - 2))
     for strategy in MASK_STRATEGIES:
         d = results[strategy]
-        matched = d.get("matched", [])
-        if not matched:
+        valid = d.get("ransac_valid", [])
+        if not valid:
             continue
-        success_rate = np.mean(matched)
+        ransac_valid_rate = np.mean(valid)
         rot_errs = d.get("rot_err_deg", [])
         trans_errs = d.get("trans_err", [])
         inlier_ratios = d.get("inlier_ratio", [])
         rot_str = f"{np.mean(rot_errs):>12.2f}" if rot_errs else f"{'n/a':>12}"
         trans_str = f"{np.mean(trans_errs):>10.4f}" if trans_errs else f"{'n/a':>10}"
         ir_str = f"{np.mean(inlier_ratios):>12.2%}" if inlier_ratios else f"{'n/a':>12}"
+        pose_strs = [
+            f"{np.mean(d[f'pose_success_{t}']):>14.2%}" for t in POSE_SUCCESS_THRESHOLDS
+        ]
         print(
-            f"  {strategy:<12} {success_rate:>12.2%} {rot_str} "
-            f"{trans_str} {ir_str} {len(matched):>8}"
+            f"  {strategy:<12} {ransac_valid_rate:>12.2%} "
+            + " ".join(pose_strs)
+            + f" {rot_str} {trans_str} {ir_str} {len(valid):>8}"
         )
 
 
