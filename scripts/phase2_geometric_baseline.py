@@ -245,10 +245,23 @@ def main():
     datamodule = instantiate(cfg.data)
     if args.split == "val":
         datamodule.setup("fit")
-        loader = datamodule.val_dataloader()
+        dataset = datamodule.val_dataset
     else:
         datamodule.setup("test")
-        loader = datamodule.test_dataloader()
+        dataset = datamodule.test_dataset
+
+    # val/test_dataloader() in module.py does NOT shuffle -- the HDF5 object list is
+    # apparently alphabetically ordered, so with a capped --max_batches the first N
+    # batches can be a single object family (observed: 634/634 edges were Bottle-type
+    # objects with --max_batches 60, making the symmetric-vs-irregular comparison
+    # impossible -- zero irregular examples). Shuffle here so a capped run still sees a
+    # diverse mix of object families.
+    from torch.utils.data import DataLoader
+    loader = DataLoader(
+        dataset, batch_size=args.batch_size, num_workers=args.num_workers,
+        shuffle=True, generator=torch.Generator().manual_seed(args.seed),
+        collate_fn=datamodule.dataset_cls.collate_fn,
+    )
 
     print(f"Loading checkpoint: {args.ckpt}")
     model = CNNFracSeg.load_from_checkpoint(args.ckpt, map_location=device, weights_only=False)

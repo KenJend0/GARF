@@ -259,6 +259,17 @@ RANSAC/Kabsch/formule R_ij-t_ij confirmés corrects). Conforme à la branche pr�
    contrainte plus globale — normales, couverture spatiale, résidu pondéré — pas
    seulement un comptage d'inliers) ; si les deux groupes sont comparables, le problème
    est le scoring/descripteur en général, pas la symétrie des objets.
+
+   **Artefact d'échantillonnage trouvé (2026-06-27)** : le premier run avec
+   `--max_batches 60` a donné **634/634 arêtes = objets `BeerBottle`/`Bottle`**, aucun
+   objet irrégulier — donc aucune comparaison possible. Cause : `val_dataloader()`
+   (`module.py`) ne shuffle pas (`shuffle` non spécifié dans le `DataLoader`, donc
+   `False` par défaut), et la liste d'objets HDF5 semble triée alphabétiquement — les 60
+   premiers batches ne couvrent que les noms commençant par "B". **Corrigé** dans
+   `phase2_geometric_baseline.py` : construction manuelle du `DataLoader` avec
+   `shuffle=True` (seed fixe, `--seed`) au lieu d'utiliser `datamodule.val_dataloader()`/
+   `test_dataloader()` directement — nécessaire pour que tout run plafonné par
+   `--max_batches` voie un mix représentatif de familles d'objets.
 2. Mutual nearest neighbor / ratio test (type Lowe) pour réduire le nombre de
    correspondances tout en augmentant `correspondence_precision` (cible indicative :
    15-25%, pas besoin de 80%).
