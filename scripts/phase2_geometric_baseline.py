@@ -144,6 +144,7 @@ def _is_dispersed(points: np.ndarray, min_dispersion: float) -> bool:
 def _hypothesis_score(
     resid: np.ndarray, inlier_mask: np.ndarray, score_mode: str, score_lambda: float,
     tau: float = 0.03, min_inliers_for_score: int = 6, eps: float = 1e-3,
+    normal_dot: np.ndarray = None,
 ):
     """Score a RANSAC hypothesis. 'count' (default/legacy) is the raw inlier count --
     this is what let a wrong but locally-consistent pose (e.g. sliding along a flat
@@ -184,6 +185,21 @@ def _hypothesis_score(
         # tau == inlier_thresh, since inliers are filtered to resid < inlier_thresh).
         quality = np.clip(1.0 - mean_resid / tau, 0.0, 1.0)
         return n_in * quality, n_in
+    if score_mode in ("count_times_normal_quality", "count_times_quality_and_normal"):
+        # Phase 2C: distance-only scoring is exhausted (score_gap > 0 for count,
+        # count_times_quality AND count_over_mean_residual alike -- a wrong pose
+        # genuinely has tighter/larger point-distance consensus than the true one on
+        # these fracture surfaces). Normals are an independent signal, validated
+        # exploitable via NORMAL ORIENTATION DIAGNOSTIC (MedianDot=-0.825 on
+        # oracle-correct correspondences): a genuine contact has opposed normals.
+        # normal_quality in [0,1]: 1 = perfectly opposed (dot=-1), 0 = dot>=0 (not opposed).
+        if normal_dot is None:
+            raise ValueError(f"{score_mode} requires normal_dot")
+        normal_quality = float(np.clip(-normal_dot[inlier_mask], 0.0, 1.0).mean())
+        if score_mode == "count_times_normal_quality":
+            return n_in * normal_quality, n_in
+        dist_quality = np.clip(1.0 - mean_resid / tau, 0.0, 1.0)
+        return n_in * dist_quality * normal_quality, n_in
     raise ValueError(score_mode)
 
 
@@ -192,6 +208,8 @@ def ransac_pose(
     sample_size: int = 3, min_dispersion: float = 0.0, max_resample_attempts: int = 10,
     score_mode: str = "count", score_lambda: float = 0.0,
     tau: float = 0.03, min_inliers_for_score: int = 6,
+    normal_P_cand: np.ndarray = None, normal_Q_cand: np.ndarray = None,
+    normal_tau: float = None,
 ):
     """RANSAC over candidate correspondences. Returns (R, t, n_inliers) or None.
 
@@ -200,10 +218,18 @@ def ransac_pose(
     near-degenerate (coplanar/clustered) triplet on a locally flat fracture surface.
     min_dispersion additionally rejects samples that don't spatially spread across the
     patch (resampled up to max_resample_attempts times per iteration).
+
+    normal_P_cand/normal_Q_cand (Phase 2C): per-candidate normals, 1:1 aligned with
+    P_cand/Q_cand. If normal_tau is set, additionally requires
+    dot(R @ n_i, n_j) < normal_tau for a point to count as inlier (hard filter) -- on
+    top of the distance threshold, not instead of it. If normal_tau is None, normals are
+    still computed and passed to _hypothesis_score for the soft normal-aware score modes
+    (count_times_normal_quality / count_times_quality_and_normal), without filtering.
     """
     n = len(P_cand)
     if n < sample_size:
         return None
+    use_normals = normal_P_cand is not None
 
     best_score, best_inliers, best_mask = -np.inf, -1, None
     for _ in range(RANSAC_ITERS):
@@ -219,10 +245,21 @@ def ransac_pose(
             continue
         pred = (Rmat @ P_cand.T).T + t
         resid = np.linalg.norm(pred - Q_cand, axis=1)
-        inlier_mask = resid < RANSAC_THRESH
+        dist_mask = resid < RANSAC_THRESH
+
+        normal_dot = None
+        if use_normals:
+            rotated_normal = (Rmat @ normal_P_cand.T).T
+            normal_dot = (rotated_normal * normal_Q_cand).sum(axis=1)
+
+        if normal_tau is not None and normal_dot is not None:
+            inlier_mask = dist_mask & (normal_dot < normal_tau)
+        else:
+            inlier_mask = dist_mask
+
         score, n_in = _hypothesis_score(
             resid, inlier_mask, score_mode, score_lambda,
-            tau=tau, min_inliers_for_score=min_inliers_for_score,
+            tau=tau, min_inliers_for_score=min_inliers_for_score, normal_dot=normal_dot,
         )
         if score > best_score:
             best_score, best_inliers, best_mask = score, n_in, inlier_mask
@@ -356,6 +393,7 @@ def main():
         choices=[
             "count", "count_minus_mean_residual", "count_minus_median_residual",
             "count_over_residual", "count_over_mean_residual", "count_times_quality",
+            "count_times_normal_quality", "count_times_quality_and_normal",
         ],
         help="RANSAC hypothesis scoring. 'count' (default/legacy) = raw inlier count, "
              "which let a loose-but-larger wrong consensus beat a tight-but-smaller "
@@ -363,7 +401,12 @@ def main():
              "subtract score_lambda * residual (needs careful calibration -- residuals "
              "are tiny relative to count differences, score_lambda=50 had zero effect "
              "empirically). count_over_residual = n_in / mean_residual, a ratio score "
-             "with no lambda to calibrate, recommended over the additive variants.",
+             "with no lambda to calibrate. Distance-only modes (count/quality/ratio) all "
+             "empirically gave score_gap > 0 (RANSAC's chosen pose outscores the true GT "
+             "pose under the SAME criterion) -- confirmed distance-only is exhausted. "
+             "count_times_normal_quality / count_times_quality_and_normal (Phase 2C) add "
+             "an independent signal: normal orientation (validated exploitable, "
+             "MedianDot=-0.825 on oracle-correct correspondences -- see --normal_tau).",
     )
     parser.add_argument(
         "--score_lambda", type=float, default=50.0,
@@ -385,6 +428,13 @@ def main():
              "tiny, accidentally-precise sample (e.g. 8 inliers at ~0 residual) "
              "outscoring a larger, more representative consensus just by being small "
              "and lucky. Default: max(6, --ransac_sample_size).",
+    )
+    parser.add_argument(
+        "--normal_tau", type=float, default=None,
+        help="Phase 2C hard filter: in addition to the distance threshold, require "
+             "dot(R @ n_i, n_j) < normal_tau for a point to count as inlier (e.g. -0.3, "
+             "-0.5, -0.7 -- start permissive). Default None = no hard normal filter "
+             "(normals are still used by the soft score modes if selected).",
     )
     args = parser.parse_args()
     score_tau = args.score_tau if args.score_tau is not None else args.inlier_thresh
@@ -589,6 +639,15 @@ def main():
                             P_cand = P_cand_all[i_idx_corr]           # (Nc,3) -- after corr_mode filtering
                             Q_cand = Q_full[j_idx_corr]
 
+                            # Normals aligned 1:1 with P_cand/Q_cand (Phase 2C) -- validated
+                            # exploitable via the NORMAL ORIENTATION DIAGNOSTIC (MedianDot=-0.825,
+                            # %dot<-0.5=78% on oracle-correct correspondences): genuine contact
+                            # points have consistently opposed normals, not just close positions.
+                            normal_i_full = normals_per_k[k_i][idx_i_keep]
+                            normal_j_full = normals_per_k[k_j][idx_j_keep]
+                            normal_P_cand = normal_i_full[i_idx_corr]
+                            normal_Q_cand = normal_j_full[j_idx_corr]
+
                             # Diagnostic 1: is the 1-NN candidate set itself usable at all?
                             # A candidate is "correct" if it's geometrically consistent with
                             # the TRUE pose (independent of whether RANSAC/Kabsch can recover
@@ -679,6 +738,9 @@ def main():
                                 score_lambda=args.score_lambda,
                                 tau=score_tau,
                                 min_inliers_for_score=min_inliers_for_score,
+                                normal_P_cand=normal_P_cand,
+                                normal_Q_cand=normal_Q_cand,
+                                normal_tau=args.normal_tau,
                             )
                             if pose is None:
                                 record(results, results_by_group, results_by_family,
@@ -702,18 +764,34 @@ def main():
                             resid_at_gt = np.linalg.norm(
                                 (R_ij_gt @ P_cand.T).T + t_ij_gt - Q_cand, axis=1
                             )
+                            normal_dot_at_gt = (
+                                (R_ij_gt @ normal_P_cand.T).T * normal_Q_cand
+                            ).sum(axis=1)
+                            inlier_at_gt = (
+                                (resid_at_gt < RANSAC_THRESH) & (normal_dot_at_gt < args.normal_tau)
+                                if args.normal_tau is not None else resid_at_gt < RANSAC_THRESH
+                            )
                             score_gt, _ = _hypothesis_score(
-                                resid_at_gt, resid_at_gt < RANSAC_THRESH,
+                                resid_at_gt, inlier_at_gt,
                                 args.score_mode, args.score_lambda,
                                 tau=score_tau, min_inliers_for_score=min_inliers_for_score,
+                                normal_dot=normal_dot_at_gt,
                             )
                             resid_at_ransac = np.linalg.norm(
                                 (R_est @ P_cand.T).T + t_est - Q_cand, axis=1
                             )
+                            normal_dot_at_ransac = (
+                                (R_est @ normal_P_cand.T).T * normal_Q_cand
+                            ).sum(axis=1)
+                            inlier_at_ransac = (
+                                (resid_at_ransac < RANSAC_THRESH) & (normal_dot_at_ransac < args.normal_tau)
+                                if args.normal_tau is not None else resid_at_ransac < RANSAC_THRESH
+                            )
                             score_ransac, _ = _hypothesis_score(
-                                resid_at_ransac, resid_at_ransac < RANSAC_THRESH,
+                                resid_at_ransac, inlier_at_ransac,
                                 args.score_mode, args.score_lambda,
                                 tau=score_tau, min_inliers_for_score=min_inliers_for_score,
+                                normal_dot=normal_dot_at_ransac,
                             )
                             if np.isfinite(score_gt) and np.isfinite(score_ransac):
                                 record(results, results_by_group, results_by_family,
@@ -722,6 +800,16 @@ def main():
                                        strategy, group, family, "score_ransac_pose", score_ransac)
                                 record(results, results_by_group, results_by_family,
                                        strategy, group, family, "score_gap", score_ransac - score_gt)
+
+                            # NormalDot mean over RANSAC's actual final inliers (distance
+                            # criterion only, regardless of --normal_tau) -- diagnostic: are
+                            # the inliers RANSAC settled on plausibly-opposed contact points,
+                            # or just close-by points with arbitrary orientation?
+                            dist_inliers_at_ransac = resid_at_ransac < RANSAC_THRESH
+                            if dist_inliers_at_ransac.any():
+                                record(results, results_by_group, results_by_family,
+                                       strategy, group, family, "ransac_inlier_normal_dot_mean",
+                                       float(normal_dot_at_ransac[dist_inliers_at_ransac].mean()))
 
                             # ransac_valid: RANSAC found >=3 inliers (produced *a* pose).
                             # pose_success: that pose is actually close to GT -- distinct,
@@ -778,7 +866,7 @@ def main():
     header = (
         f"  {'Strategy':<12} {'CorrPrec':>10} {'RansacValid':>12} "
         + " ".join(f"{c:>14}" for c in pose_success_cols)
-        + f" {'RotErr(deg)':>12} {'TransErr':>10} {'InlierRatio':>12} {'n_edges':>8}"
+        + f" {'RotErr(deg)':>12} {'TransErr':>10} {'InlierRatio':>12} {'NormalDot':>10} {'n_edges':>8}"
     )
     print(header)
     print("  " + "-" * (len(header) - 2))
@@ -792,17 +880,19 @@ def main():
         rot_errs = d.get("rot_err_deg", [])
         trans_errs = d.get("trans_err", [])
         inlier_ratios = d.get("inlier_ratio", [])
+        normal_dots = d.get("ransac_inlier_normal_dot_mean", [])
         corr_str = f"{np.mean(corr_prec):>10.2%}" if corr_prec else f"{'n/a':>10}"
         rot_str = f"{np.mean(rot_errs):>12.2f}" if rot_errs else f"{'n/a':>12}"
         trans_str = f"{np.mean(trans_errs):>10.4f}" if trans_errs else f"{'n/a':>10}"
         ir_str = f"{np.mean(inlier_ratios):>12.2%}" if inlier_ratios else f"{'n/a':>12}"
+        nd_str = f"{np.mean(normal_dots):>10.3f}" if normal_dots else f"{'n/a':>10}"
         pose_strs = [
             f"{np.mean(d[f'pose_success_{t}']):>14.2%}" for t in POSE_SUCCESS_THRESHOLDS
         ]
         print(
             f"  {strategy:<12} {corr_str} {ransac_valid_rate:>12.2%} "
             + " ".join(pose_strs)
-            + f" {rot_str} {trans_str} {ir_str} {len(valid):>8}"
+            + f" {rot_str} {trans_str} {ir_str} {nd_str} {len(valid):>8}"
         )
 
     # --- score_GT_pose vs score_RANSAC_pose: does the CURRENT score_mode prefer the

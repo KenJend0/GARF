@@ -414,14 +414,31 @@ négative + beaucoup de `dot<-0.5` → normales exploitables comme opposées ; `
 de 1 mais signe instable → utiliser `|dot|` plutôt qu'un test d'opposition strict ;
 dispersion sans structure → normales trop bruitées, ne pas filtrer dur dessus.
 
-Étapes 2-3 (pas encore implémentées, dépendent du résultat de l'étape 1) :
-- Critère d'inlier combiné : `distance < tau_dist ET dot(R @ n_i, n_j) < tau_normal`,
-  tester `tau_normal ∈ {-0.3, -0.5, -0.7}` en commençant par le plus permissif (-0.3).
-- Score soft normal-aware : `score = n_inliers × mean(clamp(-dot, 0, 1))`, ou combiné
-  avec la qualité de distance (`dist_quality × normal_quality`).
-- Bon signe attendu : `score_gap` diminue fortement (idéalement négatif), `Pose@30`
-  passe au-dessus de 10-15%, `RotErr` nettement sous 120°. `InlierRatio`/`RansacValid`
-  peuvent baisser — acceptable, on préfère moins de poses candidates mais plus fiables.
+**Résultat diagnostic (2026-06-27)** : `MeanDot=-0.665`, `MedianDot=-0.825`,
+`%dot<-0.5=78.31%`, `%dot<-0.7=73.42%` (n=566) — **normales clairement exploitables**,
+signal cohérent (médiane nettement négative, pas de dispersion sans structure). Go étapes
+2-3.
+
+Étapes 2-3 — implémentées dans `phase2_geometric_baseline.py` :
+- `--normal_tau` : filtre dur optionnel, en plus du seuil de distance (pas à sa place) —
+  `inlier = (distance < inlier_thresh) ET (dot(R @ n_i, n_j) < normal_tau)`. `None` par
+  défaut (désactivé). Tester `-0.3` (permissif) → `-0.5` → `-0.7`.
+- Deux nouveaux `--score_mode` : `count_times_normal_quality` (`score = n_in ×
+  mean(clip(-dot, 0, 1))` sur les inliers) et `count_times_quality_and_normal`
+  (`score = n_in × dist_quality × normal_quality`) — fonctionnent même sans
+  `--normal_tau` (normales utilisées en scoring doux, pas en filtre).
+- `score_gap` (déjà existant) recalculé de façon cohérente avec le filtre/score normal
+  choisi (la pose GT et la pose RANSAC sont toutes les deux réévaluées avec le même
+  critère normal-aware si applicable).
+- Nouvelle colonne `NormalDot` dans le tableau principal : moyenne de `dot(R_est @ n_i,
+  n_j)` sur les inliers finaux de RANSAC (au seuil de distance, indépendamment de
+  `--normal_tau`) — diagnostic indépendant pour voir si les inliers retenus sont
+  plausiblement des points de contact (négatif) ou des points proches sans orientation
+  cohérente.
+
+Bon signe attendu : `score_gap` diminue fortement (idéalement négatif), `Pose@30` passe
+au-dessus de 10-15%, `RotErr` nettement sous 120°. `InlierRatio`/`RansacValid` peuvent
+baisser — acceptable, on préfère moins de poses candidates mais plus fiables.
 
 **Protocole en deux temps** (ne pas mélanger les deux questions) :
 - **A. Registration sur paires positives** (`graph[i,j]=True` uniquement, ce que fait déjà
