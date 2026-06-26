@@ -141,32 +141,49 @@ def _is_dispersed(points: np.ndarray, min_dispersion: float) -> bool:
     return bool(d.max() >= min_dispersion)
 
 
-def _hypothesis_score(resid: np.ndarray, inlier_mask: np.ndarray, score_mode: str, score_lambda: float):
+def _hypothesis_score(
+    resid: np.ndarray, inlier_mask: np.ndarray, score_mode: str, score_lambda: float,
+    tau: float = 0.03, min_inliers_for_score: int = 6, eps: float = 1e-3,
+):
     """Score a RANSAC hypothesis. 'count' (default/legacy) is the raw inlier count --
     this is what let a wrong but locally-consistent pose (e.g. sliding along a flat
     fracture patch) outscore the true pose (InlierRatio > CorrPrec observed empirically).
-    The residual-penalized variants reward inlier count but penalize how loose those
-    inliers are on average, so a tight-but-smaller consensus can beat a loose-but-larger
-    one."""
+    The residual-aware variants reward inlier count but penalize how loose those inliers
+    are on average, so a tight-but-smaller consensus can beat a loose-but-larger one.
+
+    min_inliers_for_score gates ALL modes (including 'count'): a hypothesis with fewer
+    inliers than this is rejected outright (-inf), regardless of how tight its residuals
+    are -- guards the ratio/quality modes against a tiny, accidentally-precise sample
+    (e.g. 8 inliers at near-zero residual) outscoring a larger, more representative
+    consensus (e.g. 80 inliers at moderate residual) purely by being small and lucky.
+    """
     n_in = int(inlier_mask.sum())
-    if n_in == 0:
+    if n_in < min_inliers_for_score:
         return -np.inf, n_in
+    mean_resid = float(resid[inlier_mask].mean())
     if score_mode == "count":
         return float(n_in), n_in
     if score_mode == "count_minus_mean_residual":
         # additive penalty -- residuals live in [0, inlier_thresh), typically << the
         # natural scale of inlier-count differences between competing hypotheses (tens of
         # points), so score_lambda has to be calibrated very high (hundreds-thousands) to
-        # matter at all. Kept for completeness; count_over_residual below avoids the
-        # calibration problem entirely.
-        return n_in - score_lambda * float(resid[inlier_mask].mean()), n_in
+        # matter at all (confirmed empirically: lambda=50 had zero measurable effect).
+        return n_in - score_lambda * mean_resid, n_in
     if score_mode == "count_minus_median_residual":
         return n_in - score_lambda * float(np.median(resid[inlier_mask])), n_in
     if score_mode == "count_over_residual":
-        # Ratio score, no lambda to calibrate: rewards inliers and tight fits
-        # multiplicatively, so a tighter-but-smaller consensus can outscore a
-        # looser-but-larger one proportionally, regardless of the absolute count scale.
-        return n_in / (float(resid[inlier_mask].mean()) + 1e-4), n_in
+        # Unbounded ratio -- no lambda, but no protection against a tiny ultra-precise
+        # sample exploding the score either (mitigated only by min_inliers_for_score).
+        return n_in / (mean_resid + 1e-4), n_in
+    if score_mode == "count_over_mean_residual":
+        # tau-normalized ratio: score = n_in / (mean_residual/tau + eps).
+        return n_in / (mean_resid / tau + eps), n_in
+    if score_mode == "count_times_quality":
+        # score = n_in * (1 - mean_residual/tau), quality clipped to [0,1] so it can't
+        # go negative if tau != inlier_thresh (mean_resid is otherwise always < tau when
+        # tau == inlier_thresh, since inliers are filtered to resid < inlier_thresh).
+        quality = np.clip(1.0 - mean_resid / tau, 0.0, 1.0)
+        return n_in * quality, n_in
     raise ValueError(score_mode)
 
 
@@ -174,6 +191,7 @@ def ransac_pose(
     P_cand: np.ndarray, Q_cand: np.ndarray, rng: np.random.Generator,
     sample_size: int = 3, min_dispersion: float = 0.0, max_resample_attempts: int = 10,
     score_mode: str = "count", score_lambda: float = 0.0,
+    tau: float = 0.03, min_inliers_for_score: int = 6,
 ):
     """RANSAC over candidate correspondences. Returns (R, t, n_inliers) or None.
 
@@ -202,11 +220,14 @@ def ransac_pose(
         pred = (Rmat @ P_cand.T).T + t
         resid = np.linalg.norm(pred - Q_cand, axis=1)
         inlier_mask = resid < RANSAC_THRESH
-        score, n_in = _hypothesis_score(resid, inlier_mask, score_mode, score_lambda)
+        score, n_in = _hypothesis_score(
+            resid, inlier_mask, score_mode, score_lambda,
+            tau=tau, min_inliers_for_score=min_inliers_for_score,
+        )
         if score > best_score:
             best_score, best_inliers, best_mask = score, n_in, inlier_mask
 
-    if best_inliers < MIN_INLIERS:
+    if best_mask is None or best_inliers < MIN_INLIERS:
         return None
 
     Rmat, t = kabsch(P_cand[best_mask], Q_cand[best_mask])
@@ -332,7 +353,10 @@ def main():
     )
     parser.add_argument(
         "--score_mode", default="count",
-        choices=["count", "count_minus_mean_residual", "count_minus_median_residual", "count_over_residual"],
+        choices=[
+            "count", "count_minus_mean_residual", "count_minus_median_residual",
+            "count_over_residual", "count_over_mean_residual", "count_times_quality",
+        ],
         help="RANSAC hypothesis scoring. 'count' (default/legacy) = raw inlier count, "
              "which let a loose-but-larger wrong consensus beat a tight-but-smaller "
              "correct one (InlierRatio > CorrPrec observed). count_minus_*_residual "
@@ -343,11 +367,31 @@ def main():
     )
     parser.add_argument(
         "--score_lambda", type=float, default=50.0,
-        help="Residual penalty weight for --score_mode != count (default 50.0 -- "
-             "residuals are in [0, inlier_thresh), so with inlier_thresh=0.05 the max "
-             "penalty per hypothesis is ~2.5, comparable to a few inliers' worth of score).",
+        help="Residual penalty weight for --score_mode in {count_minus_mean_residual, "
+             "count_minus_median_residual} (default 50.0 -- residuals are in "
+             "[0, inlier_thresh), so this needs to be calibrated much higher, e.g. "
+             "hundreds-thousands, to compete with inlier-count differences of several "
+             "dozen points; lambda=50 had zero measurable effect empirically).",
+    )
+    parser.add_argument(
+        "--score_tau", type=float, default=None,
+        help="Residual scale for --score_mode in {count_over_mean_residual, "
+             "count_times_quality} (default: same value as --inlier_thresh).",
+    )
+    parser.add_argument(
+        "--min_inliers_for_score", type=int, default=None,
+        help="Reject any RANSAC hypothesis (all score modes, including 'count') with "
+             "fewer inliers than this -- guards the ratio/quality score modes against a "
+             "tiny, accidentally-precise sample (e.g. 8 inliers at ~0 residual) "
+             "outscoring a larger, more representative consensus just by being small "
+             "and lucky. Default: max(6, --ransac_sample_size).",
     )
     args = parser.parse_args()
+    score_tau = args.score_tau if args.score_tau is not None else args.inlier_thresh
+    min_inliers_for_score = (
+        args.min_inliers_for_score if args.min_inliers_for_score is not None
+        else max(6, args.ransac_sample_size)
+    )
     mask_strategies = args.strategies.split(",") if args.strategies else ALL_MASK_STRATEGIES
 
     global RANSAC_THRESH
@@ -613,6 +657,8 @@ def main():
                                 min_dispersion=args.ransac_min_dispersion,
                                 score_mode=args.score_mode,
                                 score_lambda=args.score_lambda,
+                                tau=score_tau,
+                                min_inliers_for_score=min_inliers_for_score,
                             )
                             if pose is None:
                                 record(results, results_by_group, results_by_family,
@@ -625,6 +671,37 @@ def main():
                             R_est, t_est, n_inliers = pose
                             rot_err = rotation_error_deg(R_est, R_ij_gt)
                             trans_err = float(np.linalg.norm(t_est - t_ij_gt))
+
+                            # score_GT_pose vs score_RANSAC_pose: does the CURRENT scoring
+                            # function (whichever --score_mode) actually rank the true pose
+                            # above the one RANSAC picked? If score_gap > 0 (RANSAC's pose
+                            # scores higher), the scoring criterion is still the bottleneck
+                            # regardless of sampling/iterations. If score_gap <= 0 but
+                            # pose_success stays low, RANSAC's exploration (not its scoring)
+                            # is failing to find the hypothesis its own criterion prefers.
+                            resid_at_gt = np.linalg.norm(
+                                (R_ij_gt @ P_cand.T).T + t_ij_gt - Q_cand, axis=1
+                            )
+                            score_gt, _ = _hypothesis_score(
+                                resid_at_gt, resid_at_gt < RANSAC_THRESH,
+                                args.score_mode, args.score_lambda,
+                                tau=score_tau, min_inliers_for_score=min_inliers_for_score,
+                            )
+                            resid_at_ransac = np.linalg.norm(
+                                (R_est @ P_cand.T).T + t_est - Q_cand, axis=1
+                            )
+                            score_ransac, _ = _hypothesis_score(
+                                resid_at_ransac, resid_at_ransac < RANSAC_THRESH,
+                                args.score_mode, args.score_lambda,
+                                tau=score_tau, min_inliers_for_score=min_inliers_for_score,
+                            )
+                            if np.isfinite(score_gt) and np.isfinite(score_ransac):
+                                record(results, results_by_group, results_by_family,
+                                       strategy, group, family, "score_gt_pose", score_gt)
+                                record(results, results_by_group, results_by_family,
+                                       strategy, group, family, "score_ransac_pose", score_ransac)
+                                record(results, results_by_group, results_by_family,
+                                       strategy, group, family, "score_gap", score_ransac - score_gt)
 
                             # ransac_valid: RANSAC found >=3 inliers (produced *a* pose).
                             # pose_success: that pose is actually close to GT -- distinct,
@@ -669,7 +746,8 @@ def main():
     print(f"PHASE 2 — GEOMETRIC BASELINE MATCHING — {args.categories}/{args.split}")
     print(f"  (corr_mode={args.corr_mode}, RANSAC sample_size={args.ransac_sample_size}, "
           f"min_dispersion={args.ransac_min_dispersion}, inlier_thresh={args.inlier_thresh}, "
-          f"score_mode={args.score_mode}, score_lambda={args.score_lambda})")
+          f"score_mode={args.score_mode}, score_lambda={args.score_lambda}, "
+          f"score_tau={score_tau}, min_inliers_for_score={min_inliers_for_score})")
     print("  CorrPrec = inlier ratio of the candidate set under the TRUE GT pose.")
     print("  InlierRatio = inlier ratio under the pose RANSAC actually picked.")
     print("  InlierRatio > CorrPrec means RANSAC's scoring objectively prefers a WRONG")
@@ -705,6 +783,28 @@ def main():
             f"  {strategy:<12} {corr_str} {ransac_valid_rate:>12.2%} "
             + " ".join(pose_strs)
             + f" {rot_str} {trans_str} {ir_str} {len(valid):>8}"
+        )
+
+    # --- score_GT_pose vs score_RANSAC_pose: does the CURRENT score_mode prefer the
+    # true pose over the one RANSAC picked? score_gap > 0 = scoring criterion is still
+    # the bottleneck (regardless of sampling/iterations); score_gap <= 0 but pose_success
+    # still low = RANSAC's exploration is failing to find what its own criterion prefers.
+    print("\n" + "=" * 100)
+    print(f"SCORE_GT_POSE vs SCORE_RANSAC_POSE — {args.categories}/{args.split} (score_mode={args.score_mode})")
+    print("  score_gap = score(RANSAC's chosen pose) - score(true GT pose), same scoring")
+    print("  function/threshold for both. >0 means the criterion still prefers a wrong pose.")
+    print("=" * 100)
+    print(f"  {'Strategy':<12} {'ScoreGT':>14} {'ScoreRANSAC':>14} {'ScoreGap':>14} {'n':>6}")
+    for strategy in mask_strategies:
+        d = results[strategy]
+        sgt = d.get("score_gt_pose", [])
+        sransac = d.get("score_ransac_pose", [])
+        sgap = d.get("score_gap", [])
+        if not sgt:
+            continue
+        print(
+            f"  {strategy:<12} {np.mean(sgt):>14.3f} {np.mean(sransac):>14.3f} "
+            f"{np.mean(sgap):>+14.3f} {len(sgt):>6}"
         )
 
     # --- Top-K correspondence diagnostic ---

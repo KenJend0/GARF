@@ -362,6 +362,32 @@ paramètre à caler, qui équilibre naturellement comptage et précision quelle 
 l'échelle absolue. `count_minus_*_residual` conservés mais nécessiteraient `λ` de l'ordre
 de plusieurs centaines/milliers pour avoir un effet, à éviter sauf besoin spécifique.
 
+**Affinement (2026-06-27)** : un ratio non borné (`count_over_residual`) peut être
+trompé par un petit échantillon accidentellement très précis (ex: 8 inliers à résidu
+quasi nul battant 80 inliers à résidu modéré). Ajout de :
+- `min_inliers_for_score` (défaut `max(6, sample_size)`) — rejette **toute** hypothèse
+  (y compris en mode `count`) sous ce plancher, avant même de calculer le score. Garde-fou
+  appliqué uniformément, pas seulement aux modes ratio/qualité.
+- `count_over_mean_residual` : `score = n_in / (résidu_moyen/τ + ε)` — version normalisée
+  par `τ` (défaut = `--inlier_thresh`) du ratio, moins sensible à l'échelle absolue du
+  résidu que `count_over_residual`.
+- `count_times_quality` : `score = n_in × clip(1 - résidu_moyen/τ, 0, 1)` — formulation
+  multiplicative simple, sans risque d'explosion numérique (`quality` borné dans [0,1]).
+- Nouvelle mesure clé `score_gap = score(pose RANSAC) - score(pose GT)`, calculée avec la
+  même fonction de score que celle utilisée pendant la recherche RANSAC (pas juste
+  `InlierRatio - CorrPrec`, qui ne reflète que le mode `count`). Lecture : `score_gap > 0`
+  → le critère de score actuel préfère encore une pose fausse, peu importe le sampling ;
+  `score_gap ≤ 0` mais `Pose@30` toujours bas → le score est correct mais l'exploration
+  RANSAC ne trouve pas l'hypothèse que son propre critère préférerait (problème
+  d'échantillonnage/itérations, pas de scoring).
+
+Prochain test recommandé : comparer `count` / `count_over_mean_residual` /
+`count_times_quality` à `inlier_thresh=0.03`, `tau=0.03` (par défaut), `sample_size=6`,
+`min_dispersion=0.1`, sur `gt_edge`. Si aucun des deux nouveaux scores ne fait dépasser
+`Pose@30`≈10%, passer à une contrainte plus informative (normales opposées, score
+Chamfer symétrique) plutôt que continuer à itérer sur des fonctions de score purement
+distance.
+
 **Protocole en deux temps** (ne pas mélanger les deux questions) :
 - **A. Registration sur paires positives** (`graph[i,j]=True` uniquement, ce que fait déjà
   `phase2_geometric_baseline.py`) : rotation/translation error, inlier_ratio,
