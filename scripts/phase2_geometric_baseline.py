@@ -80,6 +80,28 @@ MIN_INLIERS = 3
 POSE_SUCCESS_THRESHOLDS = [(15.0, 0.05), (30.0, 0.1)]
 TOPK_DIAG_LIST = [5, 10, 20]
 
+# Object name format: "<category>/<ObjectFamily>/<hash>/fractured_<n>" (e.g.
+# "everyday/BeerBottle/6da7fa.../fractured_37"). Crude but cheap symmetry proxy --
+# many everyday objects (bottles, bowls, jars...) are axisymmetric, so a fracture ring
+# around the main axis may have a genuine rotational ambiguity that no local descriptor
+# can resolve, independent of matching algorithm quality. This is a coarse heuristic
+# (manual keyword list, not a real symmetry detector) meant to sanity-check that
+# hypothesis cheaply by re-aggregating results already computed, not to be precise.
+SYMMETRIC_LIKE_KEYWORDS = ["bottle", "bowl", "vase", "jar", "cup", "mug", "plate", "pot"]
+
+
+def object_family_and_group(name: str):
+    parts = name.split("/")
+    family = parts[1] if len(parts) > 1 else "unknown"
+    group = "symmetric-like" if any(kw in family.lower() for kw in SYMMETRIC_LIKE_KEYWORDS) else "irregular-like"
+    return family, group
+
+
+def record(results, results_by_group, results_by_family, strategy, group, family, key, value):
+    results[strategy][key].append(value)
+    results_by_group[(strategy, group)][key].append(value)
+    results_by_family[(strategy, family)][key].append(value)
+
 
 def quat_wxyz_to_rotmat(quat_wxyz: np.ndarray) -> np.ndarray:
     return R.from_quat(quat_wxyz[[1, 2, 3, 0]]).as_matrix()
@@ -238,8 +260,12 @@ def main():
         use_roughness=True, use_dist_to_centroid=True,
     )
 
-    # results[strategy] -> dict of lists
+    # results[strategy] -> dict of lists. Same metrics also re-aggregated by
+    # (strategy, symmetric-like/irregular-like) and (strategy, object_family) to test
+    # whether axisymmetric objects (bottles/bowls/...) drive the rotation failure.
     results = defaultdict(lambda: defaultdict(list))
+    results_by_group = defaultdict(lambda: defaultdict(list))
+    results_by_family = defaultdict(lambda: defaultdict(list))
 
     print(f"\nRunning Phase 2 geometric baseline on {args.categories}/{args.split}...")
     n_edges = 0
@@ -276,6 +302,7 @@ def main():
                 scale_np = scale_np[:, :, None]
             graph_np = batch["graph"].numpy()
             normals_np = batch["pointclouds_normals"].numpy()  # (B, P, N, 3) or (B, N_total, 3)
+            names = batch["name"]  # list of str, length B
 
             offsets = np.concatenate([[0], np.cumsum(frag_sizes)])
             scores_per_k = [pred_flat[offsets[k]:offsets[k + 1]] for k in range(K)]
@@ -306,6 +333,7 @@ def main():
                 object_to_ks[b].append((k, p))
 
             for b, ks_ps in object_to_ks.items():
+                family, group = object_family_and_group(names[b])
                 for idx_i in range(len(ks_ps)):
                     for idx_j in range(idx_i + 1, len(ks_ps)):
                         k_i, p_i = ks_ps[idx_i]
@@ -361,9 +389,11 @@ def main():
                             idx_i_keep = np.where(mask_i)[0]
                             idx_j_keep = np.where(mask_j)[0]
                             if len(idx_i_keep) < MIN_INLIERS or len(idx_j_keep) < MIN_INLIERS:
-                                results[strategy]["ransac_valid"].append(False)
+                                record(results, results_by_group, results_by_family,
+                                       strategy, group, family, "ransac_valid", False)
                                 for thresh in POSE_SUCCESS_THRESHOLDS:
-                                    results[strategy][f"pose_success_{thresh}"].append(False)
+                                    record(results, results_by_group, results_by_family,
+                                           strategy, group, family, f"pose_success_{thresh}", False)
                                 continue
 
                             # 1-NN correspondence in descriptor space, i -> j
@@ -388,8 +418,10 @@ def main():
                             pred_under_gt = (R_ij_gt @ P_cand.T).T + t_ij_gt
                             resid_under_gt = np.linalg.norm(pred_under_gt - Q_cand, axis=1)
                             corr_precision = float((resid_under_gt < RANSAC_THRESH).mean())
-                            results[strategy]["correspondence_precision"].append(corr_precision)
-                            results[strategy]["n_candidates_diag"].append(len(P_cand))
+                            record(results, results_by_group, results_by_family,
+                                   strategy, group, family, "correspondence_precision", corr_precision)
+                            record(results, results_by_group, results_by_family,
+                                   strategy, group, family, "n_candidates_diag", len(P_cand))
 
                             # Diagnostic 2: top-K correspondence recall. Among i-points that DO
                             # have at least one geometrically correct j-point available in the
@@ -404,16 +436,17 @@ def main():
                             )                                                          # (Ni,Nj)
                             correct_mat = resid_mat < RANSAC_THRESH                     # (Ni,Nj)
                             avail_mask = correct_mat.any(axis=1)                        # (Ni,)
-                            results[strategy]["avail_rate"].append(float(avail_mask.mean()))
+                            record(results, results_by_group, results_by_family,
+                                   strategy, group, family, "avail_rate", float(avail_mask.mean()))
                             if avail_mask.any():
                                 rank = np.argsort(d_mat, axis=1)                        # (Ni,Nj)
                                 for k_top in TOPK_DIAG_LIST:
                                     k_eff = min(k_top, rank.shape[1])
                                     topk_idx = rank[:, :k_eff]
                                     hit = np.take_along_axis(correct_mat, topk_idx, axis=1).any(axis=1)
-                                    results[strategy][f"topk_recall_{k_top}"].append(
-                                        float(hit[avail_mask].mean())
-                                    )
+                                    record(results, results_by_group, results_by_family,
+                                           strategy, group, family, f"topk_recall_{k_top}",
+                                           float(hit[avail_mask].mean()))
 
                             pose = ransac_pose(
                                 P_cand, Q_cand, rng,
@@ -421,9 +454,11 @@ def main():
                                 min_dispersion=args.ransac_min_dispersion,
                             )
                             if pose is None:
-                                results[strategy]["ransac_valid"].append(False)
+                                record(results, results_by_group, results_by_family,
+                                       strategy, group, family, "ransac_valid", False)
                                 for thresh in POSE_SUCCESS_THRESHOLDS:
-                                    results[strategy][f"pose_success_{thresh}"].append(False)
+                                    record(results, results_by_group, results_by_family,
+                                           strategy, group, family, f"pose_success_{thresh}", False)
                                 continue
 
                             R_est, t_est, n_inliers = pose
@@ -433,15 +468,21 @@ def main():
                             # ransac_valid: RANSAC found >=3 inliers (produced *a* pose).
                             # pose_success: that pose is actually close to GT -- distinct,
                             # since 3 inliers can satisfy the residual threshold on a wrong pose.
-                            results[strategy]["ransac_valid"].append(True)
-                            results[strategy]["rot_err_deg"].append(rot_err)
-                            results[strategy]["trans_err"].append(trans_err)
-                            results[strategy]["n_candidates"].append(len(P_cand))
-                            results[strategy]["inlier_ratio"].append(n_inliers / len(P_cand))
+                            record(results, results_by_group, results_by_family,
+                                   strategy, group, family, "ransac_valid", True)
+                            record(results, results_by_group, results_by_family,
+                                   strategy, group, family, "rot_err_deg", rot_err)
+                            record(results, results_by_group, results_by_family,
+                                   strategy, group, family, "trans_err", trans_err)
+                            record(results, results_by_group, results_by_family,
+                                   strategy, group, family, "n_candidates", len(P_cand))
+                            record(results, results_by_group, results_by_family,
+                                   strategy, group, family, "inlier_ratio", n_inliers / len(P_cand))
                             for thresh in POSE_SUCCESS_THRESHOLDS:
                                 rot_thresh, trans_thresh = thresh
                                 success = (rot_err < rot_thresh) and (trans_err < trans_thresh)
-                                results[strategy][f"pose_success_{thresh}"].append(success)
+                                record(results, results_by_group, results_by_family,
+                                       strategy, group, family, f"pose_success_{thresh}", success)
 
     print(f"\nAnalyzed {n_edges} adjacent fragment pairs ({args.categories}/{args.split}).")
 
@@ -508,6 +549,61 @@ def main():
             vals = d.get(f"topk_recall_{k}", [])
             topk_strs.append(f"{np.mean(vals):>10.2%}" if vals else f"{'n/a':>10}")
         print(f"  {strategy:<12} {np.mean(avail):>10.2%} " + " ".join(topk_strs))
+
+    # --- Symmetric-like vs irregular-like, and per object-family breakdown ---
+    # Tests whether axisymmetric objects (bottle/bowl/vase/jar/cup/mug/plate/pot --
+    # crude keyword heuristic, cf. SYMMETRIC_LIKE_KEYWORDS) drive the rotation failure:
+    # a fracture ring around a revolution axis can be genuinely ambiguous to local
+    # descriptors, independent of matching algorithm quality. Gap = InlierRatio -
+    # CorrPrec, i.e. how much RANSAC's scoring prefers a wrong pose over the true one.
+    def print_grouped_table(title: str, grouped: dict, group_keys):
+        print("\n" + "=" * 110)
+        print(title)
+        print("=" * 110)
+        gheader = (
+            f"  {'Group':<16} {'n_edges':>8} {'CorrPrec':>10} {'InlierRatio':>12} "
+            f"{'Gap':>8} {'Pose@30d_0.1':>13} {'RotErr(deg)':>12} {'TransErr':>10}"
+        )
+        print(gheader)
+        print("  " + "-" * (len(gheader) - 2))
+        for gkey in group_keys:
+            d = grouped.get(gkey)
+            if d is None or not d.get("ransac_valid"):
+                continue
+            corr_prec = d.get("correspondence_precision", [])
+            inlier_ratios = d.get("inlier_ratio", [])
+            rot_errs = d.get("rot_err_deg", [])
+            trans_errs = d.get("trans_err", [])
+            pose30 = d.get(f"pose_success_{POSE_SUCCESS_THRESHOLDS[1]}", [])
+            corr_m = np.mean(corr_prec) if corr_prec else float("nan")
+            ir_m = np.mean(inlier_ratios) if inlier_ratios else float("nan")
+            gap = ir_m - corr_m
+            print(
+                f"  {gkey[1]:<16} {len(d['ransac_valid']):>8} {corr_m:>10.2%} {ir_m:>12.2%} "
+                f"{gap:>+8.2%} {np.mean(pose30) if pose30 else float('nan'):>13.2%} "
+                f"{np.mean(rot_errs) if rot_errs else float('nan'):>12.2f} "
+                f"{np.mean(trans_errs) if trans_errs else float('nan'):>10.4f}"
+            )
+
+    for strategy in mask_strategies:
+        group_keys = sorted(
+            {k for k in results_by_group if k[0] == strategy},
+            key=lambda k: k[1],
+        )
+        if group_keys:
+            print_grouped_table(
+                f"SYMMETRIC-LIKE vs IRREGULAR-LIKE — strategy={strategy} — {args.categories}/{args.split}",
+                results_by_group, group_keys,
+            )
+        family_keys = sorted(
+            {k for k in results_by_family if k[0] == strategy},
+            key=lambda k: -len(results_by_family[k].get("ransac_valid", [])),
+        )
+        if family_keys:
+            print_grouped_table(
+                f"PER OBJECT FAMILY — strategy={strategy} — {args.categories}/{args.split}",
+                results_by_family, family_keys,
+            )
 
 
 if __name__ == "__main__":

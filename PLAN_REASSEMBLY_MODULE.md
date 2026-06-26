@@ -239,6 +239,26 @@ RANSAC/Kabsch/formule R_ij-t_ij confirmés corrects). Conforme à la branche pr�
    (pas direct 8-12 : `CorrPrec³ ≈ 0.024` pour un triplet, donc un échantillon de 8 points
    tous corrects devient très improbable — il faut un fit robuste qui tolère une partie
    de faux dans l'échantillon, pas un échantillon plus grand mais toujours minimal/exact).
+
+   **Résultat sample_size/dispersion (2026-06-27, `gt_edge`)** : 3→4→6 avec
+   `min_dispersion=0.1` réduit légèrement l'écart `InlierRatio - CorrPrec` (18.6→14.4→14.5
+   points) et améliore un peu `Pose@30°/0.1` (4.26%→4.57%→6.78%), mais le rendement
+   décroît vite (4→6 quasi sans effet) — **le sampling n'est pas le facteur principal**,
+   confirmé. Le scoring (comptage brut d'inliers à un seuil généreux) reste le verrou.
+
+   **Hypothèse de symétrie de révolution** : beaucoup d'objets "everyday" (bouteilles,
+   bols, vases, jarres...) ont une fracture en anneau autour d'un axe de révolution — la
+   rotation autour de cet axe peut être intrinsèquement ambiguë géométriquement (la
+   surface se ressemble tout le long de l'anneau), indépendamment de la qualité du
+   matching. Ajout dans `phase2_geometric_baseline.py` d'une ré-agrégation des résultats
+   déjà calculés par `(stratégie, famille d'objet)` et `(stratégie, groupe symmetric-like
+   vs irregular-like)` — heuristique grossière par mot-clé sur le nom d'objet (`Bottle`,
+   `Bowl`, `Vase`, `Jar`, `Cup`, `Mug`, `Plate`, `Pot`), pas un vrai détecteur de symétrie.
+   Lecture prévue : si `RotErr`/`Pose@30` sont nettement pires sur `symmetric-like`,
+   l'ambiguïté de rotation est en partie structurelle (le scoring devra intégrer une
+   contrainte plus globale — normales, couverture spatiale, résidu pondéré — pas
+   seulement un comptage d'inliers) ; si les deux groupes sont comparables, le problème
+   est le scoring/descripteur en général, pas la symétrie des objets.
 2. Mutual nearest neighbor / ratio test (type Lowe) pour réduire le nombre de
    correspondances tout en augmentant `correspondence_precision` (cible indicative :
    15-25%, pas besoin de 80%).
