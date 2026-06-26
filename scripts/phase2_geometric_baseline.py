@@ -5,7 +5,7 @@ Phase 2 du plan de réassemblage léger (voir PLAN_REASSEMBLY_MODULE.md).
 
 Pipeline minimal, sans réseau de matching appris :
 
-    masque fracture (GT / CNN seuil / random / all)
+    masque fracture (GT / GT restreint au contact pair-specific / CNN seuil / random / all)
     -> descripteurs géométriques rotation-invariants (HybridGeometryFeatures)
     -> correspondances candidates (1-NN en espace descripteur)
     -> RANSAC (échantillons de 3 correspondances + Kabsch)
@@ -68,7 +68,7 @@ from assembly.models.hybrid_geometry_features import HybridGeometryFeatures
 from assembly.models.projection_mapping_utils import extract_fragment_list
 
 
-MASK_STRATEGIES = ["gt", "thresh0.2", "thresh0.3", "thresh0.5", "random", "all"]
+ALL_MASK_STRATEGIES = ["gt", "gt_edge", "thresh0.2", "thresh0.3", "thresh0.5", "random", "all"]
 RANSAC_ITERS = 500
 RANSAC_THRESH = 0.05   # inlier distance, same units as Phase 0's eps
 MIN_INLIERS = 3
@@ -161,7 +161,15 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_batches", type=int, default=60)
     parser.add_argument("--seed", type=int, default=1116)
+    parser.add_argument(
+        "--strategies", default=None,
+        help=f"Comma-separated subset of {ALL_MASK_STRATEGIES} (default: all). "
+             "Each strategy costs roughly the same O(Ni*Nj) work -- restricting "
+             "this is the main lever to cut runtime (a full run took 1h05 for "
+             "60 batches / 634 edges / 6 strategies).",
+    )
     args = parser.parse_args()
+    mask_strategies = args.strategies.split(",") if args.strategies else ALL_MASK_STRATEGIES
 
     rng = np.random.default_rng(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -274,9 +282,42 @@ def main():
                         R_ij_gt = R_j_inv @ R_i
                         t_ij_gt = R_j_inv @ (trans_np[b, p_i] - trans_np[b, p_j])
 
-                        for strategy in MASK_STRATEGIES:
-                            mask_i = build_mask(strategy, scores_per_k[k_i], gt_per_k[k_i], rng)
-                            mask_j = build_mask(strategy, scores_per_k[k_j], gt_per_k[k_j], rng)
+                        # Global/assembled-frame reconstruction (Phase 0 formula), needed
+                        # for "gt_edge" -- raw_i and raw_j each live in their OWN independent
+                        # local frame (random per-fragment rotation), so a Euclidean distance
+                        # between them directly is meaningless. Must compare in the shared
+                        # assembled frame, same as Phase 0/1.
+                        global_i_full = (R_i @ raw_per_k[k_i].T).T + trans_np[b, p_i]
+                        global_j_full = (R_j @ raw_per_k[k_j].T).T + trans_np[b, p_j]
+
+                        for strategy in mask_strategies:
+                            if strategy == "gt_edge":
+                                # Oracle restricted to pair-specific contact points: GT
+                                # fracture points of i (resp. j) whose nearest neighbor in
+                                # the FULL point cloud of j (resp. i), in the shared assembled
+                                # frame, is < eps. Isolates the multi-neighbor confound from
+                                # "gt" (which keeps ALL of a fragment's fracture points, even
+                                # those facing OTHER neighbors -- cf. avail_rate=38% diagnostic,
+                                # same issue as Phase 1's fragment-level vs edge_contact_recall).
+                                gt_i = gt_per_k[k_i].astype(bool)
+                                gt_j = gt_per_k[k_j].astype(bool)
+                                mask_i = np.zeros_like(gt_i)
+                                mask_j = np.zeros_like(gt_j)
+                                if gt_i.any():
+                                    d_i_to_j = np.linalg.norm(
+                                        global_i_full[gt_i][:, None, :]
+                                        - global_j_full[None, :, :], axis=-1
+                                    ).min(axis=1)
+                                    mask_i[np.where(gt_i)[0]] = d_i_to_j < RANSAC_THRESH
+                                if gt_j.any():
+                                    d_j_to_i = np.linalg.norm(
+                                        global_j_full[gt_j][:, None, :]
+                                        - global_i_full[None, :, :], axis=-1
+                                    ).min(axis=1)
+                                    mask_j[np.where(gt_j)[0]] = d_j_to_i < RANSAC_THRESH
+                            else:
+                                mask_i = build_mask(strategy, scores_per_k[k_i], gt_per_k[k_i], rng)
+                                mask_j = build_mask(strategy, scores_per_k[k_j], gt_per_k[k_j], rng)
 
                             idx_i_keep = np.where(mask_i)[0]
                             idx_j_keep = np.where(mask_j)[0]
@@ -372,7 +413,7 @@ def main():
     )
     print(header)
     print("  " + "-" * (len(header) - 2))
-    for strategy in MASK_STRATEGIES:
+    for strategy in mask_strategies:
         d = results[strategy]
         valid = d.get("ransac_valid", [])
         if not valid:
@@ -408,7 +449,7 @@ def main():
     )
     print(header2)
     print("  " + "-" * (len(header2) - 2))
-    for strategy in MASK_STRATEGIES:
+    for strategy in mask_strategies:
         d = results[strategy]
         avail = d.get("avail_rate", [])
         if not avail:

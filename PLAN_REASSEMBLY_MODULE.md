@@ -199,6 +199,21 @@ RANSAC/Kabsch/formule R_ij-t_ij confirmés corrects). Conforme à la branche pr�
    apparaît-elle dans le top-K du classement descripteur, même si pas en top-1 ?). Si la
    bonne correspondance n'apparaît même pas en top-20, le descripteur n'a quasi aucun
    signal ; si elle y apparaît souvent, le 1-NN est juste trop strict.
+
+   **Résultat (2026-06-26, everyday/val, 1h05 pour 60 batches/634 arêtes/6 stratégies —
+   coût élevé, à garder en tête)** : `avail_rate` ≈ 38% sur `gt`/`thresh*` (vs 19% sur
+   `random`/`all`) — donc **62% des points filtrés n'ont structurellement aucune vraie
+   correspondance disponible** dans le voisin évalué (confound multi-voisins confirmé,
+   pas juste une hypothèse). Mais parmi les 38% qui ont une vraie correspondance dispo,
+   `topk_recall_20` ≈ 60% (`top5`≈42%, `top10`≈51%) — le descripteur porte un **vrai
+   signal**, nettement mieux que le hasard, juste insuffisant pour un 1-NN strict.
+   Cohérent avec `CorrPrec`≈6.7% (≈ `avail_rate` × `top1_recall`, les deux causes se
+   combinent). Ajout d'une stratégie `gt_edge` (oracle restreint aux points de contact
+   pair-specific, NN<eps en repère assemblé reconstruit — comme Phase 1, *pas* en repère
+   local brut, qui aurait été une comparaison sans sens entre deux repères indépendants)
+   pour isoler l'effet du confound de celui du descripteur. **Pour contrôler le coût**,
+   un flag `--strategies` permet de ne lancer qu'un sous-ensemble (chaque stratégie coûte
+   ~le même travail O(Ni×Nj) ; restreindre est le levier principal pour réduire le temps).
 2. Mutual nearest neighbor / ratio test (type Lowe) pour réduire le nombre de
    correspondances tout en augmentant `correspondence_precision` (cible indicative :
    15-25%, pas besoin de 80%).
