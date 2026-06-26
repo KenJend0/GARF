@@ -270,6 +270,20 @@ RANSAC/Kabsch/formule R_ij-t_ij confirmés corrects). Conforme à la branche pr�
    `shuffle=True` (seed fixe, `--seed`) au lieu d'utiliser `datamodule.val_dataloader()`/
    `test_dataloader()` directement — nécessaire pour que tout run plafonné par
    `--max_batches` voie un mix représentatif de familles d'objets.
+
+   **Résultat symétrie (2026-06-27, après correction du shuffle, n=717 arêtes, mix
+   représentatif) : hypothèse NON confirmée (Cas B).** `irregular-like` (n=201) :
+   RotErr=131.3°, Pose@30=5.47%, Gap=13.23 ; `symmetric-like` (n=516) : RotErr=126.3°,
+   Pose@30=4.84%, Gap=15.44 — quasi équivalents, et si différence il y a, c'est
+   `irregular-like` qui est légèrement *pire* (l'inverse de ce que prédirait
+   l'hypothèse). Confirmé par famille : `ToyFigure` (n=75, clairement pas symétrique)
+   ne fait que 9.33% de `Pose@30` ; `Statue` (n=21) a `CorrPrec`=61.72% et `Gap` négatif
+   (RANSAC ne préfère même pas une pose fausse) mais `Pose@30=0%` quand même. **Donc
+   l'échec n'est pas structurel à la géométrie des objets — c'est le matching
+   (descripteur + scoring RANSAC) qui est insuffisant en général**, indépendamment de la
+   symétrie. Écarte l'explication "ambiguïté de révolution" et recentre sur le scoring/
+   descripteur (étapes 2-4 du plan Phase 2B), pas sur une contrainte géométrique
+   spécifique aux objets symétriques.
 2. Mutual nearest neighbor / ratio test (type Lowe) pour réduire le nombre de
    correspondances tout en augmentant `correspondence_precision` (cible indicative :
    15-25%, pas besoin de 80%).
