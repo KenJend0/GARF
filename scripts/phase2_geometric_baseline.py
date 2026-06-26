@@ -436,6 +436,17 @@ def main():
              "-0.5, -0.7 -- start permissive). Default None = no hard normal filter "
              "(normals are still used by the soft score modes if selected).",
     )
+    parser.add_argument(
+        "--summary_json", default=None,
+        help="Optional path to dump a compact JSON summary of the key scalar metrics "
+             "(one entry per strategy) -- avoids having to grep through the full text "
+             "log. Consumed by scripts/phase2_compare_summaries.py.",
+    )
+    parser.add_argument(
+        "--label", default=None,
+        help="Display name for this run in the summary JSON (default: derived from "
+             "score_mode/normal_tau/inlier_thresh).",
+    )
     args = parser.parse_args()
     score_tau = args.score_tau if args.score_tau is not None else args.inlier_thresh
     min_inliers_for_score = (
@@ -1020,6 +1031,68 @@ def main():
                 f"PER OBJECT FAMILY — strategy={strategy} — {args.categories}/{args.split}",
                 results_by_family, family_keys,
             )
+
+    # --- Compact JSON summary (optional) -- just the scalar numbers that matter for
+    # comparing runs across a parameter sweep, instead of grepping the full text log.
+    # Consumed by scripts/phase2_compare_summaries.py.
+    if args.summary_json:
+        import json as _json
+
+        def _mean_or_none(vals):
+            return float(np.mean(vals)) if vals else None
+
+        label = args.label or (
+            f"{args.score_mode}"
+            + (f"_normal_tau{args.normal_tau}" if args.normal_tau is not None else "")
+            + f"_thresh{args.inlier_thresh}"
+        )
+        summary = {
+            "label": label,
+            "categories": args.categories,
+            "split": args.split,
+            "n_edges_total": n_edges,
+            "config": {
+                "corr_mode": args.corr_mode,
+                "ransac_sample_size": args.ransac_sample_size,
+                "ransac_min_dispersion": args.ransac_min_dispersion,
+                "inlier_thresh": args.inlier_thresh,
+                "score_mode": args.score_mode,
+                "score_lambda": args.score_lambda,
+                "score_tau": score_tau,
+                "min_inliers_for_score": min_inliers_for_score,
+                "normal_tau": args.normal_tau,
+            },
+            "strategies": {},
+        }
+        for strategy in mask_strategies:
+            d = results[strategy]
+            if not d.get("ransac_valid"):
+                continue
+            summary["strategies"][strategy] = {
+                "n_edges": len(d["ransac_valid"]),
+                "corr_prec": _mean_or_none(d.get("correspondence_precision", [])),
+                "ransac_valid_rate": _mean_or_none(d.get("ransac_valid", [])),
+                "pose_success_15_0.05": _mean_or_none(d.get(f"pose_success_{POSE_SUCCESS_THRESHOLDS[0]}", [])),
+                "pose_success_30_0.1": _mean_or_none(d.get(f"pose_success_{POSE_SUCCESS_THRESHOLDS[1]}", [])),
+                "rot_err_deg": _mean_or_none(d.get("rot_err_deg", [])),
+                "trans_err": _mean_or_none(d.get("trans_err", [])),
+                "inlier_ratio": _mean_or_none(d.get("inlier_ratio", [])),
+                "normal_dot_mean_inliers": _mean_or_none(d.get("ransac_inlier_normal_dot_mean", [])),
+                "score_gt_pose": _mean_or_none(d.get("score_gt_pose", [])),
+                "score_ransac_pose": _mean_or_none(d.get("score_ransac_pose", [])),
+                "score_gap": _mean_or_none(d.get("score_gap", [])),
+                "avail_rate": _mean_or_none(d.get("avail_rate", [])),
+                "oracle_rot_err_deg": _mean_or_none(d.get("oracle_rot_err_deg", [])),
+                "oracle_trans_err": _mean_or_none(d.get("oracle_trans_err", [])),
+                "normal_orientation_median_dot": _mean_or_none(d.get("normal_dot_median", [])),
+                "normal_orientation_pct_below_-0.5": _mean_or_none(d.get("pct_normal_dot_below_-0.5", [])),
+            }
+
+        summary_path = Path(args.summary_json)
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(summary_path, "w") as fh:
+            _json.dump(summary, fh, indent=2)
+        print(f"\nSaved compact summary to: {summary_path}")
 
 
 if __name__ == "__main__":
