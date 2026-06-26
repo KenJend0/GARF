@@ -58,6 +58,10 @@ de l'ordre des points, via nearest-neighbor).
 **Critère de validation :** résidu quasi nul / points de fracture adjacents proches →
 convention confirmée. Sinon, inverser rotation/translation et re-tester.
 
+**Statut : CONFIRMÉ (2026-06-26)**, sur `everyday/val` et `artifact/val` (le split
+`test` n'existe pas pour `artifact`) — résidu de reconstruction ~1e-8 (bruit numérique)
+sur tous les fragments testés, une fois le facteur `scale` réappliqué (voir script).
+
 ## Phase 1 — Recall@K du CNN Step 15
 
 But : mesurer si le filtre CNN garde les vrais points de fracture (checkpoint
@@ -125,6 +129,6 @@ indépendante.
 
 ## Prochaine action concrète
 
-Lancer `scripts/phase0_check_pose_convention.py` sur le serveur (données HDF5 uniquement
-disponibles là-bas) pour confirmer empiriquement la convention de pose dérivée ci-dessus,
-avant d'écrire le moindre code de matching.
+Phase 0 confirmée. Lancer `scripts/phase1_recall_at_k.py` sur le serveur avec le
+checkpoint `output/cnn_step15_final_model/last.ckpt`, sur `everyday/val` puis
+`artifact/val`, pour mesurer le Recall@K et décider si on passe à la Phase 2.
