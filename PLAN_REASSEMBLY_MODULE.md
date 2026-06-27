@@ -942,6 +942,24 @@ matcher (`dustbin_bias` scalaire → `dustbin_head` MLP) — les checkpoints Pha
 (`output/phase3a_matcher_c1/`, `_c1_long/`, `_c2/`) ne sont plus chargeables via
 `--resume_from` avec cette architecture. Repartir de zéro pour 4A/4B.
 
+**Bug trouvé et corrigé sur le premier run 4A (2026-06-27) : `L_contact` collapsait
+vers "tout dustbin", même mécanisme que le bug original.** `dustbin_minus_max_match`
+passe de -1.39 (epoch0) à **+2.44** (epoch14, train) et +3.92 (val) ; `contact_pred_rate`
+chute 85.8%→6.7% (train), →0.37% (val). Cause : `contact_loss()` était une BCE **non
+pondérée** — avec ~65% de lignes dustbin, l'optimiseur réduit la loss en poussant
+`dustbin_logit` vers +∞ pour toutes les lignes (gagnant sur les 65% correctes, perdant
+sur les 35% restantes), exactement le même raccourci d'imbalance que l'ancien
+`dustbin_bias` global. **Fix : repondération de `contact_loss` par
+`contact_row_weight`/`dustbin_row_weight`** (mêmes valeurs 2.0/1.0 que
+`soft_correspondence_loss`, pour cohérence). Vérifié sur un cas synthétique (BCE par
+ligne, ~65% déséquilibre) : sépare parfaitement les deux classes avec la
+repondération.
+
+**Prochaine étape : relancer 4A avec le fix**, même protocole exact que C1 (15
+epochs), pour vérifier que `L_contact` apporte un vrai bénéfice par rapport à C1
+(`top1_gap` moins négatif, `dustbin_pred_rate` qui suit le vrai taux sans collapse
+dans aucune direction) avant d'attaquer 4B (cross-attention).
+
 ## Métriques d'évaluation déjà disponibles (ne pas réécrire)
 
 Dans `assembly/models/denoiser/modules/evaluation/evaluator.py` :
