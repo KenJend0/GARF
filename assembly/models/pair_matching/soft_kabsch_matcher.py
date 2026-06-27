@@ -160,16 +160,32 @@ def soft_correspondence_loss(
     return (ce * weight).sum() / denom
 
 
-def contact_loss(dustbin_logit: torch.Tensor, target: torch.Tensor, valid_i: torch.Tensor) -> torch.Tensor:
+def contact_loss(
+    dustbin_logit: torch.Tensor, target: torch.Tensor, valid_i: torch.Tensor,
+    contact_row_weight: float = 2.0, dustbin_row_weight: float = 1.0,
+) -> torch.Tensor:
     """Phase 4A auxiliary loss: BCE between the per-point dustbin head's prediction and
     whether the row actually has a real contact (target's dustbin column == 0), restricted
     to valid_i rows. Separates two questions the single soft_correspondence_loss conflates:
     (1) does this row of i have ANY counterpart in j (this loss), (2) if so, which column
     (soft_correspondence_loss). `-dustbin_logit` is used as the "has contact" logit (high
-    dustbin_logit = confidently dustbin = low contact probability)."""
+    dustbin_logit = confidently dustbin = low contact probability).
+
+    Reweighted by the SAME contact_row_weight/dustbin_row_weight as soft_correspondence_loss
+    -- a first run without this reweighting collapsed to "always predict dustbin" again
+    (dustbin_minus_max_match went from -1.39 to +2.44 over 15 epochs, contact_pred_rate
+    85.8%->6.7%): with ~65% dustbin rows and a plain unweighted BCE, the optimizer could
+    cheaply push dustbin_logit toward +inf for every row (correct on the 65% majority,
+    wrong on the 35% minority) -- the exact same imbalance-driven shortcut as the original
+    global dustbin_bias collapse, just relocated into this new auxiliary loss."""
     has_contact = (target[..., -1] <= 0.5).float()  # [B, N]
     bce = F.binary_cross_entropy_with_logits(-dustbin_logit, has_contact, reduction="none")
-    weight = valid_i.float()
+    row_weight = torch.where(
+        has_contact.bool(),
+        torch.full_like(bce, contact_row_weight),
+        torch.full_like(bce, dustbin_row_weight),
+    )
+    weight = row_weight * valid_i.float()
     return (bce * weight).sum() / weight.sum().clamp(min=1e-8)
 
 

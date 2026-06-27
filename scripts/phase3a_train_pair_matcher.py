@@ -156,7 +156,10 @@ def compute_step(matcher_model, batch: dict, args, use_pose_loss: bool):
         P, batch["target"], batch["valid_i"],
         contact_row_weight=args.contact_row_weight, dustbin_row_weight=args.dustbin_row_weight,
     )
-    l_contact = contact_loss(dustbin_logit, batch["target"], batch["valid_i"])
+    l_contact = contact_loss(
+        dustbin_logit, batch["target"], batch["valid_i"],
+        contact_row_weight=args.contact_row_weight, dustbin_row_weight=args.dustbin_row_weight,
+    )
     entropy = matching_entropy(P, batch["valid_i"])
 
     P_points = P[..., :N]
