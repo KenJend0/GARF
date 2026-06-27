@@ -187,18 +187,28 @@ def build_pair_sample(
             matches_per_contact_row.append(1)
             effective_matches_per_contact_row.append(1.0)
         elif args.label_mode == "soft":
-            w = np.exp(-(row[close] ** 2) / (args.label_sigma ** 2))
+            close_idx = np.where(close)[0]
+            # label_topk caps the number of positive columns BEFORE weighting, independent
+            # of local point density -- contact_eps alone let dense fragments (thousands of
+            # points) flood a row with tens of "close" candidates regardless of sigma
+            # (confirmed empirically: mean_effective_matches stayed ~39, close to the raw
+            # count ~70 -- sigma alone could not compensate for density variation across
+            # fragments ranging from 219 to 4027 points). 0 or negative = no cap (legacy
+            # behaviour, kept for before/after comparison).
+            if args.label_topk and args.label_topk > 0 and len(close_idx) > args.label_topk:
+                nearest = np.argsort(row[close_idx])[: args.label_topk]
+                close_idx = close_idx[nearest]
+            w = np.exp(-(row[close_idx] ** 2) / (args.label_sigma ** 2))
             w = w / w.sum()
-            target[a, np.where(close)[0]] = w
-            # raw count of points within contact_eps -- on dense fracture surfaces this can
-            # be large (tens of points) without meaning the label is actually diffuse: most
-            # of those points can carry near-zero weight after the Gaussian normalization.
-            matches_per_contact_row.append(int(close.sum()))
+            target[a, close_idx] = w
+            # raw count of positive columns kept for this row (== close.sum() when no cap,
+            # == min(close.sum(), label_topk) when capped).
+            matches_per_contact_row.append(len(close_idx))
             # effective number of matches (inverse participation ratio, 1/sum(w^2)): 1.0 for
             # a one-hot-like label (sharp, weight concentrated on the true NN), tends toward
-            # close.sum() for a near-uniform label (diffuse, weak positional signal). This is
-            # the metric that actually tells us whether contact_eps/label_sigma produce a
-            # usable supervision target, not just "how many points are nearby".
+            # len(close_idx) for a near-uniform label (diffuse, weak positional signal). This
+            # is the metric that actually tells us whether contact_eps/label_topk/label_sigma
+            # produce a usable supervision target, not just "how many points are nearby".
             effective_matches_per_contact_row.append(float(1.0 / np.sum(w ** 2)))
         else:
             raise ValueError(args.label_mode)
@@ -279,6 +289,14 @@ def main():
     parser.add_argument("--num_points", type=int, default=512, help="N points per fragment side.")
     parser.add_argument("--contact_eps", type=float, default=0.05)
     parser.add_argument("--label_sigma", type=float, default=0.02)
+    parser.add_argument(
+        "--label_topk", type=int, default=8,
+        help="Cap the number of positive columns per soft-label row to the K nearest "
+             "candidates under contact_eps, BEFORE Gaussian weighting -- decouples label "
+             "sharpness from local point density (a dense fragment can have tens of points "
+             "within contact_eps regardless of label_sigma). 0 or negative = no cap (legacy "
+             "behaviour, for before/after comparison). No effect on --label_mode hard.",
+    )
     parser.add_argument("--label_mode", default="soft", choices=["hard", "soft"])
     parser.add_argument("--sample_mode", default="random", choices=["random", "fps"])
     parser.add_argument(
@@ -330,7 +348,8 @@ def main():
 
     print(f"\nPhase 3A pair-dataset check on {args.categories}/{args.split} "
           f"(mask={args.mask_strategy}, N={args.num_points}, sample_mode={args.sample_mode}, "
-          f"label_mode={args.label_mode}, directed={not args.undirected})...")
+          f"label_mode={args.label_mode}, label_topk={args.label_topk}, label_sigma={args.label_sigma}, "
+          f"directed={not args.undirected})...")
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
@@ -501,6 +520,7 @@ def main():
             "config": {
                 "mask_strategy": args.mask_strategy, "num_points": args.num_points,
                 "contact_eps": args.contact_eps, "label_sigma": args.label_sigma,
+                "label_topk": args.label_topk,
                 "label_mode": args.label_mode, "sample_mode": args.sample_mode,
                 "directed": not args.undirected,
             },
