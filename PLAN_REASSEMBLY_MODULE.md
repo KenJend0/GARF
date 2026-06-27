@@ -563,6 +563,32 @@ bonne paire (soutient un module de compatibilité cluster-cluster appris, Phase 
 `oracle_cluster_pair` reste mauvais aussi, la limite est plus profonde que la sélection
 (descripteurs/RANSAC eux-mêmes insuffisants même sur la bonne paire).
 
+**Résultat (2026-06-27) — Cas B confirmé :** `oracle_cluster_pair` `Pose@30`=2.47%,
+`RotErr`=119.7°, `TransErr`=0.245 — seulement une amélioration modeste par rapport à
+`cluster_based` (2.01%/127.1°/0.342) et `global` (1.26%/126.2°/0.345), très loin du saut
+spectaculaire (10-20%) qui aurait indiqué que la sélection de paire était le vrai
+goulot. `no_oracle_match`=49.23% (cohérent avec `EdgeCoverage`≈43-44% de la Phase 2D) :
+même en cherchant la meilleure paire possible, ~50% des arêtes n'ont structurellement
+aucune paire de clusters qui se recouvre géométriquement. **Même avec la bonne paire
+(quand elle existe), le matching reste très imparfait** — limite plus profonde que la
+sélection de clusters.
+
+### Conclusion finale Phase 2 (toutes sous-phases)
+
+> Le verrou n'est plus seulement "quels points donner au matcher" — le CNN n'est jamais
+> le facteur limitant (confirmé à chaque étape : recall en Phase 1, précision de
+> correspondance en Phase 2A-C, structure spatiale en Phase 2D), et le clustering
+> spatial récupère une partie réelle du problème de séparation d'interface. Mais le
+> **matcher géométrique lui-même** (descripteurs faits main + RANSAC, même avec le
+> meilleur scoring normal-aware trouvé) a un plafond de performance bas et largement
+> indépendant de la qualité du pool de candidats : `gt_edge` (oracle pair-specific sur
+> tout le masque fracture) culmine à ~9.6% de `Pose@30`, et `oracle_cluster_pair`
+> (oracle de sélection sur des clusters plus petits) reste à ~2.5%. Aucun raffinement du
+> filtrage ou de la sélection de candidats ne lèvera cette limite — elle est intrinsèque
+> au pipeline de matching par descripteurs géométriques + RANSAC. **La Phase 3 (module
+> appris) n'est donc pas une amélioration optionnelle, mais une nécessité démontrée
+> empiriquement** pour dépasser ce plafond.
+
 **Protocole en deux temps** (ne pas mélanger les deux questions) :
 - **A. Registration sur paires positives** (`graph[i,j]=True` uniquement, ce que fait déjà
   `phase2_geometric_baseline.py`) : rotation/translation error, inlier_ratio,
