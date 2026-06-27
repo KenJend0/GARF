@@ -124,6 +124,11 @@ def build_pair_sample(
 
     n_mask_i, n_mask_j = int(mask_i_bool.sum()), int(mask_j_bool.sum())
     diag["mask_points_i"], diag["mask_points_j"] = n_mask_i, n_mask_j
+    # Informational, NOT a pipeline bug: a real fragment can have a tiny fracture mask
+    # (e.g. a small chip touching several neighbors, Phase 2B's avail_rate confound) while
+    # its neighbor has thousands of points -- this is expected data asymmetry, tracked as
+    # a rate rather than flagged per-pair as a "sanity issue".
+    diag["asymmetric_pair"] = n_mask_i < 0.5 * N or n_mask_j < 0.5 * N
 
     fallback_i = n_mask_i == 0
     fallback_j = n_mask_j == 0
@@ -238,12 +243,6 @@ def run_sanity_checks(sample, diag, pair_meta) -> list:
     for key in ("points_i", "points_j", "normals_i", "normals_j", "cnn_score_i", "cnn_score_j", "geom_feats_i", "geom_feats_j"):
         if not np.isfinite(sample[key]).all():
             issues.append(f"{pair_meta}: NaN/Inf in {key}")
-
-    if diag["mask_points_i"] < 0.5 * N or diag["mask_points_j"] < 0.5 * N:
-        issues.append(
-            f"{pair_meta}: mask_points_i={diag['mask_points_i']} mask_points_j={diag['mask_points_j']} "
-            f"(< 50% of N={N}, frequent padding)"
-        )
 
     return issues
 
@@ -463,6 +462,8 @@ def main():
         print(f"    {key}: p10={pct(key,10):.0f} p50={pct(key,50):.0f} p90={pct(key,90):.0f}")
     print(f"  padding_rate_i={mean('padding_i'):.2%}  padding_rate_j={mean('padding_j'):.2%}")
     print(f"  fallback_rate={mean('fallback'):.2%}")
+    print(f"  asymmetric_pair_rate={mean('asymmetric_pair'):.2%}  "
+          f"(informational: one side's mask < 50% of N -- real fragment-size asymmetry, not a bug)")
     print(f"  mean_valid_points_i={mean('valid_points_i'):.1f}  mean_valid_points_j={mean('valid_points_j'):.1f}")
     print(f"  contact_row_rate={mean('contact_row_rate'):.2%}  dustbin_row_rate={mean('dustbin_row_rate'):.2%}")
     print(f"  target_density={mean('target_density'):.4f}  mean_matches_per_contact_row={mean('mean_matches_per_contact_row'):.2f}")
@@ -495,6 +496,7 @@ def main():
             "mask_points_j_p10_p50_p90": [pct("mask_points_j", q) for q in (10, 50, 90)],
             "padding_rate_i": mean("padding_i"), "padding_rate_j": mean("padding_j"),
             "fallback_rate": mean("fallback"),
+            "asymmetric_pair_rate": mean("asymmetric_pair"),
             "mean_valid_points_i": mean("valid_points_i"), "mean_valid_points_j": mean("valid_points_j"),
             "contact_row_rate": mean("contact_row_rate"), "dustbin_row_rate": mean("dustbin_row_rate"),
             "target_density": mean("target_density"),
