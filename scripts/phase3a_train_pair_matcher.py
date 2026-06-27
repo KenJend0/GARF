@@ -234,6 +234,12 @@ def compute_step(matcher_model, batch: dict, args, use_pose_loss: bool):
             "match_top8_recall": float(top8_recall.item()),
             "random_top1_acc": float(random_top1.item()),
             "random_top8_recall": float(random_top8.item()),
+            # Explicit gap vs chance -- the metric that actually answers "is this feature
+            # set learning anything", since raw top1_acc/top8_recall alone are meaningless
+            # without knowing the random baseline at the same n_valid_j (cf. ablations A/B
+            # vs C1: a positive, persistent top8_gap is what distinguished C1 from A/B).
+            "top1_gap": float((top1_acc - random_top1).item()),
+            "top8_gap": float((top8_recall - random_top8).item()),
             "non_dustbin_confidence": float(non_dustbin_conf.item()),
             "logit_scale": float(matcher_model.matcher.logit_scale.exp().item()),
             "dustbin_bias": float(matcher_model.matcher.dustbin_bias.item()),
@@ -313,9 +319,11 @@ def print_epoch_summary(tag: str, epoch: int, summary: dict):
     print(f"    dustbin_pred_rate={summary.get('dustbin_pred_rate', float('nan')):.2%}  "
           f"contact_pred_rate={summary.get('contact_pred_rate', float('nan')):.2%}")
     print(f"    match_top1_acc={summary.get('match_top1_acc', float('nan')):.2%} "
-          f"(random={summary.get('random_top1_acc', float('nan')):.2%})  "
+          f"(random={summary.get('random_top1_acc', float('nan')):.2%}, "
+          f"gap={summary.get('top1_gap', float('nan')):+.2%})  "
           f"match_top8_recall={summary.get('match_top8_recall', float('nan')):.2%} "
-          f"(random={summary.get('random_top8_recall', float('nan')):.2%})  "
+          f"(random={summary.get('random_top8_recall', float('nan')):.2%}, "
+          f"gap={summary.get('top8_gap', float('nan')):+.2%})  "
           f"non_dustbin_confidence={summary.get('non_dustbin_confidence', float('nan')):.3f}")
     print(f"    pose_valid_rate={summary.get('pose_valid_rate', float('nan')):.2%}  "
           f"RotErr(mean/median)={summary.get('rot_err_deg_mean', float('nan')):.2f}/"
@@ -550,7 +558,8 @@ def main():
         # the two scalars" is answerable from this file alone (no need to send raw logs).
         trend_keys = [
             "loss", "l_corr", "entropy", "dustbin_pred_rate", "contact_pred_rate",
-            "match_top1_acc", "random_top1_acc", "match_top8_recall", "random_top8_recall",
+            "match_top1_acc", "random_top1_acc", "top1_gap",
+            "match_top8_recall", "random_top8_recall", "top8_gap",
             "non_dustbin_confidence", "logit_scale", "dustbin_bias", "dustbin_minus_max_match",
             "pose_success_30deg_0.1", "rot_err_deg_mean",
         ]
