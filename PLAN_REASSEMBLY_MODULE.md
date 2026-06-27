@@ -955,9 +955,27 @@ sur les 35% restantes), exactement le même raccourci d'imbalance que l'ancien
 ligne, ~65% déséquilibre) : sépare parfaitement les deux classes avec la
 repondération.
 
-**Prochaine étape : relancer 4A avec le fix**, même protocole exact que C1 (15
-epochs), pour vérifier que `L_contact` apporte un vrai bénéfice par rapport à C1
-(`top1_gap` moins négatif, `dustbin_pred_rate` qui suit le vrai taux sans collapse
+**Second bug trouvé sur le run 4A après le fix de pondération (2026-06-27) :**
+`contact_pred_rate` ne s'effondre plus à 0% (la pondération fonctionne), mais le
+collapse vers dustbin persiste sous une forme différente — `dustbin_minus_max_match`
+passe de -1.45 à **+1.86** (train) / +3.43 (val) sur 15 epochs, `dustbin_pred_rate`
+jusqu'à 86.6% (train) / 99% (val). Cause : `dustbin_logit` (sortie de la MLP) n'avait
+aucune borne liée à l'échelle des logits de matching. `L_contact` (BCE) pousse
+légitimement `dustbin_logit` vers des valeurs extrêmes pour les lignes dustbin
+correctement classées (comportement BCE normal) — mais ces valeurs (observées
+3.7-6+, vs logits de matching ~0.3-2.6) dominent ensuite le softmax de `L_corr`, qui
+compare `dustbin_logit` aux logits de matching **de la même ligne** : un point peut
+être "correctement classé" par la BCE en moyenne tout en faisant systématiquement
+gagner dustbin dans la comparaison softmax réelle. **Fix : borner `dustbin_logit` à
+`(-scale, scale)` via `scale * tanh(MLP(desc_i))`**, en réutilisant le même
+`logit_scale` que les logits de matching (au lieu d'une sortie MLP libre) — supprime
+structurellement le degré de liberté incontrôlé plutôt que d'espérer un équilibre
+entre les deux pertes. Vérifié localement : après 300 pas de gradient agressif,
+`|dustbin_logit| <= scale` reste garanti.
+
+**Prochaine étape : relancer 4A avec ce second fix**, même protocole exact que C1 (15
+epochs), pour vérifier que `L_contact` apporte enfin un vrai bénéfice par rapport à
+C1 (`top1_gap` moins négatif, `dustbin_pred_rate` qui suit le vrai taux sans collapse
 dans aucune direction) avant d'attaquer 4B (cross-attention).
 
 ## Métriques d'évaluation déjà disponibles (ne pas réécrire)
