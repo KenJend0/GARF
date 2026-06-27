@@ -973,10 +973,47 @@ structurellement le degré de liberté incontrôlé plutôt que d'espérer un é
 entre les deux pertes. Vérifié localement : après 300 pas de gradient agressif,
 `|dustbin_logit| <= scale` reste garanti.
 
-**Prochaine étape : relancer 4A avec ce second fix**, même protocole exact que C1 (15
-epochs), pour vérifier que `L_contact` apporte enfin un vrai bénéfice par rapport à
-C1 (`top1_gap` moins négatif, `dustbin_pred_rate` qui suit le vrai taux sans collapse
-dans aucune direction) avant d'attaquer 4B (cross-attention).
+**Résultat 4A après les deux fixs (2026-06-28) — ne bat pas C1.**
+`dustbin_minus_max_match` reste positif en fin de run (+1.75 train, +2.28 val), mais
+ce n'est plus un bug d'échelle : `dustbin_logit` et les logits de matching sont bien
+sur la même plage bornée `[-scale, scale]`, vérifié. C'est que `dustbin_logit` sature
+naturellement près de la borne haute (poussé par `L_contact` à être confiant sur les
+~65% de lignes vraiment dustbin), alors que le meilleur candidat de match par ligne
+(`max_match_logit_mean`≈2.0-2.7) reste modeste — parce que le signal de matching
+sous-jacent (corrélation cosinus simple) est structurellement faible, comme établi
+dans toute la Phase 3A. Comparaison directe `top8_gap` moyen sur 15 epochs : train
+1.01pp (4A) vs 1.04pp (C1, quasi identique) ; val 1.32pp (4A) vs 1.53pp (C1,
+**légèrement inférieur**). **4A ne dégrade pas, mais n'améliore pas non plus la
+qualité du matching par rapport au biais global simple de C1.**
+
+**Conclusion 4A : confirme, plutôt que résout, le diagnostic de départ de la Phase 4.**
+Séparer "dustbin ou pas" de "quel point" (l'objectif de 4A) ne change rien si le
+signal de matching lui-même (issu d'un encodeur qui traite `i` et `j` indépendamment)
+reste trop faible pour produire un meilleur candidat que le seuil dustbin appris. Le
+verrou n'est pas la formulation du dustbin (désormais propre et numériquement stable)
+— c'est l'absence d'interaction entre fragments dans l'encodeur. **Décision : ne pas
+continuer à affiner 4A (ex. tuner `lambda_contact`), passer directement à 4B
+(cross-attention).**
+
+**4B — implémenté (2026-06-28) :** `CrossAttentionBlock` (self-attention intra-fragment
+puis cross-attention `i↔j`, poids partagés entre les deux directions) empilé en
+`CrossAttnEncoder` (défaut 2 couches, 4 têtes), branché sur la **même**
+`SoftCorrespondenceMatcher` déjà validée en 4A (dustbin borné, `logit_scale` appris) —
+isole l'effet de l'interaction de tout le reste (rien d'autre ne change).
+`--matcher_arch {mlp_cosine, cross_attn}` dans `phase3a_train_pair_matcher.py` ;
+signature `forward` uniformisée `(feat_i, feat_j, valid_i, valid_j)` pour les deux
+architectures. Vérifié localement (forward/backward, gradients dans tout l'encodeur,
+padding géré via `key_padding_mask`, init identique à 4A pour `dustbin_logit`).
+
+**Note de compatibilité :** nouvelle classe de modèle (`CrossAttnPairMatcherModel`),
+checkpoints 4A/C1/C2 non chargeables ici non plus (architecture différente). Repartir
+de zéro.
+
+**Prochaine étape : lancer 4B**, en réduisant `--pairs_per_step` (ex. 4-8 au lieu de
+16, le coût de l'attention est O(N²) par paire) et en gardant le reste du protocole
+identique (15 epochs, `--feature_set cnn_feat`, mêmes inits) pour comparer
+`top1_gap`/`top8_gap` à C1 et 4A. Critère de succès déjà fixé : `top8_gap` > C1/4A,
+`top1_gap` moins négatif (idéalement positif).
 
 ## Métriques d'évaluation déjà disponibles (ne pas réécrire)
 
@@ -997,10 +1034,11 @@ indépendante.
 ## Prochaine action concrète
 
 Phase 0, 1, 2 confirmées/closes. Phase 3A clôturée (2026-06-27, matcher minimal
-insuffisant mais signal CNN confirmé réel — voir conclusion ci-dessus). **Phase 4
-ouverte (cadrage ci-dessus) : 4A (dustbin par point + L_contact) implémenté et
-vérifié localement.** Prochaine étape concrète : relancer l'entraînement avec cette
-nouvelle architecture (repartir de zéro, pas de `--resume_from` depuis les
-checkpoints Phase 3A — incompatibles), sur le même protocole que C1 (15 epochs,
-`--feature_set cnn_feat`), pour confirmer que `L_contact` apporte un bénéfice avant
-d'attaquer 4B (cross-attention).
+insuffisant mais signal CNN confirmé réel — voir conclusion ci-dessus). Phase 4
+ouverte : **4A fait et clos** (dustbin par point + `L_contact`, deux bugs trouvés et
+corrigés, conclusion : confirme le diagnostic sans le résoudre — `top8_gap` ≈ C1,
+pas d'amélioration). **4B implémenté (cross-attention, ci-dessus), prêt à lancer.**
+Prochaine étape concrète : lancer l'entraînement avec `--matcher_arch cross_attn`
+(repartir de zéro, pas de `--resume_from`), `--pairs_per_step` réduit (4-8), même
+protocole sinon (15 epochs, `--feature_set cnn_feat`), comparer `top1_gap`/`top8_gap`
+à C1/4A.
