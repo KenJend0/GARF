@@ -440,6 +440,54 @@ Bon signe attendu : `score_gap` diminue fortement (idéalement négatif), `Pose@
 au-dessus de 10-15%, `RotErr` nettement sous 120°. `InlierRatio`/`RansacValid` peuvent
 baisser — acceptable, on préfère moins de poses candidates mais plus fiables.
 
+**Résultat (2026-06-27)** : `count_times_quality_and_normal` (score doux, sans filtre dur)
+sur `gt_edge` donne la meilleure config — `Pose@30`=9.62%, `RotErr`=103.3° (vs 127.0°
+distance-only), `score_gap`=+10.46 dans son propre mode de scoring (pas comparable en
+valeur absolue à `count` — mais nettement réduit *dans son propre référentiel*, cohérent
+avec l'amélioration de `Pose@30`/`RotErr`). Combiner filtre dur (`--normal_tau -0.3/-0.5`)
++ score doux n'apporte rien de plus (`score_gap` même légèrement pire) — **le signal
+normal doit rester continu, pas être un filtre dur** ; config retenue : score doux seul,
+sans `--normal_tau`.
+
+**Test décisif sur les masques réels** (`gt`, `thresh0.2/0.3/0.5`, même config) : effondrement
+net — `CorrPrec` 22.79%→2.6-3.2%, `Pose@30` 9.6%→1.3-2.0%. `thresh0.2/0.3/0.5` ≈ `gt`
+(le CNN n'est toujours pas en cause). **Conclusion : le gain du scoring normal-aware ne se
+transfère pas aux masques réels, parce que `gt_edge` est un oracle pair-specific
+(restreint via la pose GT, irréalisable en pratique) alors que `gt`/`thresh` mélangent les
+points fracture de TOUS les voisins d'un fragment.** Le verrou n'est plus "trouver la
+bonne pose à partir de points fracture" mais "identifier quelle partie de la fracture
+d'un fragment correspond à quel voisin" — un problème de segmentation d'interface, pas de
+matching point-à-point. Aucune amélioration du descripteur/scoring ne peut compenser un
+pool de candidats dominé par du bruit structurel (points d'autres interfaces).
+
+## Phase 2D — Diagnostic clustering d'interfaces (proto, pas un pipeline complet)
+
+Teste si les points fracture d'un fragment se découpent naturellement en patches
+spatiaux correspondant chacun à un voisin, **sans connaître la pose GT** (contrairement à
+`gt_edge`) — si oui, un clustering spatial naïf pourrait approximer `gt_edge` en
+pratique. Implémenté dans `scripts/phase2d_interface_clustering_diagnostic.py`. PAS de
+RANSAC, PAS de descripteurs — diagnostic pur :
+1. Clustering par connectivité (graphe de proximité radius + composantes connexes,
+   scipy uniquement, pas de dépendance sklearn) sur les points fracture (masque `gt` ou
+   `thresh<T>`) d'un fragment, dans son repère local (structure invariante à la pose).
+2. Étiquetage GT (diagnostic uniquement) : voisin réel le plus proche en repère assemblé
+   (formule Phase 0), si distance `< 0.05` (même tolérance que Phase 1).
+3. Métriques : `mean_clusters_per_fragment`, `noise_rate`, `cluster_purity` (pondérée par
+   taille de cluster), `mixed_cluster_rate` (`<50%` pureté), `edge_coverage` (existe-t-il
+   un cluster majoritairement étiqueté `j` pour l'arête `(i,j)` ?),
+   `best_cluster_corrprec_upper_bound` (pureté du meilleur cluster par arête — borne
+   supérieure de `CorrPrec` atteignable si on ne donnait au matcher que ce cluster).
+
+Lecture : `purity`/`edge_coverage` > 70% et `best_cluster_corrprec` >> `CorrPrec` global
+(2.6-3.2%) → interfaces spatialement séparables, un module cluster→matching est une
+suite crédible. Pureté faible / couverture basse → la séparation spatiale naïve ne
+suffit pas, il faudra un modèle appris pair-specific ou des features plus riches.
+
+Ne pas repartir sur FPFH/SHOT ou un matcher appris avant ce diagnostic : le dernier
+résultat montre que le problème est **avant** le descripteur point-à-point (mauvais
+voisinage de candidats) — un meilleur descripteur sur un pool contaminé par plusieurs
+interfaces ne résoudra pas le problème de fond.
+
 **Protocole en deux temps** (ne pas mélanger les deux questions) :
 - **A. Registration sur paires positives** (`graph[i,j]=True` uniquement, ce que fait déjà
   `phase2_geometric_baseline.py`) : rotation/translation error, inlier_ratio,
