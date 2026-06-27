@@ -444,6 +444,20 @@ def main():
     )
     parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--out_dir", default=None, help="Directory to save matcher checkpoints.")
+    parser.add_argument(
+        "--resume_from", default=None,
+        help="Path to a matcher_model.state_dict() checkpoint (e.g. .../last.pt) to "
+             "resume training from -- continues C1/C2 etc. past their original --epochs "
+             "instead of retraining from scratch. Optimizer state is NOT restored (Adam "
+             "re-initialized fresh); use --start_epoch so logged epoch numbers stay "
+             "continuous with the original run.",
+    )
+    parser.add_argument(
+        "--start_epoch", type=int, default=0,
+        help="First epoch index to run (with --resume_from, set to the original run's "
+             "--epochs so this run's log/epoch numbers continue from there, e.g. resuming "
+             "a 15-epoch run to reach 40 total: --start_epoch 15 --epochs 40).",
+    )
     parser.add_argument("--summary_json", default=None)
     args = parser.parse_args()
 
@@ -496,6 +510,12 @@ def main():
         init_logit_scale=args.init_logit_scale, init_dustbin_bias=args.init_dustbin_bias,
     ).to(device)
 
+    if args.resume_from:
+        print(f"Resuming matcher weights from: {args.resume_from}")
+        matcher_model.load_state_dict(
+            torch.load(args.resume_from, map_location=device, weights_only=True)
+        )
+
     # Two LR groups: the calibration scalars (logit_scale, dustbin_bias) affect every row
     # uniformly, giving them a much cleaner/stronger gradient than the per-point encoder --
     # at the same LR they can absorb most of the early loss improvement on their own
@@ -525,7 +545,7 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
 
     history = {"train": [], "val": []}
-    for epoch in range(args.epochs):
+    for epoch in range(args.start_epoch, args.epochs):
         use_pose_loss = args.use_kabsch and epoch >= args.warmup_epochs
         print(f"\n=== Epoch {epoch} (use_pose_loss={use_pose_loss}) ===")
 
