@@ -473,6 +473,7 @@ def main():
 
     print(f"\nPhase 3A {'V1 (corr+pose)' if args.use_kabsch else 'V0 (corr only)'} training "
           f"on {args.categories}/{args.train_split} (N={args.num_points}, mask={args.mask_strategy}, "
+          f"feature_set={args.feature_set} (in_dim={FEATURE_SET_DIMS[args.feature_set]}), "
           f"label_topk={args.label_topk}, pairs_per_step={args.pairs_per_step}, "
           f"init_logit_scale={args.init_logit_scale}, init_dustbin_bias={args.init_dustbin_bias}, "
           f"scalar_lr_mult={args.scalar_lr_mult})...")
@@ -537,7 +538,8 @@ def main():
                     "config": {
                         "categories": args.categories, "train_split": args.train_split,
                         "val_split": args.val_split, "mask_strategy": args.mask_strategy,
-                        "num_points": args.num_points, "label_topk": args.label_topk,
+                        "feature_set": args.feature_set, "num_points": args.num_points,
+                        "label_topk": args.label_topk,
                         "label_mode": args.label_mode, "use_kabsch": args.use_kabsch,
                         "warmup_epochs": args.warmup_epochs, "epochs": args.epochs,
                         "lr": args.lr, "scalar_lr_mult": args.scalar_lr_mult,
