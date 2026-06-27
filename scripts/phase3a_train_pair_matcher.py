@@ -151,6 +151,16 @@ def compute_step(matcher_model, batch: dict, args, use_pose_loss: bool):
         pose_success = pose_valid & (rot_err_deg < 30.0) & (trans_err < 0.1)
         has_valid_pose = pose_valid.any()
 
+        # Logit-scale diagnostics (cf. the dustbin-collapse fix): if dustbin_minus_max_match
+        # is positive almost everywhere, the dustbin logit still structurally outscores the
+        # best real match for most rows, which is exactly why dustbin_pred_rate would sit at
+        # ~100% regardless of how much signal the encoder has learned.
+        valid_pair_mask = batch["valid_i"].unsqueeze(-1) & batch["valid_j"].unsqueeze(1)  # [B,N,N]
+        match_logits = logits[..., :N]
+        match_logits_valid = match_logits[valid_pair_mask]
+        max_match_per_row = match_logits.masked_fill(~valid_pair_mask, float("-inf")).amax(dim=-1)
+        dustbin_logit_per_row = logits[..., -1]
+
         metrics = {
             "loss": float(loss.item()),
             "l_corr": float(l_corr.item()),
@@ -160,6 +170,17 @@ def compute_step(matcher_model, batch: dict, args, use_pose_loss: bool):
             "match_top1_acc": float(top1_acc.item()),
             "match_top8_recall": float(top8_recall.item()),
             "non_dustbin_confidence": float(non_dustbin_conf.item()),
+            "logit_scale": float(matcher_model.matcher.logit_scale.exp().item()),
+            "dustbin_bias": float(matcher_model.matcher.dustbin_bias.item()),
+            "match_logits_mean": float(match_logits_valid.mean().item()),
+            "match_logits_std": float(match_logits_valid.std().item()),
+            "match_logits_min": float(match_logits_valid.min().item()),
+            "match_logits_max": float(match_logits_valid.max().item()),
+            "dustbin_logit": float(dustbin_logit_per_row[valid_mask].mean().item()),
+            "max_match_logit_mean": float(max_match_per_row[valid_mask].mean().item()),
+            "dustbin_minus_max_match": float(
+                (dustbin_logit_per_row - max_match_per_row)[valid_mask].mean().item()
+            ),
             "pose_valid_rate": float(pose_valid.float().mean().item()),
             "rot_err_deg_mean": float(rot_err_deg[pose_valid].mean().item()) if has_valid_pose else float("nan"),
             "rot_err_deg_median": float(rot_err_deg[pose_valid].median().item()) if has_valid_pose else float("nan"),
@@ -207,7 +228,9 @@ def run_epoch(loader, cnn_model, geo_extractor, device, args, rng, matcher_model
         if train and log_every > 0 and n_steps % log_every == 0:
             print(f"    step {n_steps}: loss={metrics['loss']:.4f} l_corr={metrics['l_corr']:.4f} "
                   f"top1_acc={metrics['match_top1_acc']:.2%} dustbin_pred={metrics['dustbin_pred_rate']:.2%} "
-                  f"pose_success={metrics['pose_success_30deg_0.1']:.2%}")
+                  f"pose_success={metrics['pose_success_30deg_0.1']:.2%} "
+                  f"logit_scale={metrics['logit_scale']:.2f} dustbin_bias={metrics['dustbin_bias']:.2f} "
+                  f"dustbin_minus_max_match={metrics['dustbin_minus_max_match']:+.3f}")
 
     summary = {key: float(np.nanmean(vals)) for key, vals in agg.items()}
     summary["n_steps"] = n_steps
@@ -229,6 +252,15 @@ def print_epoch_summary(tag: str, epoch: int, summary: dict):
           f"TransErr(mean/median)={summary.get('trans_err_mean', float('nan')):.4f}/"
           f"{summary.get('trans_err_median', float('nan')):.4f}  "
           f"Pose@30deg_0.1={summary.get('pose_success_30deg_0.1', float('nan')):.2%}")
+    print(f"    logit_scale={summary.get('logit_scale', float('nan')):.2f}  "
+          f"dustbin_bias={summary.get('dustbin_bias', float('nan')):.2f}  "
+          f"match_logits(mean/std/min/max)={summary.get('match_logits_mean', float('nan')):.2f}/"
+          f"{summary.get('match_logits_std', float('nan')):.2f}/"
+          f"{summary.get('match_logits_min', float('nan')):.2f}/"
+          f"{summary.get('match_logits_max', float('nan')):.2f}  "
+          f"dustbin_logit={summary.get('dustbin_logit', float('nan')):.2f}  "
+          f"max_match_logit_mean={summary.get('max_match_logit_mean', float('nan')):.2f}  "
+          f"dustbin_minus_max_match={summary.get('dustbin_minus_max_match', float('nan')):+.3f}")
 
 
 def get_dataset(datamodule, split: str):

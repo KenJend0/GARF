@@ -24,6 +24,8 @@ Two usage modes, both built from the same model:
         an unstable/meaningless gradient through Kabsch's SVD).
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -63,11 +65,22 @@ class SoftCorrespondenceMatcher(nn.Module):
     onto a wrong j point -- hence a dustbin column instead of a plain softmax over j only.
     The dustbin logit is a single learned scalar bias (broadcast to every row/pair),
     not a full Sinkhorn/optimal-transport formulation -- deliberately minimal for V0.
+
+    Assumes desc_i/desc_j are L2-normalized (cosine similarity in [-1,1] -- true when
+    PairMatcherModel.normalize_desc=True, the default). A LEARNED `logit_scale`
+    (CLIP-style) replaces a fixed `/sqrt(D)` scaling: the latter was found empirically
+    to collapse training to "always predict dustbin" -- with unit-norm descriptors,
+    dividing by sqrt(D)=sqrt(128)~11.3 squashes match logits into [-0.09, 0.09] while
+    dustbin_bias is a free, unconstrained scalar, so the optimizer could cut the loss
+    cheaply by growing dustbin_bias alone instead of learning to separate descriptors.
+    Both initialized so match logits and the dustbin logit start on a comparable scale
+    (~10), removing that structural advantage.
     """
 
-    def __init__(self, desc_dim: int):
+    def __init__(self, desc_dim: int, init_logit_scale: float = 10.0):
         super().__init__()
         self.desc_dim = desc_dim
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(init_logit_scale)))
         self.dustbin_bias = nn.Parameter(torch.zeros(1))
 
     def forward(self, desc_i: torch.Tensor, desc_j: torch.Tensor, valid_j: torch.Tensor):
@@ -76,7 +89,9 @@ class SoftCorrespondenceMatcher(nn.Module):
         -- consistent with the `valid_target_col_rate=1.0` invariant already enforced in
         the dataset-check script). Returns (logits [B,N,N+1], P [B,N,N+1])."""
         B, N, D = desc_i.shape
-        S = torch.einsum("bnd,bmd->bnm", desc_i, desc_j) / (D ** 0.5)
+        cos_sim = torch.einsum("bnd,bmd->bnm", desc_i, desc_j)
+        scale = self.logit_scale.exp().clamp(max=50.0)
+        S = scale * cos_sim
         S = S.masked_fill(~valid_j.unsqueeze(1), float("-inf"))
         dustbin_col = self.dustbin_bias.view(1, 1, 1).expand(B, N, 1)
         logits = torch.cat([S, dustbin_col], dim=-1)
