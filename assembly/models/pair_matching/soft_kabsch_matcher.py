@@ -22,6 +22,17 @@ Two usage modes, both built from the same model:
   V1 -- add `geodesic_rotation_loss` + translation L2 on the weighted-Kabsch pose,
         after a warmup of V0-only epochs (an untrained correspondence matrix produces
         an unstable/meaningless gradient through Kabsch's SVD).
+
+Phase 4 (2026-06-27/28) added on top of this minimal baseline after closing Phase 3A
+(CNN features carry real but weak signal, MLP+cosine matcher can't exploit it -- see
+plan): 4A replaced the global dustbin_bias scalar with a per-point dustbin_head
+(below), fixed through two rounds (class-imbalance reweighting, then bounding
+dustbin_logit to the match-logit scale) but did NOT beat the simple global-bias
+baseline on top8_gap -- confirming the bottleneck is the encoder's lack of
+cross-fragment interaction, not the dustbin formulation. 4B (`CrossAttnPairMatcherModel`,
+below) addresses that directly: self-attention within each fragment + cross-attention
+between i and j BEFORE the same SoftCorrespondenceMatcher head (kept unchanged,
+already validated) -- isolates the effect of interaction from everything else.
 """
 
 import math
@@ -141,13 +152,105 @@ class PairMatcherModel(nn.Module):
         self.matcher = SoftCorrespondenceMatcher(desc_dim, init_logit_scale, init_dustbin_bias)
         self.normalize_desc = normalize_desc
 
-    def forward(self, feat_i: torch.Tensor, feat_j: torch.Tensor, valid_j: torch.Tensor):
+    def forward(self, feat_i: torch.Tensor, feat_j: torch.Tensor,
+                valid_i: torch.Tensor, valid_j: torch.Tensor):
+        """valid_i is accepted but unused -- this encoder processes i and j independently
+        (no interaction, cf. Phase 4B's CrossAttnPairMatcherModel below, which DOES need
+        it for self-attention masking). Kept in the signature so callers can use the same
+        call site for both model classes."""
         desc_i = self.encoder(feat_i)
         desc_j = self.encoder(feat_j)
         if self.normalize_desc:
             # L2-normalize before the dot product so descriptor magnitude can't trivially
             # sharpen/flatten the softmax temperature -- the network must encode
             # similarity in direction, not norm.
+            desc_i = F.normalize(desc_i, dim=-1)
+            desc_j = F.normalize(desc_j, dim=-1)
+        return self.matcher(desc_i, desc_j, valid_j)
+
+
+class CrossAttentionBlock(nn.Module):
+    """One block of: self-attention within each fragment, then cross-attention between
+    fragments, then a per-point FFN -- standard transformer-encoder pattern, applied
+    symmetrically to i and j (i attends to j, j attends to i, same block instance reused
+    so weights are shared -- consistent with the rest of this module's "weight sharing
+    between fragments" convention, e.g. PointEncoder is also a single shared MLP)."""
+
+    def __init__(self, dim: int, num_heads: int = 4, ff_mult: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm_self = nn.LayerNorm(dim)
+        self.norm_cross = nn.LayerNorm(dim)
+        self.norm_ff = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, dim * ff_mult), nn.GELU(), nn.Linear(dim * ff_mult, dim),
+        )
+
+    def _apply(self, x: torch.Tensor, other: torch.Tensor, kpm_self: torch.Tensor, kpm_other: torch.Tensor):
+        a, _ = self.self_attn(x, x, x, key_padding_mask=kpm_self, need_weights=False)
+        x = self.norm_self(x + a)
+        c, _ = self.cross_attn(x, other, other, key_padding_mask=kpm_other, need_weights=False)
+        x = self.norm_cross(x + c)
+        x = self.norm_ff(x + self.ff(x))
+        return x
+
+    def forward(self, x_i: torch.Tensor, x_j: torch.Tensor, valid_i: torch.Tensor, valid_j: torch.Tensor):
+        """x_i, x_j: [B, N, D]. valid_i/valid_j: [B, N] bool. nn.MultiheadAttention's
+        key_padding_mask convention is True=IGNORE, the opposite of valid_i/valid_j
+        (True=keep) -- inverted here, once, rather than at every call site."""
+        kpm_i, kpm_j = ~valid_i, ~valid_j
+        # Both fragments updated from the SAME pre-block (x_i, x_j) -- not sequentially
+        # (which would make j's cross-attention see an already-updated i within the same
+        # block, breaking the symmetry between "i attends to j" and "j attends to i").
+        new_i = self._apply(x_i, x_j, kpm_i, kpm_j)
+        new_j = self._apply(x_j, x_i, kpm_j, kpm_i)
+        return new_i, new_j
+
+
+class CrossAttnEncoder(nn.Module):
+    """Phase 4B encoder: shared input projection -> L stacked CrossAttentionBlocks. Each
+    fragment's points first attend to each other (self-attention), then to the OTHER
+    fragment's points (cross-attention) -- the structural fix Phase 4A's per-point
+    dustbin head couldn't provide: i and j are no longer encoded independently before
+    the cosine-similarity head sees them."""
+
+    def __init__(self, in_dim: int, desc_dim: int = 128, num_layers: int = 2,
+                 num_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_dim, desc_dim), nn.LayerNorm(desc_dim), nn.GELU(),
+        )
+        self.blocks = nn.ModuleList([
+            CrossAttentionBlock(desc_dim, num_heads, dropout=dropout) for _ in range(num_layers)
+        ])
+
+    def forward(self, feat_i: torch.Tensor, feat_j: torch.Tensor,
+                valid_i: torch.Tensor, valid_j: torch.Tensor):
+        x_i, x_j = self.input_proj(feat_i), self.input_proj(feat_j)
+        for block in self.blocks:
+            x_i, x_j = block(x_i, x_j, valid_i, valid_j)
+        return x_i, x_j
+
+
+class CrossAttnPairMatcherModel(nn.Module):
+    """Phase 4B model: CrossAttnEncoder -> the SAME SoftCorrespondenceMatcher used by
+    PairMatcherModel (unchanged, already validated in Phase 3A/4A) -- isolates the effect
+    of adding cross-fragment interaction from everything else (dustbin head, logit_scale
+    bounding, loss functions all stay identical)."""
+
+    def __init__(self, in_dim: int = 65, desc_dim: int = 128, num_layers: int = 2,
+                 num_heads: int = 4, dropout: float = 0.1, normalize_desc: bool = True,
+                 init_logit_scale: float = 10.0, init_dustbin_bias: float = 0.0):
+        super().__init__()
+        self.encoder = CrossAttnEncoder(in_dim, desc_dim, num_layers, num_heads, dropout)
+        self.matcher = SoftCorrespondenceMatcher(desc_dim, init_logit_scale, init_dustbin_bias)
+        self.normalize_desc = normalize_desc
+
+    def forward(self, feat_i: torch.Tensor, feat_j: torch.Tensor,
+                valid_i: torch.Tensor, valid_j: torch.Tensor):
+        desc_i, desc_j = self.encoder(feat_i, feat_j, valid_i, valid_j)
+        if self.normalize_desc:
             desc_i = F.normalize(desc_i, dim=-1)
             desc_j = F.normalize(desc_j, dim=-1)
         return self.matcher(desc_i, desc_j, valid_j)

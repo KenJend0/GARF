@@ -50,8 +50,8 @@ from scripts.phase3a_pair_dataset_check import iter_positive_pairs
 from assembly.models.cnn_segmentation_model import CNNFracSeg
 from assembly.models.hybrid_geometry_features import HybridGeometryFeatures
 from assembly.models.pair_matching.soft_kabsch_matcher import (
-    PairMatcherModel, soft_correspondence_loss, contact_loss, matching_entropy,
-    weighted_kabsch, geodesic_rotation_error,
+    PairMatcherModel, CrossAttnPairMatcherModel, soft_correspondence_loss, contact_loss,
+    matching_entropy, weighted_kabsch, geodesic_rotation_error,
 )
 
 
@@ -149,7 +149,9 @@ def compute_step(matcher_model, batch: dict, args, use_pose_loss: bool):
     """One forward pass + loss + diagnostic metrics for a stacked pair-batch. Pose
     metrics (Kabsch-based) are ALWAYS computed for monitoring; `use_pose_loss` only
     controls whether they're added to the backward graph (V1 behaviour)."""
-    logits, P, dustbin_logit = matcher_model(batch["feat_i"], batch["feat_j"], batch["valid_j"])
+    logits, P, dustbin_logit = matcher_model(
+        batch["feat_i"], batch["feat_j"], batch["valid_i"], batch["valid_j"]
+    )
     N = batch["points_i"].shape[1]
 
     l_corr = soft_correspondence_loss(
@@ -400,8 +402,21 @@ def main():
              "needed). Test C1 before C2 (don't conflate two unknowns).",
     )
     # Model args.
+    parser.add_argument(
+        "--matcher_arch", default="mlp_cosine", choices=["mlp_cosine", "cross_attn"],
+        help="'mlp_cosine' (default, Phase 3A/4A): independent shared-MLP encoder per "
+             "fragment + cosine correlation -- i and j never see each other before "
+             "matching. 'cross_attn' (Phase 4B): self-attention within each fragment + "
+             "cross-attention between i and j before the SAME matching head -- the "
+             "structural fix for the bottleneck 4A confirmed (per-point dustbin alone "
+             "doesn't help if the underlying descriptors carry no cross-fragment signal). "
+             "Heavier: lower --pairs_per_step (e.g. 4-8) and/or --num_points if it doesn't "
+             "fit in memory.",
+    )
     parser.add_argument("--desc_dim", type=int, default=128)
-    parser.add_argument("--encoder_hidden", default="64,128")
+    parser.add_argument("--encoder_hidden", default="64,128", help="mlp_cosine only.")
+    parser.add_argument("--num_layers", type=int, default=2, help="cross_attn only.")
+    parser.add_argument("--num_heads", type=int, default=4, help="cross_attn only.")
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--no_normalize_desc", action="store_true")
     parser.add_argument(
@@ -523,11 +538,19 @@ def main():
         use_roughness=True, use_dist_to_centroid=True,
     )
 
-    matcher_model = PairMatcherModel(
-        in_dim=FEATURE_SET_DIMS[args.feature_set], hidden=hidden, desc_dim=args.desc_dim,
-        dropout=args.dropout, normalize_desc=not args.no_normalize_desc,
-        init_logit_scale=args.init_logit_scale, init_dustbin_bias=args.init_dustbin_bias,
-    ).to(device)
+    if args.matcher_arch == "cross_attn":
+        matcher_model = CrossAttnPairMatcherModel(
+            in_dim=FEATURE_SET_DIMS[args.feature_set], desc_dim=args.desc_dim,
+            num_layers=args.num_layers, num_heads=args.num_heads, dropout=args.dropout,
+            normalize_desc=not args.no_normalize_desc,
+            init_logit_scale=args.init_logit_scale, init_dustbin_bias=args.init_dustbin_bias,
+        ).to(device)
+    else:
+        matcher_model = PairMatcherModel(
+            in_dim=FEATURE_SET_DIMS[args.feature_set], hidden=hidden, desc_dim=args.desc_dim,
+            dropout=args.dropout, normalize_desc=not args.no_normalize_desc,
+            init_logit_scale=args.init_logit_scale, init_dustbin_bias=args.init_dustbin_bias,
+        ).to(device)
 
     if args.resume_from:
         print(f"Resuming matcher weights from: {args.resume_from}")
@@ -554,12 +577,13 @@ def main():
         weight_decay=args.weight_decay,
     )
 
-    print(f"\nPhase 3A {'V1 (corr+pose)' if args.use_kabsch else 'V0 (corr only)'} training "
-          f"on {args.categories}/{args.train_split} (N={args.num_points}, mask={args.mask_strategy}, "
+    print(f"\nPhase 3A/4 {'V1 (corr+pose)' if args.use_kabsch else 'V0 (corr only)'} training "
+          f"on {args.categories}/{args.train_split} (matcher_arch={args.matcher_arch}, "
+          f"N={args.num_points}, mask={args.mask_strategy}, "
           f"feature_set={args.feature_set} (in_dim={FEATURE_SET_DIMS[args.feature_set]}), "
           f"label_topk={args.label_topk}, pairs_per_step={args.pairs_per_step}, "
           f"init_logit_scale={args.init_logit_scale}, init_dustbin_bias={args.init_dustbin_bias}, "
-          f"scalar_lr_mult={args.scalar_lr_mult})...")
+          f"scalar_lr_mult={args.scalar_lr_mult}, lambda_contact={args.lambda_contact})...")
 
     out_dir = Path(args.out_dir) if args.out_dir else None
     if out_dir:
@@ -622,6 +646,7 @@ def main():
                     "config": {
                         "categories": args.categories, "train_split": args.train_split,
                         "val_split": args.val_split, "mask_strategy": args.mask_strategy,
+                        "matcher_arch": args.matcher_arch,
                         "feature_set": args.feature_set, "num_points": args.num_points,
                         "label_topk": args.label_topk,
                         "label_mode": args.label_mode, "use_kabsch": args.use_kabsch,
