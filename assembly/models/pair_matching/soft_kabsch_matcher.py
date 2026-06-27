@@ -85,6 +85,18 @@ class SoftCorrespondenceMatcher(nn.Module):
     the loss cheaply by growing it alone instead of learning to separate descriptors.
     Both initialized so match logits and the dustbin logit start on a comparable scale
     (~10), removing that structural advantage -- still relevant with a per-point head.
+
+    Second collapse found with the per-point dustbin_head (Phase 4A, after fixing
+    L_contact's class imbalance): dustbin_logit is BCE-trained (L_contact) with no
+    constraint tying its magnitude to the match-logit scale -- BCE's incentive to push
+    confidently-correct (majority dustbin) rows to extreme logit values is unrelated to
+    what the softmax in L_corr actually needs (a per-row comparison against THAT row's
+    match logits, which stay roughly within [-scale, scale]). Observed: dustbin_logit
+    mean drifted to 3.7-6+ while match logits stayed ~0.3-2.6, so dustbin started
+    winning the softmax even on rows L_contact "correctly" ranked as lower-dustbin-than-
+    average. Fixed by bounding dustbin_logit to (-scale, scale) via `scale * tanh(...)`,
+    using the SAME learned scale as the match logits -- structurally removes the
+    runaway degree of freedom instead of hoping the two losses stay balanced.
     """
 
     def __init__(self, desc_dim: int, init_logit_scale: float = 10.0, init_dustbin_bias: float = 0.0):
@@ -97,7 +109,10 @@ class SoftCorrespondenceMatcher(nn.Module):
             nn.Linear(desc_dim // 2, 1),
         )
         nn.init.zeros_(self.dustbin_head[-1].weight)
-        nn.init.constant_(self.dustbin_head[-1].bias, float(init_dustbin_bias))
+        # tanh(bias) * init_logit_scale == init_dustbin_bias at step 0 (matches the old
+        # global-bias behavior exactly, since the head's weight is zero-init above).
+        tanh_target = max(min(init_dustbin_bias / init_logit_scale, 0.999), -0.999)
+        nn.init.constant_(self.dustbin_head[-1].bias, math.atanh(tanh_target))
 
     def forward(self, desc_i: torch.Tensor, desc_j: torch.Tensor, valid_j: torch.Tensor):
         """desc_i, desc_j: [B, N, D]. valid_j: [B, N] bool (padded j columns are masked
@@ -110,7 +125,8 @@ class SoftCorrespondenceMatcher(nn.Module):
         scale = self.logit_scale.exp().clamp(max=50.0)
         S = scale * cos_sim
         S = S.masked_fill(~valid_j.unsqueeze(1), float("-inf"))
-        dustbin_logit = self.dustbin_head(desc_i).squeeze(-1)  # [B, N]
+        dustbin_raw = self.dustbin_head(desc_i).squeeze(-1)  # [B, N]
+        dustbin_logit = scale * torch.tanh(dustbin_raw)  # bounded to (-scale, scale)
         logits = torch.cat([S, dustbin_logit.unsqueeze(-1)], dim=-1)
         P = torch.softmax(logits, dim=-1)
         return logits, P, dustbin_logit
