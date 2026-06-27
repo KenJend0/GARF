@@ -291,38 +291,50 @@ Checkpoint final : `output/cnn_step13_point_head/last-v3.ckpt` (= `epoch-29.ckpt
 
 ---
 
-## 7. Analyse qualitative — CNN vs GARF (visualisations 3D)
+## 7. Comparaison rigoureuse CNN (Step 15) vs GARF-mini (PTv3)
 
-### Profil de précision/recall
+### Pourquoi une nouvelle comparaison
 
-Observations sur les 4 objets comparés dans la présentation HTML :
+Les premières comparaisons qualitatives (4 objets, doc initial) utilisaient un pipeline d'inférence GARF maison, simplifié et pas totalement aligné avec son protocole d'entraînement. En préparant un mail de synthèse pour le tuteur, deux bugs réels ont été trouvés et corrigés dans `scripts/analyze_errors.py` / `assembly/models/projection_mapping_utils.py` :
 
-| Objet | CNN F1 | CNN P | CNN R | GARF F1 | GARF P | GARF R |
-|---|---|---|---|---|---|---|
-| Plate — 2 fragments | 0.798 | 0.71 | 0.90 | **0.935** | **0.95** | 0.92 |
-| Bowl — 3 fragments | 0.845 | 0.81 | 0.88 | **0.900** | **0.99** | 0.82 |
-| Plate — 9 fragments ★ | **0.902** | 0.85 | 0.96 | 0.673 | **0.99** | 0.51 |
-| Mug — 5 fragments | 0.305 | 0.89 | 0.19 | **0.946** | **0.98** | 0.92 |
+1. **`extract_fragment_list` supposait une taille égale par fragment** (`num_pts = N_total // max_parts`), valide uniquement pour `sample_method=uniform` (CNN). Avec `sample_method=weighted` (GARF, tailles de fragment variables), ce reshape découpait les points n'importe où, jetant la majorité des points réels du diagnostic. → ajout d'un chemin de découpe par offsets réels (`points_per_part`) pour le cas non-uniforme.
+2. **GARF/FracSeg n'est pas robuste au batching multi-objets** (`batch_size>1`) — perd ~10 points de F1 par rapport à `batch_size=1` (la config officielle `eval_frac_seg.yaml` le fixe d'ailleurs explicitement à 1). Cause probable : bookkeeping d'offsets/graphe par-objet non conçu pour mélanger plusieurs objets.
 
-### Pattern structurel
+Après ces corrections, les chiffres GARF ont été **validés en croisant deux méthodes indépendantes** : notre script `analyze_errors.py --model_type garf` (Mean F1 fragment-level, Boundary F1, Hausdorff, Chamfer) et le chemin officiel `eval_segmentation.py` + `trainer.validate()` (F1 pooled au seuil natif 0.5, calculé par le `validation_step` de PTv3 lui-même, sur l'intégralité du val set).
 
-**GARF : ultra-précis, recall variable**
-- Precision systématiquement ≥ 0.95 — très peu de faux positifs
-- Recall effondré sur les objets à beaucoup de fragments (Plate 9 frags : R=0.51)
-- Cause : GARF partage le budget de 5000 pts entre tous les fragments → 5000/9 ≈ 555 pts/fragment → résolution insuffisante pour détecter les lignes de fracture fines
+### Résultat final (val set complet, everyday in-domain + artifact zero-shot pour les deux modèles)
 
-**CNN : recall fort, precision perfectible**
-- Recall maintenu même sur objets complexes (Plate 9 frags : R=0.96)
-- Cause : CNN alloue 5000 pts par fragment indépendamment du nombre de fragments
-- Faiblesse : faux positifs sur zones géométriquement ambiguës (bords à forte courbure, transitions intacte/fracture)
+| Métrique | CNN Step 15 (everyday) | CNN Step 15 (artifact, zero-shot) | GARF-mini (everyday) | GARF-mini (artifact, zero-shot) |
+|---|---|---|---|---|
+| Params | 544 K | 544 K | 12 725 K | 12 725 K |
+| Mean F1 fragment-level | 86.8% | 76.7% | 84.8% | 81.3% |
+| Boundary F1 | 80.0% | 71.8% | **86.4%** | **85.1%** |
+| Hausdorff distance | 0.251 | 0.505 | 0.337 | 0.439 |
+| Chamfer distance | 0.050 | 0.131 | 0.096 | 0.128 |
+| **F1 pooled (seuil natif 0.5, validé Lightning)** | **94.4%** | **88.8%** | 88.3% | 83.7% |
 
-### Implication pour Step 13
+**Au seuil natif 0.5, le CNN devance GARF-mini sur le F1 pooled dans les deux catégories** (94.4% vs 88.3% everyday ; 88.8% vs 83.7% artifact), avec 23× moins de paramètres. **GARF garde l'avantage sur le Boundary F1**, surtout en zero-shot (85.1% vs 71.8%) — ses features de point-transformer semblent mieux généraliser la géométrie des frontières sous changement de domaine.
 
-L'avantage CNN sur les objets complexes vient du sampling uniforme par fragment. La faiblesse est la **précision** — trop de FP aux frontières géométriques ambiguës.
+### Réserve méthodologique importante — budget de points par fragment
 
-Le PointHead (features 3D : normales, courbure, roughness) devrait permettre au modèle d'être plus sélectif : distinguer un bord à forte courbure *intact* d'une vraie fracture, ce que la projection 2D seule ne peut pas faire.
+Le CNN échantillonne **5000 points par fragment** (`sample_method=uniform`), alors que GARF-mini échantillonne **5000 points au total pour l'objet entier**, répartis entre fragments selon leur aire (`sample_method=weighted`). Ce n'est pas un choix arbitraire de leur part : PTv3 traite tous les fragments d'un objet **conjointement** (nécessaire pour la tâche de réassemblage, qui doit comparer les fragments entre eux), donc son coût de calcul global force un budget de points partagé. Le CNN, lui, traite chaque fragment **indépendamment** via sa projection 2D — son coût ne dépend pas du nombre de fragments, donc il peut se permettre un budget généreux et fixe par fragment.
 
-**Objectif Step 13 : rapprocher la precision CNN de celle de GARF (0.95+) tout en conservant le recall fort.**
+8 visualisations qualitatives (`output/viz_step15/*.html`, GT/CNN/GARF, seuil 0.5) confirment l'effet :
+
+| Objet | Fragments | Pts/fragment (GARF) | F1 CNN | F1 GARF |
+|---|---|---|---|---|
+| BeerBottle (everyday) | 2 | 2500 | 0.978 | 0.927 |
+| BeerBottle (everyday) | 15 | 333 | 0.972 | **0.654** |
+| Bottle (everyday) | 15 | 333 | 0.982 | **0.678** |
+| Bottle (everyday) | 12 | 417 | 0.977 | **0.615** |
+| artifact #1 | 2 | 2500 | 0.956 | 0.794 |
+| artifact #2 (zero-shot) | 11 | 454 | 0.835 | **0.894** ← GARF gagne |
+| artifact #3 | 2 | 2500 | 0.977 | 0.565 |
+| artifact #4 | 3 | 1667 | 0.809 | 0.862 |
+
+Le F1 de GARF s'effondre presque proportionnellement au nombre de fragments sur `everyday` (0.93→0.65 entre 2 et 15 fragments), cohérent avec une limite de densité de points plutôt qu'une limite architecturale pure. **Mais** sur deux objets `artifact` (zero-shot pour les deux modèles), GARF bat le CNN malgré le même désavantage de points — la robustesse de PTv3 sous changement de domaine compte aussi.
+
+**Conclusion à retenir** : une partie de l'avantage du CNN vient de son architecture qui permet un échantillonnage plus dense par fragment — un avantage pratique réel (pas un artefact de comparaison déloyale), mais qui doit être nommé explicitement plutôt que présenté comme une supériorité architecturale pure et simple.
 
 ---
 
@@ -419,30 +431,36 @@ Gain mesuré : débit ×2.5 (3.5 → 8.8 objets/s), confirmé par `nvidia-smi` p
 
 ## 10. Prochaines étapes
 
-### Court terme
-- [x] Résultats Step 14 (20 epochs, terminé le 2026-06-18) — gap de généralisation réduit de moitié (10.0→4.2 pts) mais objectif artifact F1>90% non atteint (88.4%), et Boundary F1 everyday régresse (-9.5 pts)
-- [x] Step 15 — modèle final entraîné de zéro (100 epochs, terminé le 2026-06-18) — meilleur résultat in-domain ET zero-shot de toute la série, retenu comme candidat final
-- [ ] Décider si Step 15 est le résultat final à présenter, ou si on tente encore une itération (cf. pistes ci-dessous)
+### Bilan de la phase segmentation (terminée)
+- [x] Step 14 (généralisation, 20 epochs) — succès partiel, gap réduit de moitié
+- [x] Step 15 (modèle final from-scratch, 100 epochs) — meilleur résultat de toute la série, retenu comme modèle final
+- [x] Comparaison rigoureuse vs GARF-mini (cf. section 7) — CNN devant sur F1 pooled (94.4%/88.8% vs 88.3%/83.7%), GARF devant sur Boundary F1 ; réserve méthodologique sur le budget de points identifiée et documentée
 
-### Pistes restantes (optionnel, si temps disponible)
-- Boundary F1 zero-shot artifact (75.5%) reste en retrait par rapport à l'in-domain everyday (83.2%) — gap résiduel de 7.7 points. Pousser plus loin nécessiterait probablement de voir au moins quelques exemples `artifact` (même peu) plutôt que du pur zero-shot.
-- Reproduire Step 15 avec seed différente pour vérifier la stabilité du résultat (un seul run pour l'instant).
+**La phase d'ablation CNN pour la segmentation de fracture est considérée terminée.** Step 15 est le modèle final retenu.
 
-### Step 16 — Boundary Loss (si on veut encore réduire le gap aux frontières)
-```python
-Loss = 0.4 × Focal + 0.4 × Dice + 0.2 × Boundary
-# Boundary : BCE uniquement sur les points frontière (kNN k=5)
-```
+### Nouvelle direction — le CNN comme fracture prior pour le réassemblage
 
-### Phase 6 — Résolution adaptative (optionnel, gain marginal probable après Step 15)
-Critère de raffinement **révisé** (basé sur l'analyse occupancy) :
-```
-Pixels à raffiner :
-  - proba ∈ [0.4, 0.6]  (incertitude élevée)
-  - faible occupancy     (manque de support 2D)
-  - forte courbure locale
-```
-*Ne plus cibler les pixels à forte occupancy — ils sont déjà bien prédits.*
+Suite directe de l'ablation, déjà bien engagée (plan détaillé, tenu à jour séparément dans `PLAN_REASSEMBLY_MODULE.md` — ce qui suit n'en est qu'un résumé). Idée centrale : GARF (`assembly/models/denoiser/`) ne fait pas de matching pair-à-pair explicite — il régresse une pose SE(3) globale par fragment via flow matching + attention globale sur tous les points. Utiliser le filtre CNN pour ne garder que les points de fracture, en amont d'un module de matching pair-à-pair, est donc un changement de paradigme vers la registration classique par correspondances, pas un simple remplacement de backbone.
+
+**Phase 0 (convention de pose) — CONFIRMÉE.** Reconstruction de l'objet assemblé à partir des poses stockées (`quaternions`/`translations`/`scale`), résidu ~1e-8 sur everyday et artifact val. Formule retenue : `R_ij = R_j⁻¹ R_i`, `t_ij = R_j⁻¹(t_i − t_j)`, valable après réapplication du facteur `scale` par fragment.
+
+**Phase 1 (Recall@K du filtre CNN) — CONFIRMÉE, avec un résultat inattendu.** Un budget fixe par fragment (top-K ou top-percent) échoue (recall 13-73%, ne suit pas la quantité réelle de surface de fracture qui croît avec le nombre de voisins). En revanche, un **filtrage par seuil de probabilité** (0.2/0.3/0.5) réussit largement : recall 84-98%, stable même sur 11+ fragments. **Le CNN Step 15 est validé comme prior exploitable** — c'est le résultat clé de cette phase.
+
+**Phase 2 (baseline géométrique RANSAC/Kabsch, 5 sous-phases 2A-2E) — CLOSE, conclusion forte.** Confirmé à chaque étape (précision de correspondance, structure spatiale des interfaces, clustering) : **le CNN n'est jamais le facteur limitant** — ses masques se comportent presque comme l'oracle GT. Le vrai plafond est le matcher géométrique lui-même : même dans les conditions les plus favorables testées (oracle pair-specific + scoring normal-aware), `Pose@30°` ne dépasse pas **~9.6%**. Cause identifiée : un fragment touchant plusieurs voisins a tous ses points de fracture mélangés dans un seul masque — le problème est une **séparation d'interface par paire**, pas juste un matching point-à-point, et aucun raffinement de descripteur/scoring géométrique ne lève cette limite. **Ce résultat démontre empiriquement la nécessité d'un module appris (Phase 3), pas juste une optimisation possible.**
+
+**Phase 3 (matcher appris) — cadrage décidé, implémentation en cours.** Doit corriger deux causes indépendantes identifiées en Phase 2 (descripteurs faits-main trop faibles ET scoring RANSAC structurellement biaisé), pas juste l'une des deux. Architecture cible : encodeur léger partagé (PointNet/EdgeConv) → corrélation cross-fragment → correspondance souple (row-softmax + dustbin, **pas** Sinkhorn — les surfaces de fracture sont bruitées/partielles, pas un bipartite équilibré) → Kabsch pondéré différentiable → pose relative. Scope Phase 3A : paires positives uniquement (`graph[i,j]=True`), question du "registration" pure. Script de vérification des données (`scripts/phase3a_pair_dataset_check.py`) écrit ; prochaine action : le lancer sur le serveur et valider le format des paires avant d'écrire l'encodeur.
+
+**Hors scope sauf si le temps le permet** : pipeline d'assemblage global complet, cohérence de cycle, paires négatives (Phase 3B), ou une version "GARF-lite" avec attention globale sur l'ensemble réduit (resterait le paradigme lourd de GARF, juste avec moins de points — pas une alternative légère).
+
+### Pistes secondaires sur le CNN seul (si on y revient)
+
+- **Step 16 — Boundary Loss**, si le gap de Boundary F1 doit encore être réduit :
+  ```python
+  Loss = 0.4 × Focal + 0.4 × Dice + 0.2 × Boundary
+  # Boundary : BCE uniquement sur les points frontière (kNN k=5)
+  ```
+- **Résolution adaptative**, critère basé sur l'analyse occupancy (proba ∈ [0.4, 0.6] + faible occupancy + forte courbure) — gain marginal probable après Step 15, pas prioritaire.
+- Reproduire Step 15 avec une seed différente pour vérifier la stabilité du résultat (un seul run pour l'instant).
 
 ---
 
@@ -466,4 +484,6 @@ Pixels à raffiner :
 
 9. **Mais entraîné de zéro, ce coût disparaît — et le résultat dépasse tout le reste.** Step 15 (même recette finale, from-scratch, sans warm-start, `everyday` seul) atteint Mean F1=93.1% / Boundary F1=83.2% in-domain — **meilleur que tous les steps précédents**, y compris Step 13. Et en zero-shot sur `artifact` (jamais vu), il atteint F1 pooled=91.5%, **supérieur** à Step 14 qui avait pourtant vu `artifact` à l'entraînement. La chaîne de fine-tuning séquentiel accumulait une sous-optimalité ; repartir de zéro avec la recette complète donne un meilleur optimum global ET une meilleure généralisation.
 
-10. **Le modèle final (Step 15) dépasse même la référence PTv3/GARF sur le F1 pooled** (96.7% vs ~90.9%) en in-domain, avec 23× moins de paramètres (543K vs 12 727K) — confirmation que l'architecture légère spécialisée tient la comparaison avec un encodeur généraliste bien plus lourd, au moins sur cette tâche.
+10. **Le modèle final (Step 15) dépasse la référence PTv3/GARF-mini sur le F1 pooled** (94.4%/88.8% vs 88.3%/83.7%, validé sur le val set complet via le protocole d'évaluation natif de PTv3) en in-domain et en zero-shot, avec 23× moins de paramètres — mais GARF garde l'avantage sur le Boundary F1, en partie parce que le CNN bénéficie d'un budget de points par fragment plus dense que GARF (contrainte architecturale de ce dernier, pas un choix arbitraire — cf. section 7).
+
+11. **Le prior CNN est validé pour le réassemblage, mais le matching géométrique classique ne suffit pas.** En testant le CNN comme filtre en amont d'un module de matching pair-à-pair (alternative légère à l'attention globale de GARF), le CNN n'est jamais le facteur limitant (recall, précision de correspondance, structure spatiale — confirmé à chaque étape). Mais le matcher géométrique (descripteurs faits-main + RANSAC) plafonne empiriquement à ~9.6% de poses correctes même dans les conditions les plus favorables — la limite vient de la séparation d'interface par paire, pas de la segmentation. Un module de matching appris (Phase 3, en cours) est donc une nécessité démontrée, pas une simple optimisation.
