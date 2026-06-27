@@ -55,30 +55,50 @@ from assembly.models.pair_matching.soft_kabsch_matcher import (
 )
 
 
-def build_features(sample):
-    """[points(3) + normals(3) + cnn_score(1) + dist_to_centroid(1)] = 8 dims per side
-    -- the agreed minimal V0 feature set, NOT the full HybridGeometryFeatures vector.
-    dist_to_centroid is geom_feats[:, 3] (column order: consistency, curvature,
-    roughness, dist_to_centroid -- cf. HybridGeometryFeatures with use_normals=False,
-    use_curvature=True, use_roughness=True, use_dist_to_centroid=True, as configured in
-    phase3a_pair_dataset_check.py's geo_extractor)."""
-    dist_i = sample["geom_feats_i"][:, 3:4]
-    dist_j = sample["geom_feats_j"][:, 3:4]
-    feat_i = np.concatenate(
-        [sample["points_i"], sample["normals_i"], sample["cnn_score_i"], dist_i], axis=-1
-    )
-    feat_j = np.concatenate(
-        [sample["points_j"], sample["normals_j"], sample["cnn_score_j"], dist_j], axis=-1
-    )
+FEATURE_SET_DIMS = {"raw_xyz_normal": 8, "geom_invariant": 5}
+
+
+def build_features(sample, feature_set: str = "geom_invariant"):
+    """Two feature sets, selected by --feature_set (V0.2 ablation -- see plan):
+
+    'raw_xyz_normal' (original V0/V0.1, in_dim=8): [points(3) + normals(3) + cnn_score(1)
+    + dist_to_centroid(1)]. V0/V0.1 training (15 epochs) showed match_top1_acc/
+    match_top8_recall stuck at or below the random baseline throughout -- root cause:
+    points_i/normals_i and points_j/normals_j live in INDEPENDENT per-fragment random
+    rotation frames (cf. Phase 0), so raw xyz/normal values are not directly comparable
+    between i and j. 6 of the 8 dims carry no cross-fragment signal; only cnn_score and
+    dist_to_centroid do, which is far too weak to discriminate among ~512 candidates.
+
+    'geom_invariant' (V0.2, in_dim=5, default): [consistency, curvature, roughness,
+    dist_to_centroid, cnn_score] -- i.e. the full HybridGeometryFeatures vector
+    (geom_feats[:, :4]) instead of raw xyz/normals. These are rotation/translation
+    invariant by construction (cf. Phase 2), so they ARE comparable across the two
+    independent fragment frames. points_i/points_j/normals_i/normals_j remain available
+    in the stacked batch for Kabsch (V1) -- only removed from what the ENCODER sees.
+    """
+    if feature_set == "raw_xyz_normal":
+        dist_i = sample["geom_feats_i"][:, 3:4]
+        dist_j = sample["geom_feats_j"][:, 3:4]
+        feat_i = np.concatenate(
+            [sample["points_i"], sample["normals_i"], sample["cnn_score_i"], dist_i], axis=-1
+        )
+        feat_j = np.concatenate(
+            [sample["points_j"], sample["normals_j"], sample["cnn_score_j"], dist_j], axis=-1
+        )
+    elif feature_set == "geom_invariant":
+        feat_i = np.concatenate([sample["geom_feats_i"][:, :4], sample["cnn_score_i"]], axis=-1)
+        feat_j = np.concatenate([sample["geom_feats_j"][:, :4], sample["cnn_score_j"]], axis=-1)
+    else:
+        raise ValueError(feature_set)
     return feat_i.astype(np.float32), feat_j.astype(np.float32)
 
 
-def stack_pairs(samples: list, device) -> dict:
+def stack_pairs(samples: list, device, feature_set: str = "geom_invariant") -> dict:
     """Stack a list of per-pair sample dicts (numpy, from build_pair_sample) into
     batched torch tensors on `device`."""
     feats_i, feats_j = [], []
     for s in samples:
-        fi, fj = build_features(s)
+        fi, fj = build_features(s, feature_set)
         feats_i.append(fi)
         feats_j.append(fj)
     return {
@@ -226,7 +246,7 @@ def run_epoch(loader, cnn_model, geo_extractor, device, args, rng, matcher_model
     agg = defaultdict(list)
     n_steps = 0
     for chunk in epoch_pairs_in_chunks(loader, cnn_model, geo_extractor, device, args, rng, max_batches, pairs_per_step):
-        batch = stack_pairs(chunk, device)
+        batch = stack_pairs(chunk, device, args.feature_set)
         if train:
             optimizer.zero_grad()
             loss, metrics = compute_step(matcher_model, batch, args, use_pose_loss)
@@ -315,6 +335,17 @@ def main():
     parser.add_argument("--label_mode", default="soft", choices=["hard", "soft"])
     parser.add_argument("--sample_mode", default="random", choices=["random", "fps"])
     parser.add_argument("--undirected", action="store_true")
+    parser.add_argument(
+        "--feature_set", default="geom_invariant", choices=list(FEATURE_SET_DIMS),
+        help="'geom_invariant' (V0.2, default, in_dim=5): rotation/translation-invariant "
+             "HybridGeometryFeatures (consistency/curvature/roughness/dist_to_centroid) + "
+             "cnn_score. 'raw_xyz_normal' (original V0/V0.1, in_dim=8): raw points+normals "
+             "+ cnn_score + dist_to_centroid -- kept only for before/after comparison; V0/"
+             "V0.1 training showed match_top1_acc/match_top8_recall stuck at or below the "
+             "random baseline over 15 epochs with this set, because points_i/normals_i and "
+             "points_j/normals_j live in independent per-fragment rotation frames and are "
+             "not directly comparable (see build_features()).",
+    )
     # Model args.
     parser.add_argument("--desc_dim", type=int, default=128)
     parser.add_argument("--encoder_hidden", default="64,128")
@@ -418,7 +449,7 @@ def main():
     )
 
     matcher_model = PairMatcherModel(
-        in_dim=8, hidden=hidden, desc_dim=args.desc_dim,
+        in_dim=FEATURE_SET_DIMS[args.feature_set], hidden=hidden, desc_dim=args.desc_dim,
         dropout=args.dropout, normalize_desc=not args.no_normalize_desc,
         init_logit_scale=args.init_logit_scale, init_dustbin_bias=args.init_dustbin_bias,
     ).to(device)
