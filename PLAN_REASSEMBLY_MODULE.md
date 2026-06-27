@@ -681,6 +681,49 @@ utilitaire de sampling de paires n'existe dans le codebase (confirmé par inspec
 Il faudra écrire un dataset/sampler dédié qui extrait les paires positives à partir de
 `graph` + `points_per_part` (en respectant le padding `max_parts`), avant le modèle.
 
+**Vérification de la plomberie (`scripts/phase3a_pair_dataset_check.py`), 2026-06-27 —
+VALIDÉE.** Run initial (`label_mode=hard`, `everyday/val`, 10 batches, 234 paires
+directed) : `valid_target_col_rate=1.0000`, 0 vrai problème de sanity check (le seul
+warning observé, asymétrie de masque entre i/j, est un phénomène réel de fragments de
+tailles très différentes — reclassé en compteur informatif `asymmetric_pair_rate`, pas
+une "issue"). `contact_row_rate=34.85%` / `dustbin_row_rate=65.15%` — quasi identique à
+l'`avail_rate≈38%` mesuré en Phase 2B sur les masques `thresh*` : confirmation croisée
+indépendante que le confound multi-voisins diagnostiqué en Phase 2 est bien présent
+dans cette nouvelle pipeline de labels.
+
+**Problème trouvé et corrigé : label soft trop diffus avec `label_sigma` seul.**
+Premier run `label_mode=soft` (`contact_eps=0.05`, `label_sigma=0.02`, sans cap) :
+`mean_matches_per_contact_row=70.53`, `mean_effective_matches_per_contact_row=38.84`
+(quasi égal au compte brut → label réellement diffus, pas juste "beaucoup de voisins
+mais poids concentré"). Cause : la densité de points varie énormément selon le
+fragment (219 à 4027 points dans le masque observé) — un `label_sigma` fixe ne peut
+pas compenser cette variation de densité. **Fix : `--label_topk`** (défaut 8) — cap le
+nombre de colonnes positives aux K plus proches voisins sous `contact_eps`, *avant*
+la pondération gaussienne, donc indépendant de la densité locale. Rôles découplés :
+`contact_eps` décide contact vs dustbin, `label_topk` borne le nombre de colonnes
+positives, `label_sigma` répartit le poids entre elles.
+
+**Résultat sweep `--label_topk` (2026-06-27, même config, soft) :**
+| topk | mean_matches | mean_effective | target_density | contact/dustbin rate |
+|---|---|---|---|---|
+| 8 | 7.22 | 6.18 | 2.53 | 34.85%/65.15% (inchangé) |
+| 4 | 3.80 | 3.52 | 1.34 | 34.85%/65.15% (inchangé) |
+| 1 (≈hard) | 1.00 | 1.00 | 0.35 | 34.86%/65.14% (inchangé) |
+
+`contact_row_rate`/`dustbin_row_rate` parfaitement stables sur les 3 runs (confirme
+que `label_topk` n'affecte que la pondération, pas la décision dustbin, comme prévu).
+`target_density` chute massivement (16.3 → 2.53 → 1.34 → 0.35) — le label n'est plus
+une soupe diffuse. `mean_effective_matches` à topk=8 (6.18, à la limite haute de la
+fourchette visée 2-6) reflète que les 8 plus proches voisins sont souvent très
+similaires en distance sur une surface de fracture lisse — pas un problème, juste un
+label peu piqué là où la géométrie locale est elle-même peu discriminante.
+**Décision : `--label_topk 8` retenu comme réglage par défaut pour l'entraînement**
+(meilleur compromis contexte positionnel / diffusion contrôlée).
+
+**Conclusion : la plomberie de données Phase 3A est validée.** Prochaine étape :
+écrire l'encodeur partagé + matching souple (row-softmax + dustbin) + weighted Kabsch
+différentiable, et la boucle d'entraînement (Phase 3A, positive pairs only).
+
 ## Métriques d'évaluation déjà disponibles (ne pas réécrire)
 
 Dans `assembly/models/denoiser/modules/evaluation/evaluator.py` :
