@@ -843,11 +843,55 @@ prolonger un run existant sans repartir de zéro (charge le state_dict du matche
 seul, pas l'optimizer ; `--start_epoch` garde la numérotation d'epoch globale
 cohérente dans les logs/summary_json).
 
-**Prochaine étape : prolonger C1 à 40 epochs** en reprenant
-`output/phase3a_matcher_c1/last.pt` (`--resume_from ... --start_epoch 15 --epochs 40`).
-Motivation : `dustbin_pred_rate` n'était pas stabilisé à l'epoch 15 (28.6%, loin du
-~65% cible) sur C1 comme C2 — pas encore certain que le `top8_gap` modeste observé
-plafonne déjà, ou continue de croître une fois le calibrage terminé.
+**Résultat run prolongé C1 (epochs 15→40, `--resume_from output/phase3a_matcher_c1/last.pt
+--start_epoch 15 --epochs 40`, 2026-06-27) — signal confirmé réel, mais rendements
+nettement décroissants.** `top8_gap` moyen monte par rapport aux 15 premières epochs :
+train 1.04pp→1.61pp (+55% relatif), val 1.53pp→2.19pp (+43% relatif) — pas un plateau
+immédiat, le signal continue de se renforcer. `dustbin_pred_rate` a continué de
+progresser vers le vrai taux ~65% (28.6%→56.6% train, 27.7%→41.7% val à l'epoch 39) —
+calibrage toujours pas totalement terminé. **Mais** doubler le nombre d'epochs (15→40)
+n'a donné qu'une augmentation modeste du gap, pas une explosion ; `top1_gap` reste
+négatif tout le long (~-0.3 à -0.6pp) — toujours aucun signal de pointage exact, juste
+un signal de "bon voisinage" (top-8) ; `RotErr` reste plat (~118-126°) ; et
+`match_top8_recall` reste dans la zone 6-9% en absolu, train et val — loin d'un
+matching exploitable en pratique.
+
+### Conclusion finale Phase 3A — décidé de clôturer ici (2026-06-27)
+
+> La Phase 3A montre que les features internes du CNN de segmentation contiennent une
+> information utile pour le matching pairwise, contrairement aux coordonnées brutes
+> (ablation A) et aux descripteurs géométriques faits main (ablation B). Cette
+> information reste cependant faible avec une architecture minimale (MLP partagé +
+> corrélation cosinus + row-softmax+dustbin) : elle améliore légèrement le rappel
+> top-8 par rapport au hasard (`top8_gap` ≈ +1 à +2pp, croissant mais à rendement
+> décroissant avec plus d'entraînement), mais ne permet ni un top-1 fiable ni une
+> pose relative exploitable (`RotErr` reste quasi aléatoire, ~120-126°, du début à la
+> fin de tous les runs V0/C1/C2). **La limite n'est donc plus la plomberie dataset, ni
+> le prior CNN fracture, ni seulement le choix des features d'entrée — elle vient de
+> la capacité du matcher minimal (corrélation cosinus simple, sans interaction
+> pairwise explicite) à exploiter le signal déjà présent dans `cnn_feat`.**
+
+**Chaîne de preuve complète (ordre des ablations, toutes sur 15+ epochs, comparées
+systématiquement à la baseline aléatoire `random_top1_acc`/`random_top8_recall`) :**
+- A. `raw_xyz_normal` (coordonnées/normales brutes, repères de rotation indépendants
+  entre fragments) → négatif, jamais au-dessus du hasard.
+- B. `geom_invariant` (descripteurs géométriques invariants faits main) → négatif,
+  même conclusion que A.
+- C1. `cnn_feat` (embedding fusionné 2D+3D du PointHead) → **premier signal positif
+  net**, `top8_gap` > 0 sur tous les runs, train et val, qui croît avec
+  l'entraînement (1.04→1.61pp train sur 0-14 puis 15-39 epochs).
+- C2. `cnn_feat`+`geom_invariant` → n'ajoute rien à C1 seul (gap quasi identique) —
+  la géométrie invariante n'apporte aucune information complémentaire une fois le
+  signal CNN présent.
+
+**Prochaine vraie direction si reprise un jour (PAS une petite correction, une
+nouvelle phase) :** architecture avec interaction pairwise explicite —
+`cnn_feat_i`/`cnn_feat_j` → cross-attention légère ou message passing pairwise →
+matching souple → weighted Kabsch. Plus d'epochs ou un LR différent sur l'architecture
+actuelle (corrélation cosinus simple) ne suffira pas, le run prolongé l'a montré
+(rendements décroissants nets dès 15→40 epochs). À ne déclencher que si une suite
+expérimentale est explicitement souhaitée (ex. demande du tuteur) — sinon, le
+résultat ci-dessus est suffisant et solide pour le rapport de stage tel quel.
 
 ## Métriques d'évaluation déjà disponibles (ne pas réécrire)
 
@@ -867,11 +911,12 @@ indépendante.
 
 ## Prochaine action concrète
 
-Phase 0, 1, 2 confirmées/closes. Phase 3A : plomberie de données validée, modèle V0
-implémenté, bug de collapse dustbin trouvé+corrigé, ablations A (raw xyz/normales) et
-B (géométrie invariante faite main) toutes deux négatives (au niveau du hasard sur 15
-epochs). Ablation C (features internes du CNN, `point_features` du PointHead, dim=64)
-: exposition côté modèle + plomberie + check de validation tous faits et validés
-(`cnn_feat_dim=64`, 0 issue). `--feature_set cnn_feat`/`cnn_feat_geom` (C1/C2)
-implémentés. **Étape actuelle : lancer C1 (15 epochs, même protocole), comparer à
-`random_top1_acc`/`random_top8_recall`.**
+Phase 0, 1, 2 confirmées/closes. **Phase 3A clôturée (2026-06-27)** — voir la
+conclusion finale ci-dessus (section Phase 3, "Conclusion finale Phase 3A") : les
+features internes du CNN portent un signal de matching réel mais faible
+(`top8_gap` > 0, croissant à rendement décroissant), insuffisant pour un top-1 fiable
+ou une pose exploitable avec un matcher minimal (corrélation cosinus + row-softmax).
+Pas de suite expérimentale prévue pour l'instant — la prochaine vraie direction
+(interaction pairwise explicite type cross-attention/message-passing) est documentée
+comme piste future, à ne déclencher que si une suite est explicitement souhaitée.
+Rien à lancer côté serveur pour le moment.
