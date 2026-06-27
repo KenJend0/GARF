@@ -544,6 +544,25 @@ masques réels), `cluster_based` pourrait monter vers 4-8% si la séparation d'i
 aide effectivement le matching réel, pas seulement la précision de correspondance
 théorique mesurée en Phase 2D.
 
+**Résultat (2026-06-27) — contre-intuitif :** `cluster_based` fait **moins bien** que
+`global` (`Pose@30` 1.82% vs 3.18%, `RotErr` quasi identique 124.6° vs 123.5°,
+`RansacValid` 78.62% vs 87.59%, `no_cluster_match_rate`=23.57%). Le clustering isole bien
+des patches individuellement plus purs (Phase 2D : `BestCorrPrec`≈37%), mais en testant
+*toutes* les paires de clusters (4-16 par arête) et en gardant la mieux notée, on
+multiplie les occasions que le critère de score (déjà connu pour préférer parfois une
+pose fausse, `score_gap`>0 en Phase 2C) sélectionne une mauvaise paire — sur un pool plus
+restreint (un cluster), un mauvais alignement peut sembler "propre" par coïncidence plus
+facilement que sur le pool plus large du masque global.
+
+**Diagnostic complémentaire ajouté : `oracle_cluster_pair`**, implémenté dans le même
+script. Utilise la pose GT **uniquement pour choisir** quelle paire de clusters matcher
+(recouvrement mutuel en repère assemblé, `CONTACT_EPS=0.05`) — le matching/RANSAC réel
+sur cette paire reste identique à `cluster_based`, aucune triche dans cette étape. Tranche
+: si `oracle_cluster_pair` >> `cluster_based`, le pipeline échoue surtout à **choisir** la
+bonne paire (soutient un module de compatibilité cluster-cluster appris, Phase 3) ; si
+`oracle_cluster_pair` reste mauvais aussi, la limite est plus profonde que la sélection
+(descripteurs/RANSAC eux-mêmes insuffisants même sur la bonne paire).
+
 **Protocole en deux temps** (ne pas mélanger les deux questions) :
 - **A. Registration sur paires positives** (`graph[i,j]=True` uniquement, ce que fait déjà
   `phase2_geometric_baseline.py`) : rotation/translation error, inlier_ratio,

@@ -24,6 +24,14 @@ Pipeline, sur les paires positives uniquement (`graph[i,j]=True`) :
      on garde l'hypothèse de pose la mieux notée (même critère de score que le RANSAC
      normal-aware) parmi toutes les paires de clusters testées. Si aucune paire de
      clusters ne produit de pose valide, l'arête est comptée en `no_cluster_match`.
+  5. "oracle_cluster_pair" (diagnostic, PAS une méthode utilisable en pratique) : utilise
+     la pose GT UNIQUEMENT pour choisir la paire de clusters la plus compatible
+     géométriquement avec cette arête (recouvrement mutuel en repère assemblé), puis
+     lance le MÊME matching/RANSAC réel sur cette paire -- pas de triche dans l'étape de
+     matching elle-même, seulement dans le choix de la paire. Tranche la question :
+     est-ce que le pipeline échoue parce qu'il ne choisit pas la bonne paire de clusters
+     (cas favorable : oracle >> cluster_based), ou parce que même la bonne paire ne
+     suffit pas à une pose fiable (cas défavorable : oracle reste mauvais aussi) ?
 
 Ne teste QUE les paires positives (Protocole A, comme tout Phase 2) -- pas encore de
 discrimination positif/négatif.
@@ -43,10 +51,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy.spatial import cKDTree
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hydra.utils import instantiate
+
+CONTACT_EPS = 0.05  # same tolerance as Phase 0/1/2D's edge_contact_recall
 
 from scripts.analyze_errors import load_config_and_model
 from scripts import phase2_geometric_baseline as p2b
@@ -176,8 +187,13 @@ def main():
         k=16, use_normals=False, use_curvature=True, use_roughness=True, use_dist_to_centroid=True,
     )
 
-    results = {"global": defaultdict(list), "cluster_based": defaultdict(list)}
+    results = {
+        "global": defaultdict(list),
+        "cluster_based": defaultdict(list),
+        "oracle_cluster_pair": defaultdict(list),
+    }
     no_cluster_match = 0
+    no_oracle_match = 0
     n_edges = 0
 
     print(f"\nRunning Phase 2E cluster-based matching on {args.categories}/{args.split}...")
@@ -269,6 +285,7 @@ def main():
                         # keep the best-scoring hypothesis across all pairs tested ---
                         if len(frac_idx_i) < args.min_cluster_size or len(frac_idx_j) < args.min_cluster_size:
                             no_cluster_match += 1
+                            no_oracle_match += 1
                             continue
                         clusters_i = cluster_points(raw_per_k[k_i][frac_idx_i], args.cluster_eps, args.min_cluster_size)
                         clusters_j = cluster_points(raw_per_k[k_j][frac_idx_j], args.cluster_eps, args.min_cluster_size)
@@ -297,15 +314,62 @@ def main():
                         if best is None:
                             no_cluster_match += 1
                             results["cluster_based"]["ransac_valid"].append(False)
+                        else:
+                            _, R_est, t_est = best
+                            rot_err = p2b.rotation_error_deg(R_est, R_ij_gt)
+                            trans_err = float(np.linalg.norm(t_est - t_ij_gt))
+                            results["cluster_based"]["rot_err_deg"].append(rot_err)
+                            results["cluster_based"]["trans_err"].append(trans_err)
+                            results["cluster_based"]["pose_success_30_0.1"].append(rot_err < 30.0 and trans_err < 0.1)
+                            results["cluster_based"]["ransac_valid"].append(True)
+
+                        # --- "oracle_cluster_pair": GT pose used ONLY to pick which
+                        # cluster pair to match -- the matching/RANSAC step itself is
+                        # identical to cluster_based, no cheating there. Isolates
+                        # "selection among candidates is the failure" from "even the
+                        # right candidate doesn't yield a reliable pose". Runs regardless
+                        # of whether cluster_based (above) found anything, since the
+                        # selection criteria differ.
+                        global_i_full = (R_i @ raw_per_k[k_i].T).T + trans_np[b, p_i]
+                        global_j_full = (R_j @ raw_per_k[k_j].T).T + trans_np[b, p_j]
+                        best_compat, best_oracle_pair = -1.0, None
+                        for c_a in valid_i:
+                            idx_i_sub = frac_idx_i[clusters_i == c_a]
+                            g_i_sub = global_i_full[idx_i_sub]
+                            for c_b in valid_j:
+                                idx_j_sub = frac_idx_j[clusters_j == c_b]
+                                g_j_sub = global_j_full[idx_j_sub]
+                                d_a, _ = cKDTree(g_j_sub).query(g_i_sub)
+                                d_b, _ = cKDTree(g_i_sub).query(g_j_sub)
+                                compat = 0.5 * (float((d_a < CONTACT_EPS).mean()) + float((d_b < CONTACT_EPS).mean()))
+                                if compat > best_compat:
+                                    best_compat, best_oracle_pair = compat, (idx_i_sub, idx_j_sub)
+
+                        if best_oracle_pair is None or best_compat <= 0:
+                            no_oracle_match += 1
+                            results["oracle_cluster_pair"]["ransac_valid"].append(False)
                             continue
 
-                        _, R_est, t_est = best
-                        rot_err = p2b.rotation_error_deg(R_est, R_ij_gt)
-                        trans_err = float(np.linalg.norm(t_est - t_ij_gt))
-                        results["cluster_based"]["rot_err_deg"].append(rot_err)
-                        results["cluster_based"]["trans_err"].append(trans_err)
-                        results["cluster_based"]["pose_success_30_0.1"].append(rot_err < 30.0 and trans_err < 0.1)
-                        results["cluster_based"]["ransac_valid"].append(True)
+                        idx_i_sub, idx_j_sub = best_oracle_pair
+                        oracle_res = match_subset(
+                            idx_i_sub, idx_j_sub, raw_per_k[k_i], raw_per_k[k_j],
+                            desc_per_k[k_i], desc_per_k[k_j],
+                            normals_per_k[k_i], normals_per_k[k_j], rng, args,
+                        )
+                        if oracle_res is None:
+                            no_oracle_match += 1
+                            results["oracle_cluster_pair"]["ransac_valid"].append(False)
+                            continue
+
+                        R_o, t_o, _, _, _, _, _ = oracle_res
+                        rot_err_o = p2b.rotation_error_deg(R_o, R_ij_gt)
+                        trans_err_o = float(np.linalg.norm(t_o - t_ij_gt))
+                        results["oracle_cluster_pair"]["rot_err_deg"].append(rot_err_o)
+                        results["oracle_cluster_pair"]["trans_err"].append(trans_err_o)
+                        results["oracle_cluster_pair"]["pose_success_30_0.1"].append(
+                            rot_err_o < 30.0 and trans_err_o < 0.1
+                        )
+                        results["oracle_cluster_pair"]["ransac_valid"].append(True)
 
     print(f"\nAnalyzed {n_edges} adjacent fragment pairs ({args.categories}/{args.split}).")
 
@@ -314,8 +378,8 @@ def main():
     print(f"  (mask_strategy={args.mask_strategy}, cluster_eps={args.cluster_eps}, "
           f"score_mode={args.score_mode}, inlier_thresh={args.inlier_thresh})")
     print("=" * 90)
-    print(f"  {'Variant':<14} {'RansacValid':>12} {'Pose@30d_0.1':>13} {'RotErr(deg)':>12} {'TransErr':>10} {'n':>6}")
-    for variant in ["global", "cluster_based"]:
+    print(f"  {'Variant':<20} {'RansacValid':>12} {'Pose@30d_0.1':>13} {'RotErr(deg)':>12} {'TransErr':>10} {'n':>6}")
+    for variant in ["global", "cluster_based", "oracle_cluster_pair"]:
         d = results[variant]
         valid = d.get("ransac_valid", [])
         if not valid:
@@ -324,12 +388,18 @@ def main():
         trans_errs = d.get("trans_err", [])
         pose30 = d.get("pose_success_30_0.1", [])
         print(
-            f"  {variant:<14} {np.mean(valid):>12.2%} "
+            f"  {variant:<20} {np.mean(valid):>12.2%} "
             f"{np.mean(pose30) if pose30 else float('nan'):>13.2%} "
             f"{np.mean(rot_errs) if rot_errs else float('nan'):>12.2f} "
             f"{np.mean(trans_errs) if trans_errs else float('nan'):>10.4f} {len(valid):>6}"
         )
-    print(f"\n  no_cluster_match rate (cluster_based): {no_cluster_match / max(n_edges, 1):.2%}  ({no_cluster_match}/{n_edges})")
+    print(f"\n  no_cluster_match rate (cluster_based)      : {no_cluster_match / max(n_edges, 1):.2%}  ({no_cluster_match}/{n_edges})")
+    print(f"  no_oracle_match rate (oracle_cluster_pair) : {no_oracle_match / max(n_edges, 1):.2%}  ({no_oracle_match}/{n_edges})")
+    print("\n  Lecture : si oracle_cluster_pair >> cluster_based, le pipeline echoue surtout")
+    print("  a SELECTIONNER la bonne paire de clusters (score geometrique insuffisant)")
+    print("  -- soutient un module de compatibilite appris (Phase 3). Si oracle_cluster_pair")
+    print("  reste mauvais aussi, meme la bonne paire ne suffit pas -- limite plus profonde")
+    print("  que la selection (descripteurs/RANSAC eux-memes insuffisants).")
 
     if args.summary_json:
         import json as _json
@@ -340,9 +410,10 @@ def main():
             "metrics": {
                 "n_edges": n_edges,
                 "no_cluster_match_rate": no_cluster_match / max(n_edges, 1),
+                "no_oracle_match_rate": no_oracle_match / max(n_edges, 1),
             },
         }
-        for variant in ["global", "cluster_based"]:
+        for variant in ["global", "cluster_based", "oracle_cluster_pair"]:
             d = results[variant]
             valid = d.get("ransac_valid", [])
             summary["metrics"][f"{variant}_ransac_valid_rate"] = float(np.mean(valid)) if valid else None
