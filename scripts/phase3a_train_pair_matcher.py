@@ -136,15 +136,27 @@ def compute_step(matcher_model, batch: dict, args, use_pose_loss: bool):
         dustbin_pred_rate = ((pred_label == N) & valid_mask).float().sum() / n_valid
 
         n_contact = contact_mask.float().sum()
+        k_eff = min(8, N)
         if n_contact > 0:
             top1_acc = (pred_label[contact_mask] == target_label[contact_mask]).float().mean()
-            k_eff = min(8, N)
             topk_pred = P_points.topk(k_eff, dim=-1).indices
             top8_hit = (topk_pred == target_label.unsqueeze(-1)).any(dim=-1)
             top8_recall = top8_hit[contact_mask].float().mean()
+
+            # Random-guess baseline (closed-form expectation, not sampled -- a uniformly
+            # random guess among the n_valid_j real candidates has expected top1 accuracy
+            # 1/n_valid_j and expected top-k recall k/n_valid_j): without this, a value
+            # like match_top8_recall=5% is uninterpretable -- could be far above or
+            # actually BELOW chance depending on how many valid j points there are.
+            n_valid_j_per_pair = batch["valid_j"].float().sum(dim=-1).clamp(min=1.0)  # [B]
+            n_valid_j_per_row = n_valid_j_per_pair.unsqueeze(1).expand(-1, N)         # [B,N]
+            random_top1 = (1.0 / n_valid_j_per_row)[contact_mask].mean()
+            random_top8 = (float(k_eff) / n_valid_j_per_row).clamp(max=1.0)[contact_mask].mean()
         else:
             top1_acc = torch.tensor(float("nan"))
             top8_recall = torch.tensor(float("nan"))
+            random_top1 = torch.tensor(float("nan"))
+            random_top8 = torch.tensor(float("nan"))
 
         non_dustbin_conf = (1.0 - P[..., -1])[valid_mask].mean()
         rot_err_deg = torch.rad2deg(rot_err)
@@ -169,6 +181,8 @@ def compute_step(matcher_model, batch: dict, args, use_pose_loss: bool):
             "contact_pred_rate": float(1.0 - dustbin_pred_rate.item()),
             "match_top1_acc": float(top1_acc.item()),
             "match_top8_recall": float(top8_recall.item()),
+            "random_top1_acc": float(random_top1.item()),
+            "random_top8_recall": float(random_top8.item()),
             "non_dustbin_confidence": float(non_dustbin_conf.item()),
             "logit_scale": float(matcher_model.matcher.logit_scale.exp().item()),
             "dustbin_bias": float(matcher_model.matcher.dustbin_bias.item()),
@@ -243,8 +257,10 @@ def print_epoch_summary(tag: str, epoch: int, summary: dict):
           f"entropy={summary.get('entropy', float('nan')):.3f}")
     print(f"    dustbin_pred_rate={summary.get('dustbin_pred_rate', float('nan')):.2%}  "
           f"contact_pred_rate={summary.get('contact_pred_rate', float('nan')):.2%}")
-    print(f"    match_top1_acc={summary.get('match_top1_acc', float('nan')):.2%}  "
-          f"match_top8_recall={summary.get('match_top8_recall', float('nan')):.2%}  "
+    print(f"    match_top1_acc={summary.get('match_top1_acc', float('nan')):.2%} "
+          f"(random={summary.get('random_top1_acc', float('nan')):.2%})  "
+          f"match_top8_recall={summary.get('match_top8_recall', float('nan')):.2%} "
+          f"(random={summary.get('random_top8_recall', float('nan')):.2%})  "
           f"non_dustbin_confidence={summary.get('non_dustbin_confidence', float('nan')):.3f}")
     print(f"    pose_valid_rate={summary.get('pose_valid_rate', float('nan')):.2%}  "
           f"RotErr(mean/median)={summary.get('rot_err_deg_mean', float('nan')):.2f}/"
@@ -304,9 +320,32 @@ def main():
     parser.add_argument("--encoder_hidden", default="64,128")
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--no_normalize_desc", action="store_true")
+    parser.add_argument(
+        "--init_logit_scale", type=float, default=10.0,
+        help="Initial logit_scale (cf. dustbin-collapse fix). The first V0 run with the "
+             "default 10.0 swung to the opposite extreme (contact_pred_rate~99.86% at "
+             "epoch 0) and converged toward ~5 over 5 epochs -- starting near that "
+             "converged value avoids spending epochs just on recalibration.",
+    )
+    parser.add_argument(
+        "--init_dustbin_bias", type=float, default=0.0,
+        help="Initial dustbin_bias. The first V0 run converged toward ~1.0 over 5 "
+             "epochs starting from 0.0 -- same rationale as --init_logit_scale.",
+    )
     # Training args.
     parser.add_argument("--pairs_per_step", type=int, default=8, help="Pairs stacked per gradient step.")
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=1e-3, help="LR for the encoder.")
+    parser.add_argument(
+        "--scalar_lr_mult", type=float, default=1.0,
+        help="LR multiplier for the two calibration scalars (logit_scale, dustbin_bias) "
+             "relative to --lr. These have a much cleaner/stronger gradient signal than "
+             "the per-point encoder (they affect every row uniformly), so at mult=1.0 they "
+             "can dominate early training and absorb most of the loss improvement before "
+             "the encoder gets a chance to learn real correspondences (observed: loss fell "
+             "monotonically over 5 epochs while match_top1_acc/match_top8_recall stayed "
+             "flat). <1.0 (e.g. 0.1) slows their recalibration so the encoder's signal isn't "
+             "drowned out.",
+    )
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--contact_row_weight", type=float, default=2.0)
     parser.add_argument("--dustbin_row_weight", type=float, default=1.0)
@@ -381,12 +420,31 @@ def main():
     matcher_model = PairMatcherModel(
         in_dim=8, hidden=hidden, desc_dim=args.desc_dim,
         dropout=args.dropout, normalize_desc=not args.no_normalize_desc,
+        init_logit_scale=args.init_logit_scale, init_dustbin_bias=args.init_dustbin_bias,
     ).to(device)
-    optimizer = torch.optim.Adam(matcher_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # Two LR groups: the calibration scalars (logit_scale, dustbin_bias) affect every row
+    # uniformly, giving them a much cleaner/stronger gradient than the per-point encoder --
+    # at the same LR they can absorb most of the early loss improvement on their own
+    # (observed in the first V0 run: loss fell monotonically while match_top1_acc/
+    # match_top8_recall stayed flat). scalar_lr_mult < 1.0 slows them down so the encoder's
+    # weaker signal isn't drowned out.
+    scalar_params = [matcher_model.matcher.logit_scale, matcher_model.matcher.dustbin_bias]
+    scalar_param_ids = {id(p) for p in scalar_params}
+    encoder_params = [p for p in matcher_model.parameters() if id(p) not in scalar_param_ids]
+    optimizer = torch.optim.Adam(
+        [
+            {"params": encoder_params, "lr": args.lr},
+            {"params": scalar_params, "lr": args.lr * args.scalar_lr_mult},
+        ],
+        weight_decay=args.weight_decay,
+    )
 
     print(f"\nPhase 3A {'V1 (corr+pose)' if args.use_kabsch else 'V0 (corr only)'} training "
           f"on {args.categories}/{args.train_split} (N={args.num_points}, mask={args.mask_strategy}, "
-          f"label_topk={args.label_topk}, pairs_per_step={args.pairs_per_step})...")
+          f"label_topk={args.label_topk}, pairs_per_step={args.pairs_per_step}, "
+          f"init_logit_scale={args.init_logit_scale}, init_dustbin_bias={args.init_dustbin_bias}, "
+          f"scalar_lr_mult={args.scalar_lr_mult})...")
 
     out_dir = Path(args.out_dir) if args.out_dir else None
     if out_dir:

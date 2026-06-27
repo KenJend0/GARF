@@ -77,11 +77,11 @@ class SoftCorrespondenceMatcher(nn.Module):
     (~10), removing that structural advantage.
     """
 
-    def __init__(self, desc_dim: int, init_logit_scale: float = 10.0):
+    def __init__(self, desc_dim: int, init_logit_scale: float = 10.0, init_dustbin_bias: float = 0.0):
         super().__init__()
         self.desc_dim = desc_dim
         self.logit_scale = nn.Parameter(torch.tensor(math.log(init_logit_scale)))
-        self.dustbin_bias = nn.Parameter(torch.zeros(1))
+        self.dustbin_bias = nn.Parameter(torch.full((1,), float(init_dustbin_bias)))
 
     def forward(self, desc_i: torch.Tensor, desc_j: torch.Tensor, valid_j: torch.Tensor):
         """desc_i, desc_j: [B, N, D]. valid_j: [B, N] bool (padded j columns are masked
@@ -101,10 +101,11 @@ class SoftCorrespondenceMatcher(nn.Module):
 
 class PairMatcherModel(nn.Module):
     def __init__(self, in_dim: int = 8, hidden=(64, 128), desc_dim: int = 128,
-                 dropout: float = 0.1, normalize_desc: bool = True):
+                 dropout: float = 0.1, normalize_desc: bool = True,
+                 init_logit_scale: float = 10.0, init_dustbin_bias: float = 0.0):
         super().__init__()
         self.encoder = PointEncoder(in_dim, hidden, desc_dim, dropout)
-        self.matcher = SoftCorrespondenceMatcher(desc_dim)
+        self.matcher = SoftCorrespondenceMatcher(desc_dim, init_logit_scale, init_dustbin_bias)
         self.normalize_desc = normalize_desc
 
     def forward(self, feat_i: torch.Tensor, feat_j: torch.Tensor, valid_j: torch.Tensor):
