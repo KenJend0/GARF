@@ -282,7 +282,13 @@ def iter_positive_pairs(loader, model, geo_extractor, device, args, rng, max_bat
     Yields dicts: {"type": "pair", "sample": ..., "diag": ..., "pair_meta": ...,
     "batch_idx": ...} or {"type": "empty_object", "name": ..., "batch_idx": ...}.
     """
-    with torch.no_grad():
+    # NOTE: deliberately NOT `with torch.no_grad():` wrapping this whole loop -- a context
+    # manager entered before a `yield` does not exit while the generator is suspended, so
+    # it would stay active (disabling autograd) in the CONSUMER's code too (e.g. the
+    # training script's loss.backward(), which crashed with "does not require grad" until
+    # this was found). no_grad is applied locally, only around the frozen CNN forward call
+    # below, which is the only computation here that actually needs it.
+    if True:
         for batch_idx, batch in enumerate(loader):
             if max_batches is not None and max_batches > 0 and batch_idx >= max_batches:
                 break
@@ -299,7 +305,8 @@ def iter_positive_pairs(loader, model, geo_extractor, device, args, rng, max_bat
                 continue
             frag_sizes = [f.shape[0] for f in frag_list]
 
-            out = model(batch_gpu)
+            with torch.no_grad():
+                out = model(batch_gpu)
             pred_flat = out["coarse_seg_pred"].float().cpu().numpy()
             gt_flat = out["coarse_seg_gt"].long().cpu().numpy()
 
