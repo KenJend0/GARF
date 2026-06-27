@@ -50,7 +50,7 @@ from scripts.phase3a_pair_dataset_check import iter_positive_pairs
 from assembly.models.cnn_segmentation_model import CNNFracSeg
 from assembly.models.hybrid_geometry_features import HybridGeometryFeatures
 from assembly.models.pair_matching.soft_kabsch_matcher import (
-    PairMatcherModel, soft_correspondence_loss, matching_entropy,
+    PairMatcherModel, soft_correspondence_loss, contact_loss, matching_entropy,
     weighted_kabsch, geodesic_rotation_error,
 )
 
@@ -149,13 +149,14 @@ def compute_step(matcher_model, batch: dict, args, use_pose_loss: bool):
     """One forward pass + loss + diagnostic metrics for a stacked pair-batch. Pose
     metrics (Kabsch-based) are ALWAYS computed for monitoring; `use_pose_loss` only
     controls whether they're added to the backward graph (V1 behaviour)."""
-    logits, P = matcher_model(batch["feat_i"], batch["feat_j"], batch["valid_j"])
+    logits, P, dustbin_logit = matcher_model(batch["feat_i"], batch["feat_j"], batch["valid_j"])
     N = batch["points_i"].shape[1]
 
     l_corr = soft_correspondence_loss(
         P, batch["target"], batch["valid_i"],
         contact_row_weight=args.contact_row_weight, dustbin_row_weight=args.dustbin_row_weight,
     )
+    l_contact = contact_loss(dustbin_logit, batch["target"], batch["valid_i"])
     entropy = matching_entropy(P, batch["valid_i"])
 
     P_points = P[..., :N]
@@ -167,7 +168,7 @@ def compute_step(matcher_model, batch: dict, args, use_pose_loss: bool):
     trans_err = (t_pred - batch["t_gt"]).norm(dim=-1)
     pose_valid = wsum > args.pose_min_weight
 
-    loss = l_corr
+    loss = l_corr + args.lambda_contact * l_contact
     if use_pose_loss and pose_valid.any():
         loss = (
             loss + args.lambda_rot * rot_err[pose_valid].mean()
@@ -227,6 +228,7 @@ def compute_step(matcher_model, batch: dict, args, use_pose_loss: bool):
         metrics = {
             "loss": float(loss.item()),
             "l_corr": float(l_corr.item()),
+            "l_contact": float(l_contact.item()),
             "entropy": float(entropy.item()),
             "dustbin_pred_rate": float(dustbin_pred_rate.item()),
             "contact_pred_rate": float(1.0 - dustbin_pred_rate.item()),
@@ -242,7 +244,11 @@ def compute_step(matcher_model, batch: dict, args, use_pose_loss: bool):
             "top8_gap": float((top8_recall - random_top8).item()),
             "non_dustbin_confidence": float(non_dustbin_conf.item()),
             "logit_scale": float(matcher_model.matcher.logit_scale.exp().item()),
-            "dustbin_bias": float(matcher_model.matcher.dustbin_bias.item()),
+            # Phase 4A: dustbin is now per-point (dustbin_head(desc_i)), not a single
+            # scalar -- this std is the diagnostic that matters: 0 at init (zero-init last
+            # layer), should grow if the head is learning a real per-point "has contact"
+            # signal rather than collapsing back to a near-constant value.
+            "dustbin_logit_std": float(dustbin_logit_per_row[valid_mask].std().item()),
             "match_logits_mean": float(match_logits_valid.mean().item()),
             "match_logits_std": float(match_logits_valid.std().item()),
             "match_logits_min": float(match_logits_valid.min().item()),
@@ -302,9 +308,10 @@ def run_epoch(loader, cnn_model, geo_extractor, device, args, rng, matcher_model
         n_steps += 1
         if train and log_every > 0 and n_steps % log_every == 0:
             print(f"    step {n_steps}: loss={metrics['loss']:.4f} l_corr={metrics['l_corr']:.4f} "
+                  f"l_contact={metrics['l_contact']:.4f} "
                   f"top1_acc={metrics['match_top1_acc']:.2%} dustbin_pred={metrics['dustbin_pred_rate']:.2%} "
                   f"pose_success={metrics['pose_success_30deg_0.1']:.2%} "
-                  f"logit_scale={metrics['logit_scale']:.2f} dustbin_bias={metrics['dustbin_bias']:.2f} "
+                  f"logit_scale={metrics['logit_scale']:.2f} dustbin_logit_std={metrics['dustbin_logit_std']:.3f} "
                   f"dustbin_minus_max_match={metrics['dustbin_minus_max_match']:+.3f}")
 
     summary = {key: float(np.nanmean(vals)) for key, vals in agg.items()}
@@ -332,7 +339,8 @@ def print_epoch_summary(tag: str, epoch: int, summary: dict):
           f"{summary.get('trans_err_median', float('nan')):.4f}  "
           f"Pose@30deg_0.1={summary.get('pose_success_30deg_0.1', float('nan')):.2%}")
     print(f"    logit_scale={summary.get('logit_scale', float('nan')):.2f}  "
-          f"dustbin_bias={summary.get('dustbin_bias', float('nan')):.2f}  "
+          f"l_contact={summary.get('l_contact', float('nan')):.4f}  "
+          f"dustbin_logit_std={summary.get('dustbin_logit_std', float('nan')):.3f}  "
           f"match_logits(mean/std/min/max)={summary.get('match_logits_mean', float('nan')):.2f}/"
           f"{summary.get('match_logits_std', float('nan')):.2f}/"
           f"{summary.get('match_logits_min', float('nan')):.2f}/"
@@ -410,18 +418,26 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3, help="LR for the encoder.")
     parser.add_argument(
         "--scalar_lr_mult", type=float, default=1.0,
-        help="LR multiplier for the two calibration scalars (logit_scale, dustbin_bias) "
-             "relative to --lr. These have a much cleaner/stronger gradient signal than "
-             "the per-point encoder (they affect every row uniformly), so at mult=1.0 they "
-             "can dominate early training and absorb most of the loss improvement before "
-             "the encoder gets a chance to learn real correspondences (observed: loss fell "
-             "monotonically over 5 epochs while match_top1_acc/match_top8_recall stayed "
-             "flat). <1.0 (e.g. 0.1) slows their recalibration so the encoder's signal isn't "
+        help="LR multiplier for logit_scale (the single global calibration scalar) "
+             "relative to --lr. It has a much cleaner/stronger gradient signal than "
+             "the per-point encoder/dustbin_head (it affects every row uniformly), so at "
+             "mult=1.0 it can dominate early training and absorb most of the loss "
+             "improvement before the encoder gets a chance to learn real correspondences "
+             "(observed: loss fell monotonically over 5 epochs while match_top1_acc/"
+             "match_top8_recall stayed flat). <1.0 (e.g. 0.1) slows its recalibration so "
+             "the encoder's signal isn't "
              "drowned out.",
     )
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--contact_row_weight", type=float, default=2.0)
     parser.add_argument("--dustbin_row_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--lambda_contact", type=float, default=0.5,
+        help="Phase 4A: weight of the auxiliary L_contact BCE loss (per-point dustbin "
+             "head vs row_has_contact_gt), added to L_corr. Separates 'does this row have "
+             "a contact at all' from 'which column' -- the old single global dustbin_bias "
+             "(Phase 3A) could only express an average dustbin rate, not a per-point signal.",
+    )
     parser.add_argument(
         "--use_kabsch", action="store_true",
         help="V1: add geodesic rotation + translation L2 loss on the weighted-Kabsch "
@@ -516,13 +532,15 @@ def main():
             torch.load(args.resume_from, map_location=device, weights_only=True)
         )
 
-    # Two LR groups: the calibration scalars (logit_scale, dustbin_bias) affect every row
-    # uniformly, giving them a much cleaner/stronger gradient than the per-point encoder --
-    # at the same LR they can absorb most of the early loss improvement on their own
+    # Slowed-LR group: logit_scale is a single GLOBAL scalar affecting every row
+    # uniformly, giving it a much cleaner/stronger gradient than the per-point encoder --
+    # at the same LR it could absorb most of the early loss improvement on its own
     # (observed in the first V0 run: loss fell monotonically while match_top1_acc/
-    # match_top8_recall stayed flat). scalar_lr_mult < 1.0 slows them down so the encoder's
-    # weaker signal isn't drowned out.
-    scalar_params = [matcher_model.matcher.logit_scale, matcher_model.matcher.dustbin_bias]
+    # match_top8_recall stayed flat). scalar_lr_mult < 1.0 slows it down so the encoder's
+    # weaker signal isn't drowned out. dustbin_head (Phase 4A) is NOT included here --
+    # unlike the old global dustbin_bias scalar, it's a function of desc_i, so it doesn't
+    # have the same "free lunch" shortcut and is trained at the normal encoder LR.
+    scalar_params = [matcher_model.matcher.logit_scale]
     scalar_param_ids = {id(p) for p in scalar_params}
     encoder_params = [p for p in matcher_model.parameters() if id(p) not in scalar_param_ids]
     optimizer = torch.optim.Adam(
@@ -577,10 +595,10 @@ def main():
         # first vs last epoch, so "did this actually learn anything, or just recalibrate
         # the two scalars" is answerable from this file alone (no need to send raw logs).
         trend_keys = [
-            "loss", "l_corr", "entropy", "dustbin_pred_rate", "contact_pred_rate",
+            "loss", "l_corr", "l_contact", "entropy", "dustbin_pred_rate", "contact_pred_rate",
             "match_top1_acc", "random_top1_acc", "top1_gap",
             "match_top8_recall", "random_top8_recall", "top8_gap",
-            "non_dustbin_confidence", "logit_scale", "dustbin_bias", "dustbin_minus_max_match",
+            "non_dustbin_confidence", "logit_scale", "dustbin_logit_std", "dustbin_minus_max_match",
             "pose_success_30deg_0.1", "rot_err_deg_mean",
         ]
 

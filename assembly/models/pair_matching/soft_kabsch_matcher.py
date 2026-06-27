@@ -58,45 +58,62 @@ class PointEncoder(nn.Module):
 
 
 class SoftCorrespondenceMatcher(nn.Module):
-    """Descriptor correlation + row-softmax with a learned dustbin column.
+    """Descriptor correlation + row-softmax with a learned, PER-POINT dustbin column.
 
     A point of i with no genuine contact in j (cf. Phase 2's multi-neighbor confound,
     ~65% of rows in the validated Phase 3A data) should match the dustbin, not be forced
     onto a wrong j point -- hence a dustbin column instead of a plain softmax over j only.
-    The dustbin logit is a single learned scalar bias (broadcast to every row/pair),
-    not a full Sinkhorn/optimal-transport formulation -- deliberately minimal for V0.
+
+    Phase 4A change: the dustbin logit was a single GLOBAL learned scalar bias
+    (Phase 3A V0/C1/C2) -- it could only express "rows go to dustbin X% of the time on
+    average", not "THIS point of i has no counterpart in j" (which is exactly the
+    multi-neighbor confound this column exists to handle). Replaced with a small
+    per-point head `dustbin_head(desc_i)`, trained with an auxiliary `L_contact` BCE
+    loss (cf. soft_correspondence_loss + this module's docstring in the training
+    script) that explicitly separates two questions: (1) does this row have a real
+    contact at all, (2) if so, which column. The head's last layer is zero-init with
+    its bias set to `init_dustbin_bias`, so at initialization every point starts with
+    the SAME dustbin logit (matching the old global-bias behavior) -- it only
+    differentiates per point once gradient flows through L_contact/L_corr.
 
     Assumes desc_i/desc_j are L2-normalized (cosine similarity in [-1,1] -- true when
     PairMatcherModel.normalize_desc=True, the default). A LEARNED `logit_scale`
     (CLIP-style) replaces a fixed `/sqrt(D)` scaling: the latter was found empirically
     to collapse training to "always predict dustbin" -- with unit-norm descriptors,
     dividing by sqrt(D)=sqrt(128)~11.3 squashes match logits into [-0.09, 0.09] while
-    dustbin_bias is a free, unconstrained scalar, so the optimizer could cut the loss
-    cheaply by growing dustbin_bias alone instead of learning to separate descriptors.
+    the old dustbin bias was a free, unconstrained scalar, so the optimizer could cut
+    the loss cheaply by growing it alone instead of learning to separate descriptors.
     Both initialized so match logits and the dustbin logit start on a comparable scale
-    (~10), removing that structural advantage.
+    (~10), removing that structural advantage -- still relevant with a per-point head.
     """
 
     def __init__(self, desc_dim: int, init_logit_scale: float = 10.0, init_dustbin_bias: float = 0.0):
         super().__init__()
         self.desc_dim = desc_dim
         self.logit_scale = nn.Parameter(torch.tensor(math.log(init_logit_scale)))
-        self.dustbin_bias = nn.Parameter(torch.full((1,), float(init_dustbin_bias)))
+        self.dustbin_head = nn.Sequential(
+            nn.Linear(desc_dim, desc_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(desc_dim // 2, 1),
+        )
+        nn.init.zeros_(self.dustbin_head[-1].weight)
+        nn.init.constant_(self.dustbin_head[-1].bias, float(init_dustbin_bias))
 
     def forward(self, desc_i: torch.Tensor, desc_j: torch.Tensor, valid_j: torch.Tensor):
         """desc_i, desc_j: [B, N, D]. valid_j: [B, N] bool (padded j columns are masked
         out with -inf before softmax, so they can structurally never receive any weight
         -- consistent with the `valid_target_col_rate=1.0` invariant already enforced in
-        the dataset-check script). Returns (logits [B,N,N+1], P [B,N,N+1])."""
+        the dataset-check script). Returns (logits [B,N,N+1], P [B,N,N+1], dustbin_logit
+        [B,N] -- the raw per-point dustbin logit, exposed separately for L_contact)."""
         B, N, D = desc_i.shape
         cos_sim = torch.einsum("bnd,bmd->bnm", desc_i, desc_j)
         scale = self.logit_scale.exp().clamp(max=50.0)
         S = scale * cos_sim
         S = S.masked_fill(~valid_j.unsqueeze(1), float("-inf"))
-        dustbin_col = self.dustbin_bias.view(1, 1, 1).expand(B, N, 1)
-        logits = torch.cat([S, dustbin_col], dim=-1)
+        dustbin_logit = self.dustbin_head(desc_i).squeeze(-1)  # [B, N]
+        logits = torch.cat([S, dustbin_logit.unsqueeze(-1)], dim=-1)
         P = torch.softmax(logits, dim=-1)
-        return logits, P
+        return logits, P, dustbin_logit
 
 
 class PairMatcherModel(nn.Module):
@@ -141,6 +158,19 @@ def soft_correspondence_loss(
     weight = weight * valid_i.float()
     denom = weight.sum().clamp(min=eps)
     return (ce * weight).sum() / denom
+
+
+def contact_loss(dustbin_logit: torch.Tensor, target: torch.Tensor, valid_i: torch.Tensor) -> torch.Tensor:
+    """Phase 4A auxiliary loss: BCE between the per-point dustbin head's prediction and
+    whether the row actually has a real contact (target's dustbin column == 0), restricted
+    to valid_i rows. Separates two questions the single soft_correspondence_loss conflates:
+    (1) does this row of i have ANY counterpart in j (this loss), (2) if so, which column
+    (soft_correspondence_loss). `-dustbin_logit` is used as the "has contact" logit (high
+    dustbin_logit = confidently dustbin = low contact probability)."""
+    has_contact = (target[..., -1] <= 0.5).float()  # [B, N]
+    bce = F.binary_cross_entropy_with_logits(-dustbin_logit, has_contact, reduction="none")
+    weight = valid_i.float()
+    return (bce * weight).sum() / weight.sum().clamp(min=1e-8)
 
 
 def matching_entropy(P: torch.Tensor, valid_i: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
