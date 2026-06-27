@@ -156,15 +156,27 @@ class PointHead(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
         )
 
-    def forward(self, feat_2d: torch.Tensor, feat_3d: torch.Tensor) -> torch.Tensor:
+    def forward(self, feat_2d: torch.Tensor, feat_3d: torch.Tensor,
+                return_features: bool = False):
         """
         feat_2d : (N, feat_2d_dim)
         feat_3d : (N, feat_3d_dim)
-        Returns : (N,) logits
+        Returns : (N,) logits, or (logits, point_features) if return_features=True
+                  -- point_features (N, hidden_dim // 2) is the activation right before
+                  the final Linear(hidden_dim//2, 1), i.e. the fused 2D+3D point-level
+                  embedding the segmentation decision is read off from (cf. Phase 3
+                  ablation C: this is the richest per-point representation available
+                  in the frozen CNN, as opposed to a raw decoder feature map that's
+                  still image/projection-level, not yet point-aligned).
         """
         f2d = self.feat_2d_norm(feat_2d)
         f3d = self.feat_3d_encoder(feat_3d)
-        return self.mlp(torch.cat([f2d, f3d], dim=1)).squeeze(-1)
+        fused = torch.cat([f2d, f3d], dim=1)
+        point_features = self.mlp[:-1](fused)          # (N, hidden_dim // 2)
+        logits = self.mlp[-1](point_features).squeeze(-1)
+        if return_features:
+            return logits, point_features
+        return logits
 
 
 class SimpleCNNBackbone(nn.Module):
@@ -658,7 +670,7 @@ class CNNFracSeg(pl.LightningModule):
     # Forward
     # ------------------------------------------------------------------
 
-    def forward(self, batch):
+    def forward(self, batch, return_point_features: bool = False):
         """
         9-step forward pass.
 
@@ -672,6 +684,16 @@ class CNNFracSeg(pl.LightningModule):
           coarse_seg_pred        : (N_sum_valid,) float  probabilities
           coarse_seg_pred_binary : (N_sum_valid,) bool   > 0.5 threshold
           coarse_seg_gt          : (N_sum_valid,) long   ground-truth labels
+          point_features          : (N_sum_valid, point_head_hidden_dim // 2) float --
+                                    ONLY when return_point_features=True AND
+                                    use_point_head=True (cf. Phase 3 ablation C). The
+                                    fused 2D+3D point-level embedding PointHead reads
+                                    its logit off, same point ordering/concatenation as
+                                    coarse_seg_pred (so callers can slice it with the
+                                    exact same per-fragment `offsets` they already use
+                                    for coarse_seg_pred). Default False: behavior and
+                                    return dict are unchanged for every existing caller
+                                    (training/eval steps, other ablation scripts).
         """
         out = {}
         pointclouds     = batch["pointclouds"]       # (B, N_total, 3)
@@ -844,7 +866,13 @@ class CNNFracSeg(pl.LightningModule):
             # 8d. Concat all fragments, run MLP, sigmoid
             feat_2d_all = torch.cat(feat_2d_list,  dim=0)     # (N_sum, C_feat)
             feat_3d_all = torch.cat(feat_3d_list,  dim=0)     # (N_sum, feat_3d_dim)
-            point_logits   = self.point_head(feat_2d_all, feat_3d_all)  # (N_sum,)
+            if return_point_features:
+                point_logits, point_features = self.point_head(
+                    feat_2d_all, feat_3d_all, return_features=True
+                )
+                out["point_features"] = point_features  # (N_sum, hidden_dim // 2)
+            else:
+                point_logits = self.point_head(feat_2d_all, feat_3d_all)
             coarse_seg_pred = torch.sigmoid(point_logits)
         else:
             # Classic path: 2D sigmoid map → bilinear + view-attention backproject

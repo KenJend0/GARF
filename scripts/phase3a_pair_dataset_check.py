@@ -115,6 +115,7 @@ def select_points(pool_idx: np.ndarray, pool_xyz: np.ndarray, N: int, mode: str,
 def build_pair_sample(
     raw_i, raw_j, normals_i, normals_j, scores_i, scores_j, desc_i, desc_j,
     mask_i_bool, mask_j_bool, R_ij_gt, t_ij_gt, args, rng,
+    cnn_feat_i_full=None, cnn_feat_j_full=None,
 ):
     """Build the full Phase 3A input/label tensors for one directed pair i->j.
     Returns a dict (see module docstring for the exact field list) plus a `diag` dict of
@@ -159,6 +160,16 @@ def build_pair_sample(
     cnn_score_j = np.where(valid_j, scores_j[sel_j], 0.0)[:, None]
     geom_i = np.where(valid_i[:, None], desc_i[sel_i], 0.0)
     geom_j = np.where(valid_j[:, None], desc_j[sel_j], 0.0)
+
+    # Optional CNN point-level features (Phase 3 ablation C, cf. PointHead.forward
+    # return_features=True) -- sliced/padded with the EXACT SAME sel_i/sel_j indices and
+    # valid_i/valid_j masks as every other per-point field above, so a misalignment
+    # between cnn_feat and points/scores cannot silently creep in.
+    cnn_feat_i = cnn_feat_j = None
+    if cnn_feat_i_full is not None:
+        cnn_feat_i = np.where(valid_i[:, None], cnn_feat_i_full[sel_i], 0.0)
+    if cnn_feat_j_full is not None:
+        cnn_feat_j = np.where(valid_j[:, None], cnn_feat_j_full[sel_j], 0.0)
 
     # Distance in j's local frame: transform i's selected points by the GT relative pose
     # (raw_i and raw_j live in independent per-fragment random-rotation frames, cf. Phase 0
@@ -243,6 +254,10 @@ def build_pair_sample(
         "target_ij": target,
         "R_ij": R_ij_gt, "t_ij": t_ij_gt,
     }
+    if cnn_feat_i is not None:
+        sample["cnn_feat_i"] = cnn_feat_i
+        sample["cnn_feat_j"] = cnn_feat_j
+        diag["cnn_feat_dim"] = cnn_feat_i.shape[-1]
     return sample, diag
 
 
@@ -268,10 +283,24 @@ def run_sanity_checks(sample, diag, pair_meta) -> list:
         if not np.isfinite(sample[key]).all():
             issues.append(f"{pair_meta}: NaN/Inf in {key}")
 
+    if "cnn_feat_i" in sample:
+        for key in ("cnn_feat_i", "cnn_feat_j"):
+            if not np.isfinite(sample[key]).all():
+                issues.append(f"{pair_meta}: NaN/Inf in {key}")
+        # Padded rows/cols must carry zero cnn_feat -- same convention as every other
+        # per-point field (points/normals/cnn_score/geom_feats), checked explicitly here
+        # because cnn_feat is sliced through an extra indirection (offsets -> sel_i/sel_j)
+        # that a future refactor could break silently otherwise.
+        if (sample["cnn_feat_i"][~valid_i] != 0).any():
+            issues.append(f"{pair_meta}: padded rows (valid_i=False) carry nonzero cnn_feat_i")
+        if (sample["cnn_feat_j"][~valid_j] != 0).any():
+            issues.append(f"{pair_meta}: padded rows (valid_j=False) carry nonzero cnn_feat_j")
+
     return issues
 
 
-def iter_positive_pairs(loader, model, geo_extractor, device, args, rng, max_batches=None):
+def iter_positive_pairs(loader, model, geo_extractor, device, args, rng, max_batches=None,
+                         use_cnn_features=False):
     """Yield one event per directed positive pair (plus one event per object with zero
     positive pairs), reusing the EXACT extraction/masking/sampling logic validated by this
     script's own `main()`. Shared with `scripts/phase3a_train_pair_matcher.py` and
@@ -306,9 +335,13 @@ def iter_positive_pairs(loader, model, geo_extractor, device, args, rng, max_bat
             frag_sizes = [f.shape[0] for f in frag_list]
 
             with torch.no_grad():
-                out = model(batch_gpu)
+                out = model(batch_gpu, return_point_features=use_cnn_features)
             pred_flat = out["coarse_seg_pred"].float().cpu().numpy()
             gt_flat = out["coarse_seg_gt"].long().cpu().numpy()
+            cnn_feat_flat = (
+                out["point_features"].float().cpu().numpy()
+                if use_cnn_features and "point_features" in out else None
+            )
 
             valid_pcs_np = valid_pcs.cpu().numpy()
             B, P = valid_pcs_np.shape
@@ -327,6 +360,10 @@ def iter_positive_pairs(loader, model, geo_extractor, device, args, rng, max_bat
             scores_per_k = [pred_flat[offsets[k]:offsets[k + 1]] for k in range(K)]
             gt_per_k = [gt_flat[offsets[k]:offsets[k + 1]] for k in range(K)]
             pc_local_per_k = [frag_list[k].cpu().numpy() for k in range(K)]
+            cnn_feat_per_k = (
+                [cnn_feat_flat[offsets[k]:offsets[k + 1]] for k in range(K)]
+                if cnn_feat_flat is not None else [None] * K
+            )
 
             normals_per_k, raw_per_k = [], []
             for k, (b, p) in enumerate(bp_pairs):
@@ -381,6 +418,7 @@ def iter_positive_pairs(loader, model, geo_extractor, device, args, rng, max_bat
                             scores_per_k[k_i], scores_per_k[k_j],
                             desc_per_k[k_i], desc_per_k[k_j],
                             mask_i_bool, mask_j_bool, R_ij_gt, t_ij_gt, args, rng,
+                            cnn_feat_per_k[k_i], cnn_feat_per_k[k_j],
                         )
                         pair_meta = f"{names[b]} part_i={p_i} part_j={p_j}"
                         yield {
@@ -423,6 +461,14 @@ def main():
     parser.add_argument(
         "--undirected", action="store_true",
         help="Emit only i<j pairs instead of both (i,j) and (j,i) (default: directed).",
+    )
+    parser.add_argument(
+        "--use_cnn_features", action="store_true",
+        help="Phase 3 ablation C: also extract PointHead's fused 2D+3D point-level "
+             "embedding (cf. CNNFracSeg.forward return_point_features) into "
+             "sample['cnn_feat_i']/['cnn_feat_j']. Requires a checkpoint trained with "
+             "use_point_head=True (true for cnn_step15_final_model). No effect on the "
+             "existing fields -- purely additive.",
     )
     parser.add_argument("--summary_json", default=None)
     args = parser.parse_args()
@@ -470,10 +516,13 @@ def main():
     print(f"\nPhase 3A pair-dataset check on {args.categories}/{args.split} "
           f"(mask={args.mask_strategy}, N={args.num_points}, sample_mode={args.sample_mode}, "
           f"label_mode={args.label_mode}, label_topk={args.label_topk}, label_sigma={args.label_sigma}, "
-          f"directed={not args.undirected})...")
+          f"directed={not args.undirected}, use_cnn_features={args.use_cnn_features})...")
 
     seen_objects = set()
-    for event in iter_positive_pairs(loader, model, geo_extractor, device, args, rng, args.max_batches):
+    for event in iter_positive_pairs(
+        loader, model, geo_extractor, device, args, rng, args.max_batches,
+        use_cnn_features=args.use_cnn_features,
+    ):
         if event["type"] == "batch_seen":
             n_batches += 1
             if event["batch_idx"] % 5 == 0:
@@ -544,6 +593,10 @@ def main():
     print(f"  mean_effective_matches_per_contact_row={mean('mean_effective_matches_per_contact_row'):.2f}  "
           f"(1.0 = sharp/one-hot-like label, -> raw count = uniform/diffuse label, no real positional signal)")
     print(f"  valid_target_col_rate={mean('valid_target_col_rate'):.4f}")
+    if args.use_cnn_features:
+        cnn_dims = diag_acc.get("cnn_feat_dim", [])
+        print(f"  cnn_feat_dim={cnn_dims[0] if cnn_dims else 'n/a'} "
+              f"(constant across pairs: {len(set(cnn_dims)) <= 1 if cnn_dims else 'n/a'})")
 
     print("\n" + "=" * 100)
     print(f"SANITY CHECK ISSUES: {len(issues_all)}")
@@ -563,8 +616,9 @@ def main():
                 "contact_eps": args.contact_eps, "label_sigma": args.label_sigma,
                 "label_topk": args.label_topk,
                 "label_mode": args.label_mode, "sample_mode": args.sample_mode,
-                "directed": not args.undirected,
+                "directed": not args.undirected, "use_cnn_features": args.use_cnn_features,
             },
+            "cnn_feat_dim": (diag_acc.get("cnn_feat_dim") or [None])[0],
             "n_batches": n_batches, "n_objects": n_objects,
             "n_positive_pairs_directed": n_pairs,
             "mean_pos_pairs_per_object": mean_pos_per_obj,
