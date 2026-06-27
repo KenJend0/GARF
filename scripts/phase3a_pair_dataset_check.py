@@ -271,6 +271,120 @@ def run_sanity_checks(sample, diag, pair_meta) -> list:
     return issues
 
 
+def iter_positive_pairs(loader, model, geo_extractor, device, args, rng, max_batches=None):
+    """Yield one event per directed positive pair (plus one event per object with zero
+    positive pairs), reusing the EXACT extraction/masking/sampling logic validated by this
+    script's own `main()`. Shared with `scripts/phase3a_train_pair_matcher.py` and
+    `scripts/phase3a_eval_pair_matcher.py` so the three scripts can never silently diverge
+    on how a training/eval pair is built -- this dataset-check script remains the single
+    source of truth for the data pipeline.
+
+    Yields dicts: {"type": "pair", "sample": ..., "diag": ..., "pair_meta": ...,
+    "batch_idx": ...} or {"type": "empty_object", "name": ..., "batch_idx": ...}.
+    """
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(loader):
+            if max_batches is not None and max_batches > 0 and batch_idx >= max_batches:
+                break
+            yield {"type": "batch_seen", "batch_idx": batch_idx}
+
+            batch_gpu = {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
+            frag_list, valid_pcs, K = extract_fragment_list(
+                batch_gpu["pointclouds"], batch_gpu["points_per_part"]
+            )
+            if K == 0:
+                continue
+            frag_sizes = [f.shape[0] for f in frag_list]
+
+            out = model(batch_gpu)
+            pred_flat = out["coarse_seg_pred"].float().cpu().numpy()
+            gt_flat = out["coarse_seg_gt"].long().cpu().numpy()
+
+            valid_pcs_np = valid_pcs.cpu().numpy()
+            B, P = valid_pcs_np.shape
+            bp_pairs = [(b, p) for b in range(B) for p in range(P) if valid_pcs_np[b, p]]
+
+            quats_np = batch["quaternions"].numpy()
+            trans_np = batch["translations"].numpy()
+            scale_np = batch["scale"].numpy()
+            if scale_np.ndim == 2:
+                scale_np = scale_np[:, :, None]
+            graph_np = batch["graph"].numpy()
+            normals_np = batch["pointclouds_normals"].numpy()
+            names = batch["name"]
+
+            offsets = np.concatenate([[0], np.cumsum(frag_sizes)])
+            scores_per_k = [pred_flat[offsets[k]:offsets[k + 1]] for k in range(K)]
+            gt_per_k = [gt_flat[offsets[k]:offsets[k + 1]] for k in range(K)]
+            pc_local_per_k = [frag_list[k].cpu().numpy() for k in range(K)]
+
+            normals_per_k, raw_per_k = [], []
+            for k, (b, p) in enumerate(bp_pairs):
+                scale_k = scale_np[b, p]
+                raw_k = pc_local_per_k[k] * scale_k
+                raw_per_k.append(raw_k)
+                normals_per_k.append(
+                    normals_np[b, p] if normals_np.ndim == 4
+                    else normals_np[offsets[k]:offsets[k + 1]]
+                )
+
+            desc_per_k = []
+            for k in range(K):
+                xyz_t = torch.from_numpy(raw_per_k[k]).float().to(device)
+                nrm_t = torch.from_numpy(normals_per_k[k]).float().to(device)
+                desc_per_k.append(geo_extractor.forward_single(xyz_t, nrm_t).cpu().numpy())
+
+            object_to_ks = defaultdict(list)
+            for k, (b, p) in enumerate(bp_pairs):
+                object_to_ks[b].append((k, p))
+
+            for b, ks_ps in object_to_ks.items():
+                pos_pairs_this_object = 0
+                for idx_i in range(len(ks_ps)):
+                    j_range = (
+                        range(idx_i + 1, len(ks_ps)) if args.undirected
+                        else [j for j in range(len(ks_ps)) if j != idx_i]
+                    )
+                    for idx_j in j_range:
+                        k_i, p_i = ks_ps[idx_i]
+                        k_j, p_j = ks_ps[idx_j]
+                        if not graph_np[b, p_i, p_j]:
+                            continue
+                        pos_pairs_this_object += 1
+
+                        R_i = p2b.quat_wxyz_to_rotmat(quats_np[b, p_i])
+                        R_j = p2b.quat_wxyz_to_rotmat(quats_np[b, p_j])
+                        R_j_inv = R_j.T
+                        R_ij_gt = R_j_inv @ R_i
+                        t_ij_gt = R_j_inv @ (trans_np[b, p_i] - trans_np[b, p_j])
+
+                        mask_i_bool = p2b.build_mask(
+                            args.mask_strategy, scores_per_k[k_i], gt_per_k[k_i], rng
+                        )
+                        mask_j_bool = p2b.build_mask(
+                            args.mask_strategy, scores_per_k[k_j], gt_per_k[k_j], rng
+                        )
+
+                        sample, diag = build_pair_sample(
+                            raw_per_k[k_i], raw_per_k[k_j],
+                            normals_per_k[k_i], normals_per_k[k_j],
+                            scores_per_k[k_i], scores_per_k[k_j],
+                            desc_per_k[k_i], desc_per_k[k_j],
+                            mask_i_bool, mask_j_bool, R_ij_gt, t_ij_gt, args, rng,
+                        )
+                        pair_meta = f"{names[b]} part_i={p_i} part_j={p_j}"
+                        yield {
+                            "type": "pair", "sample": sample, "diag": diag,
+                            "pair_meta": pair_meta, "batch_idx": batch_idx,
+                        }
+
+                if pos_pairs_this_object == 0:
+                    yield {"type": "empty_object", "name": names[b], "batch_idx": batch_idx}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", required=True)
@@ -351,126 +465,46 @@ def main():
           f"label_mode={args.label_mode}, label_topk={args.label_topk}, label_sigma={args.label_sigma}, "
           f"directed={not args.undirected})...")
 
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(loader):
-            if args.max_batches > 0 and batch_idx >= args.max_batches:
-                break
+    seen_objects = set()
+    for event in iter_positive_pairs(loader, model, geo_extractor, device, args, rng, args.max_batches):
+        if event["type"] == "batch_seen":
             n_batches += 1
+            if event["batch_idx"] % 5 == 0:
+                print(f"  batch {event['batch_idx']}... ({n_pairs} pairs so far)")
+            continue
 
-            batch_gpu = {
-                k: v.to(device) if isinstance(v, torch.Tensor) else v
-                for k, v in batch.items()
-            }
-            frag_list, valid_pcs, K = extract_fragment_list(
-                batch_gpu["pointclouds"], batch_gpu["points_per_part"]
-            )
-            if K == 0:
-                continue
-            frag_sizes = [f.shape[0] for f in frag_list]
-
-            out = model(batch_gpu)
-            pred_flat = out["coarse_seg_pred"].float().cpu().numpy()
-            gt_flat = out["coarse_seg_gt"].long().cpu().numpy()
-
-            valid_pcs_np = valid_pcs.cpu().numpy()
-            B, P = valid_pcs_np.shape
-            bp_pairs = [(b, p) for b in range(B) for p in range(P) if valid_pcs_np[b, p]]
-
-            quats_np = batch["quaternions"].numpy()
-            trans_np = batch["translations"].numpy()
-            scale_np = batch["scale"].numpy()
-            if scale_np.ndim == 2:
-                scale_np = scale_np[:, :, None]
-            graph_np = batch["graph"].numpy()
-            normals_np = batch["pointclouds_normals"].numpy()
-            names = batch["name"]
-
-            offsets = np.concatenate([[0], np.cumsum(frag_sizes)])
-            scores_per_k = [pred_flat[offsets[k]:offsets[k + 1]] for k in range(K)]
-            gt_per_k = [gt_flat[offsets[k]:offsets[k + 1]] for k in range(K)]
-            pc_local_per_k = [frag_list[k].cpu().numpy() for k in range(K)]
-
-            normals_per_k, raw_per_k = [], []
-            for k, (b, p) in enumerate(bp_pairs):
-                scale_k = scale_np[b, p]
-                raw_k = pc_local_per_k[k] * scale_k
-                raw_per_k.append(raw_k)
-                normals_per_k.append(
-                    normals_np[b, p] if normals_np.ndim == 4
-                    else normals_np[offsets[k]:offsets[k + 1]]
-                )
-
-            desc_per_k = []
-            for k in range(K):
-                xyz_t = torch.from_numpy(raw_per_k[k]).float().to(device)
-                nrm_t = torch.from_numpy(normals_per_k[k]).float().to(device)
-                desc_per_k.append(geo_extractor.forward_single(xyz_t, nrm_t).cpu().numpy())
-
-            object_to_ks = defaultdict(list)
-            for k, (b, p) in enumerate(bp_pairs):
-                object_to_ks[b].append((k, p))
-
-            for b, ks_ps in object_to_ks.items():
+        if event["type"] == "empty_object":
+            obj_key = (event["batch_idx"], event["name"])
+            if obj_key not in seen_objects:
+                seen_objects.add(obj_key)
                 n_objects += 1
-                pos_pairs_this_object = 0
-                for idx_i in range(len(ks_ps)):
-                    j_range = (
-                        range(idx_i + 1, len(ks_ps)) if args.undirected
-                        else [j for j in range(len(ks_ps)) if j != idx_i]
-                    )
-                    for idx_j in j_range:
-                        k_i, p_i = ks_ps[idx_i]
-                        k_j, p_j = ks_ps[idx_j]
-                        if not graph_np[b, p_i, p_j]:
-                            continue
-                        n_pairs += 1
-                        pos_pairs_this_object += 1
+            issues_all.append(f"batch {event['batch_idx']} object {event['name']}: no positive pair")
+            continue
 
-                        R_i = p2b.quat_wxyz_to_rotmat(quats_np[b, p_i])
-                        R_j = p2b.quat_wxyz_to_rotmat(quats_np[b, p_j])
-                        R_j_inv = R_j.T
-                        R_ij_gt = R_j_inv @ R_i
-                        t_ij_gt = R_j_inv @ (trans_np[b, p_i] - trans_np[b, p_j])
+        sample, diag, pair_meta = event["sample"], event["diag"], event["pair_meta"]
+        obj_key = (event["batch_idx"], pair_meta.split(" part_i=")[0])
+        if obj_key not in seen_objects:
+            seen_objects.add(obj_key)
+            n_objects += 1
+        n_pairs += 1
 
-                        mask_i_bool = p2b.build_mask(
-                            args.mask_strategy, scores_per_k[k_i], gt_per_k[k_i], rng
-                        )
-                        mask_j_bool = p2b.build_mask(
-                            args.mask_strategy, scores_per_k[k_j], gt_per_k[k_j], rng
-                        )
+        issues = run_sanity_checks(sample, diag, pair_meta)
+        issues_all.extend(issues)
 
-                        sample, diag = build_pair_sample(
-                            raw_per_k[k_i], raw_per_k[k_j],
-                            normals_per_k[k_i], normals_per_k[k_j],
-                            scores_per_k[k_i], scores_per_k[k_j],
-                            desc_per_k[k_i], desc_per_k[k_j],
-                            mask_i_bool, mask_j_bool, R_ij_gt, t_ij_gt, args, rng,
-                        )
+        for key, val in diag.items():
+            diag_acc[key].append(val)
 
-                        pair_meta = f"{names[b]} part_i={p_i} part_j={p_j}"
-                        issues = run_sanity_checks(sample, diag, pair_meta)
-                        issues_all.extend(issues)
-
-                        for key, val in diag.items():
-                            diag_acc[key].append(val)
-
-                        if examples_printed < N_EXAMPLES_TO_PRINT:
-                            print(
-                                f"\n  Example {examples_printed + 1}: {pair_meta}\n"
-                                f"    mask_count_i={diag['mask_points_i']} mask_count_j={diag['mask_points_j']} "
-                                f"fallback={diag['fallback']}\n"
-                                f"    valid_i={diag['valid_points_i']} valid_j={diag['valid_points_j']}\n"
-                                f"    contact_row_rate={diag['contact_row_rate']:.2%} "
-                                f"dustbin_row_rate={diag['dustbin_row_rate']:.2%} "
-                                f"target_density={diag['target_density']:.4f}"
-                            )
-                            examples_printed += 1
-
-                if pos_pairs_this_object == 0:
-                    issues_all.append(f"batch {batch_idx} object {names[b]}: no positive pair")
-
-            if batch_idx % 5 == 0:
-                print(f"  batch {batch_idx}... ({n_pairs} pairs so far)")
+        if examples_printed < N_EXAMPLES_TO_PRINT:
+            print(
+                f"\n  Example {examples_printed + 1}: {pair_meta}\n"
+                f"    mask_count_i={diag['mask_points_i']} mask_count_j={diag['mask_points_j']} "
+                f"fallback={diag['fallback']}\n"
+                f"    valid_i={diag['valid_points_i']} valid_j={diag['valid_points_j']}\n"
+                f"    contact_row_rate={diag['contact_row_rate']:.2%} "
+                f"dustbin_row_rate={diag['dustbin_row_rate']:.2%} "
+                f"target_density={diag['target_density']:.4f}"
+            )
+            examples_printed += 1
 
     print("\n" + "=" * 100)
     print(f"PHASE 3A — PAIR DATASET CHECK SUMMARY — {args.categories}/{args.split}")
