@@ -514,12 +514,35 @@ masque GT. **Encore une fois, le CNN n'est pas le facteur limitant.**
 > masque GT (`thresh0.3` ≈ `gt` à `eps=0.02`), donc la limite est structurelle au
 > problème, pas à la qualité du prior de segmentation.
 
-**Décision pour la suite** (à discuter) : un module cluster-based léger (matcher chaque
-cluster contre son voisin candidat) récupérerait correctement la moitié des interfaces
-sans rien apprendre de nouveau, mais laisserait l'autre moitié non couverte ; un module
-appris de séparation/matching d'interfaces (la vraie Phase 3) serait nécessaire pour une
-couverture complète, mais plus coûteux à construire. Les deux pistes restent ouvertes —
-pas encore tranché.
+**Décision (2026-06-27) : on part sur le module cluster-based léger.** Cohérent avec le
+diagnostic Phase 2D, rapide à implémenter, basé sur le CNN réel (`thresh0.3`, pas un
+oracle), suffisant pour une conclusion de stage solide. Le module appris de
+séparation/matching d'interfaces reste une perspective Phase 3 / future work — plus
+ambitieux (labels d'interface, architecture, entraînement, ablations) mais trop risqué à
+ce stade.
+
+## Phase 2E — Matching pairwise cluster-based (prototype court et ciblé)
+
+Implémenté dans `scripts/phase2e_cluster_based_matching.py`. Sur les paires positives
+uniquement (Protocole A, `graph[i,j]=True`), compare deux variantes sur les MÊMES arêtes :
+- **`global`** (référence) : matching (1-NN descripteur + RANSAC `count_times_quality_and_normal`)
+  sur tout le masque fracture `thresh0.3` de chaque fragment, comme en Phase 2C.
+- **`cluster_based`** : clustering par connectivité (mêmes paramètres Phase 2D,
+  `eps=0.02`) sur les points fracture de CHAQUE fragment séparément, dans son repère
+  local — **aucune connaissance de la pose GT**, contrairement à l'étiquetage GT utilisé
+  en Phase 2D qui ne servait qu'au diagnostic (le clustering lui-même est
+  rotation/translation-invariant, donc clusterer en repère local ou assemblé donne
+  exactement les mêmes clusters pour un fragment pris isolément). Teste *chaque paire*
+  de clusters (cluster de `i` × cluster de `j`), garde l'hypothèse de pose la mieux
+  notée (même critère de score que RANSAC) parmi toutes les paires de clusters testées.
+  Si aucune paire de clusters ne produit de pose valide → `no_cluster_match`.
+
+Métriques : `RansacValid`, `Pose@30°/0.1`, `RotErr`, `TransErr`, `no_cluster_match_rate`,
+pour `global` vs `cluster_based` sur les mêmes arêtes. Attendu réaliste (pas un objectif
+de performance absolue) : `Pose@30` global ≈ 1.5-2% (cohérent avec le run précédent sur
+masques réels), `cluster_based` pourrait monter vers 4-8% si la séparation d'interface
+aide effectivement le matching réel, pas seulement la précision de correspondance
+théorique mesurée en Phase 2D.
 
 **Protocole en deux temps** (ne pas mélanger les deux questions) :
 - **A. Registration sur paires positives** (`graph[i,j]=True` uniquement, ce que fait déjà
