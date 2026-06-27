@@ -187,7 +187,7 @@ class CrossAttentionBlock(nn.Module):
             nn.Linear(dim, dim * ff_mult), nn.GELU(), nn.Linear(dim * ff_mult, dim),
         )
 
-    def _apply(self, x: torch.Tensor, other: torch.Tensor, kpm_self: torch.Tensor, kpm_other: torch.Tensor):
+    def _attend(self, x: torch.Tensor, other: torch.Tensor, kpm_self: torch.Tensor, kpm_other: torch.Tensor):
         a, _ = self.self_attn(x, x, x, key_padding_mask=kpm_self, need_weights=False)
         x = self.norm_self(x + a)
         c, _ = self.cross_attn(x, other, other, key_padding_mask=kpm_other, need_weights=False)
@@ -203,8 +203,8 @@ class CrossAttentionBlock(nn.Module):
         # Both fragments updated from the SAME pre-block (x_i, x_j) -- not sequentially
         # (which would make j's cross-attention see an already-updated i within the same
         # block, breaking the symmetry between "i attends to j" and "j attends to i").
-        new_i = self._apply(x_i, x_j, kpm_i, kpm_j)
-        new_j = self._apply(x_j, x_i, kpm_j, kpm_i)
+        new_i = self._attend(x_i, x_j, kpm_i, kpm_j)
+        new_j = self._attend(x_j, x_i, kpm_j, kpm_i)
         return new_i, new_j
 
 
