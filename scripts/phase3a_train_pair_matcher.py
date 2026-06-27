@@ -479,6 +479,25 @@ def main():
     if args.summary_json:
         import json as _json
 
+        # Key metrics worth eyeballing without reading the full per-epoch history --
+        # first vs last epoch, so "did this actually learn anything, or just recalibrate
+        # the two scalars" is answerable from this file alone (no need to send raw logs).
+        trend_keys = [
+            "loss", "l_corr", "entropy", "dustbin_pred_rate", "contact_pred_rate",
+            "match_top1_acc", "random_top1_acc", "match_top8_recall", "random_top8_recall",
+            "non_dustbin_confidence", "logit_scale", "dustbin_bias", "dustbin_minus_max_match",
+            "pose_success_30deg_0.1", "rot_err_deg_mean",
+        ]
+
+        def _trend(split_history: list) -> dict:
+            if not split_history:
+                return {}
+            first, last = split_history[0], split_history[-1]
+            return {
+                key: {"first_epoch": first.get(key), "last_epoch": last.get(key)}
+                for key in trend_keys if key in first or key in last
+            }
+
         summary_path = Path(args.summary_json)
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         with open(summary_path, "w") as fh:
@@ -490,10 +509,14 @@ def main():
                         "num_points": args.num_points, "label_topk": args.label_topk,
                         "label_mode": args.label_mode, "use_kabsch": args.use_kabsch,
                         "warmup_epochs": args.warmup_epochs, "epochs": args.epochs,
-                        "lr": args.lr, "pairs_per_step": args.pairs_per_step,
+                        "lr": args.lr, "scalar_lr_mult": args.scalar_lr_mult,
+                        "init_logit_scale": args.init_logit_scale,
+                        "init_dustbin_bias": args.init_dustbin_bias,
+                        "pairs_per_step": args.pairs_per_step,
                         "contact_row_weight": args.contact_row_weight,
                         "dustbin_row_weight": args.dustbin_row_weight,
                     },
+                    "trend": {"train": _trend(history["train"]), "val": _trend(history["val"])},
                     "history": history,
                 },
                 fh, indent=2,
