@@ -893,6 +893,55 @@ actuelle (corrélation cosinus simple) ne suffira pas, le run prolongé l'a mont
 expérimentale est explicitement souhaitée (ex. demande du tuteur) — sinon, le
 résultat ci-dessus est suffisant et solide pour le rapport de stage tel quel.
 
+## Phase 4 — Matcher interactif (cadrage décidé le 2026-06-27)
+
+**Recadrage important après la clôture de la Phase 3A :** on arrête l'architecture
+minimale (MLP + corrélation cosinus statique), pas le projet. La Phase 3A a déjà
+établi une carte claire du problème : CNN fracture → OK (Phase 1) ; matching
+géométrique/RANSAC → plafond très bas (Phase 2) ; matcher MLP+cosinus → trop faible
+(Phase 3A) ; features CNN internes → premier vrai signal mais inexploitable seul
+(Phase 3A C1/C2). La cause structurelle identifiée : le matcher encode `i` et `j`
+**séparément** puis fait juste `desc_i @ desc_j.T` — chaque point est représenté sans
+jamais "voir" l'autre fragment, alors que le matching de fragments cassés est
+fondamentalement pair-dependent.
+
+**Roadmap (3 mois, à ajuster au fil de l'eau) :**
+- **4A — dustbin par point + `L_contact`** (fait, ci-dessous) : corrige une limite
+  architecturale avant même d'attaquer l'attention.
+- **4B — cross-attention léger** : `cnn_feat_i`/`cnn_feat_j` → self-attention sur
+  chaque fragment → cross-attention `i←j`/`j←i` → matrice de similarité →
+  row-softmax+dustbin. Minimal (D=128, 2 couches, 4 têtes), pas un Transformer
+  massif. Critère de succès : `top8_gap` > C1-long, `top1_gap` moins négatif
+  (idéalement positif), `dustbin_pred_rate` proche du vrai taux.
+- **4C — pose avec weighted Kabsch** : seulement si 4B améliore le matching (sinon la
+  pose restera plate comme en Phase 3A, déjà vérifié).
+- **4D — paires négatives / score de compatibilité fragment-fragment** : branche
+  alternative/sécurité — positives = arêtes `graph` GT, négatives = non-voisins,
+  métriques AUC/AP/precision@k. Résultat solide même si la pose reste difficile :
+  savoir quels fragments vont ensemble est déjà une étape majeure pour le
+  réassemblage.
+- Explicitement écarté pour l'instant : 80-100 epochs sur l'archi minimale,
+  fine-tuning complet du CNN, assembly de graphe global, Sinkhorn lourd, gros
+  Transformer — risque de consommer le temps restant sans diagnostic propre.
+
+**4A — implémenté (2026-06-27) :** le biais dustbin global (Phase 3A) ne pouvait
+exprimer qu'un taux moyen de dustbin, pas "ce point précis de `i` a-t-il un
+correspondant dans `j`" — exactement le confound multi-voisins que la colonne
+dustbin est censée gérer. Remplacé par `dustbin_head = MLP(desc_i)` (par point),
+avec une loss auxiliaire `L_contact` (BCE entre le logit dustbin et l'existence
+réelle d'un contact) : `L = L_corr + lambda_contact * L_contact` (`--lambda_contact`,
+défaut 0.5). Dernière couche du head zero-init + biais = `init_dustbin_bias`, donc
+comportement identique à l'ancien biais global au tout premier pas (transition
+douce, pas de régression). `scalar_lr_mult` ne s'applique plus qu'à `logit_scale`
+(le head n'a plus le "raccourci gratuit" d'un scalaire libre). Nouveau diagnostic
+`dustbin_logit_std` (0 à l'init, doit croître si le head apprend un vrai signal par
+point). Vérifié localement (forward/backward, gradients, std qui croît).
+
+**Note de compatibilité :** ce changement modifie la structure du `state_dict` du
+matcher (`dustbin_bias` scalaire → `dustbin_head` MLP) — les checkpoints Phase 3A
+(`output/phase3a_matcher_c1/`, `_c1_long/`, `_c2/`) ne sont plus chargeables via
+`--resume_from` avec cette architecture. Repartir de zéro pour 4A/4B.
+
 ## Métriques d'évaluation déjà disponibles (ne pas réécrire)
 
 Dans `assembly/models/denoiser/modules/evaluation/evaluator.py` :
@@ -911,12 +960,11 @@ indépendante.
 
 ## Prochaine action concrète
 
-Phase 0, 1, 2 confirmées/closes. **Phase 3A clôturée (2026-06-27)** — voir la
-conclusion finale ci-dessus (section Phase 3, "Conclusion finale Phase 3A") : les
-features internes du CNN portent un signal de matching réel mais faible
-(`top8_gap` > 0, croissant à rendement décroissant), insuffisant pour un top-1 fiable
-ou une pose exploitable avec un matcher minimal (corrélation cosinus + row-softmax).
-Pas de suite expérimentale prévue pour l'instant — la prochaine vraie direction
-(interaction pairwise explicite type cross-attention/message-passing) est documentée
-comme piste future, à ne déclencher que si une suite est explicitement souhaitée.
-Rien à lancer côté serveur pour le moment.
+Phase 0, 1, 2 confirmées/closes. Phase 3A clôturée (2026-06-27, matcher minimal
+insuffisant mais signal CNN confirmé réel — voir conclusion ci-dessus). **Phase 4
+ouverte (cadrage ci-dessus) : 4A (dustbin par point + L_contact) implémenté et
+vérifié localement.** Prochaine étape concrète : relancer l'entraînement avec cette
+nouvelle architecture (repartir de zéro, pas de `--resume_from` depuis les
+checkpoints Phase 3A — incompatibles), sur le même protocole que C1 (15 epochs,
+`--feature_set cnn_feat`), pour confirmer que `L_contact` apporte un bénéfice avant
+d'attaquer 4B (cross-attention).
