@@ -601,20 +601,85 @@ sélection de clusters.
   paire permet-il de reconnaître qu'une paire est vraie ?" Ne pas mélanger A et B dans la
   même mesure.
 
-## Phase 3 — Matcher appris (en réserve, seulement si Phase 2 montre un vrai signal)
+## Phase 3 — Matcher appris (cadrage décidé le 2026-06-27, suite directe de la conclusion Phase 2)
 
-Architecture gardée en réserve :
-- Input : top-K points de fracture des fragments i et j
-- Encodeur léger partagé : PointNet / EdgeConv
-- Interaction de paire : corrélation de descripteurs, top-k correspondances
-- Pose : weighted Kabsch / RANSAC
-- Sorties : score de paire, correspondances, pose relative
+**Pourquoi pas juste un meilleur descripteur.** La Phase 2 a isolé deux causes
+indépendantes du plafond, pas une seule :
+1. Descripteurs faibles : même à l'oracle `gt_edge`, `CorrPrec` (top-1) ≈ 22.8-28.8%,
+   mais `topk_recall_20` ≈ 60% — le signal existe, le 1-NN strict est trop strict.
+2. Scoring RANSAC structurellement biaisé : `score_gap > 0` confirmé sur 3 formules de
+   score différentes (`count`, `count_times_quality`, `count_over_mean_residual`) — le
+   critère préfère objectivement une pose fausse, quelle que soit la formule de
+   comptage/qualité essayée (Phase 2C).
 
-Supervision (une fois Phase 0 confirmée) : `graph[i,j]` (label de paire), pose relative
-GT dérivée de `quaternions`/`translations` (formule ci-dessus), `fracture_surface_gt`.
+Remplacer seulement `HybridGeometryFeatures` par un encodeur appris, en gardant un
+RANSAC à seuil dur derrière, ne corrigerait que la cause 1. **Décision : la Phase 3 doit
+apprendre à la fois de meilleurs descripteurs ET à pondérer/sélectionner les
+correspondances utiles à la pose** — pas seulement mieux décrire les points, puisque la
+Phase 2 a montré que le scoring géométrique heuristique échoue même quand un signal de
+correspondance existe.
 
-Échantillonnage à l'entraînement : toutes les paires positives + 2-3x négatifs
-aléatoires (hard negatives seulement plus tard).
+**Architecture cible (positive pairs only, Phase 3A) :**
+```
+CNN Step 15 figé → points fracture thresh0.3 (échantillon borné, N=512 ou 1024)
+→ encodeur partagé léger (PointNet / EdgeConv), features = coords locales + normales
+  + score CNN + features géométriques simples (HybridGeometryFeatures en complément,
+  pas en remplacement total — à valider empiriquement si elles aident en input)
+→ interaction cross-fragment (corrélation de descripteurs i×j)
+→ matrice de correspondance souple : row-softmax + dustbin (PAS Sinkhorn au départ —
+  Sinkhorn impose une structure quasi one-to-one équilibrée, alors que les surfaces de
+  fracture sont échantillonnées/bruitées et les correspondances peuvent être
+  many-to-one ou partielles ; un dustbin laisse les points sans contact réel ne
+  matcher avec rien plutôt que d'être forcés dans une permutation)
+→ weighted Kabsch différentiable (poids = lignes de la matrice de correspondance)
+→ pose relative R_ij, t_ij
+```
+
+**Loss composite (pas pose loss seule — risque d'instabilité : matrice diffuse,
+concentration sur quelques points faciles, solution dégénérée donnant parfois une bonne
+pose sans correspondances interprétables) :**
+```
+L = L_pose + α·L_correspondance + β·L_contact + γ·L_regularization
+```
+- `L_pose` : geodesic rotation loss + L2 translation loss (R_ij/t_ij GT, formule déjà
+  dérivée et confirmée en Phase 0 : `R_ij = R_j^{-1} @ R_i`, `t_ij = R_j^{-1} @ (t_i - t_j)`,
+  repère après réapplication de `scale`).
+- `L_correspondance` : supervision auxiliaire de la matrice souple, label dérivé
+  directement de la logique `gt_edge` déjà implémentée (`phase2_geometric_baseline.py`,
+  reconstruction GT + NN < `CONTACT_EPS`=0.05) — même principe que les diagnostics
+  `CorrPrec` de la Phase 2, réutilisé ici comme signal d'apprentissage plutôt que comme
+  métrique d'évaluation seule.
+- `L_contact` : pénalise les poids de correspondance élevés sur des points sans contact
+  réel (complète `L_correspondance`, cible spécifiquement le confound multi-voisins
+  identifié en Phase 2B/2D — un fragment touchant plusieurs voisins a des points
+  fracture vers chacun d'eux dans le même masque `thresh0.3`).
+- `L_regularization` : à définir en implémentation (ex. entropie de la matrice pour
+  éviter une diffusion totale) — détail d'implémentation, pas un choix de cadrage.
+
+**Phase 3A — scope : positive pairs only (`graph[i,j]=True`).** Question posée : "si
+deux fragments vont vraiment ensemble, le module retrouve-t-il leur pose relative ?"
+Pas de paires négatives à ce stade — mélanger pair/non-pair et qualité de pose dans le
+même entraînement initial risque de produire un modèle qui apprend surtout à
+discriminer "paire/non-paire" sans bien apprendre la pose.
+
+Évaluation : réutiliser les métriques déjà définies en Phase 2
+(`Pose@30°/0.1`, `Pose@15°/0.05`, `RotErr`, `TransErr`) pour comparaison directe avec
+`global` (Phase 2C, ~1.3-3.2%), `gt_edge` oracle (~9.6%, plafond Phase 2 toutes
+conditions confondues) et l'oracle Kabsch sanity check (~11.8° RotErr, borne haute du
+pipeline pose/Kabsch lui-même, indépendante du matching).
+
+**Phase 3B (seulement après 3A, si le signal de pose est validé) :** ajouter les paires
+négatives (`graph[i,j]=False`) pour apprendre un score de compatibilité de paire —
+question différente ("le modèle reconnaît-il quelles paires vont ensemble ?"), à ne pas
+mélanger avec 3A (cf. distinction Protocole A/B déjà établie en fin de Phase 2).
+Échantillonnage : toutes les paires positives + 2-3x négatifs aléatoires (hard
+negatives seulement plus tard).
+
+**Prérequis technique non résolu (à vérifier avant le premier entraînement) :** aucun
+utilitaire de sampling de paires n'existe dans le codebase (confirmé par inspection de
+`assembly/data/breaking_bad/base.py` — `collate_fn` standard, pas de pair sampling).
+Il faudra écrire un dataset/sampler dédié qui extrait les paires positives à partir de
+`graph` + `points_per_part` (en respectant le padding `max_parts`), avant le modèle.
 
 ## Métriques d'évaluation déjà disponibles (ne pas réécrire)
 
@@ -634,6 +699,9 @@ indépendante.
 
 ## Prochaine action concrète
 
-Phase 0 confirmée. Lancer `scripts/phase1_recall_at_k.py` sur le serveur avec le
-checkpoint `output/cnn_step15_final_model/last.ckpt`, sur `everyday/val` puis
-`artifact/val`, pour mesurer le Recall@K et décider si on passe à la Phase 2.
+Phase 0, 1, 2 confirmées/closes. Cadrage Phase 3 décidé le 2026-06-27 (ci-dessus).
+Prochaine étape : écrire le dataset/sampler de paires positives (équivalent d'un
+"Phase 0" pour la Phase 3) — extraire les paires `graph[i,j]=True`, échantillonner
+N=512/1024 points depuis le masque `thresh0.3`, construire le label de correspondance
+souple via la logique `gt_edge` déjà implémentée, et vérifier les shapes/labels sur
+quelques batches réels avant d'écrire l'encodeur/matching/Kabsch différentiable.
