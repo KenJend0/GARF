@@ -798,17 +798,25 @@ découpe `point_features` avec les **mêmes** `offsets` que `coarse_seg_pred`, p
 geom_feats) — aucun nouvel indice, donc pas de risque de désalignement silencieux.
 Sanity checks étendus (NaN, padding=0) pour `cnn_feat_i/j` quand actif.
 
-**Statut : check de plomberie lancé sur le serveur (`--use_cnn_features`), résultat pas
-encore reçu.** Attendu : `cnn_feat_dim=64` constant, `SANITY CHECK ISSUES: 0`, mêmes
-chiffres qu'avant sur les champs existants (`--use_cnn_features` est purement additif).
+**Check de plomberie validé (2026-06-27, `--use_cnn_features`, everyday/val) :**
+`cnn_feat_dim=64` constant, `SANITY CHECK ISSUES: 0`, tous les autres chiffres
+identiques aux runs précédents (`contact_row_rate=34.85%`, `valid_target_col_rate=1.0`,
+etc.) — confirme que `--use_cnn_features` est bien purement additif, pas de
+désalignement.
 
-**Prochaine étape (après validation du check) :** Ablation C1 (`cnn_feat`+`cnn_score`,
-in_dim=65) puis C2 (`cnn_feat`+`geom_invariant`+`cnn_score`, in_dim=69) dans
-`phase3a_train_pair_matcher.py`, même protocole V0 (15 epochs, comparaison à
-`random_top1_acc`/`random_top8_recall`). Si C1/C2 restent aussi au niveau du hasard,
-conclusion : le matching point-à-point appris (quelle que soit la feature d'entrée)
-est lui-même insuffisant pour ce problème — à documenter comme limite du stage plutôt
-que de continuer à itérer sur les features.
+**Implémenté (`phase3a_train_pair_matcher.py`) : `--feature_set cnn_feat` (C1,
+in_dim=65 = `cnn_feat`(64) + `cnn_score`) et `cnn_feat_geom` (C2, in_dim=69 =
+`cnn_feat` + `geom_invariant`(4) + `cnn_score`).** `use_cnn_features` dérivé
+automatiquement de `feature_set` (pas de flag séparé à garder synchronisé) —
+`epoch_pairs_in_chunks` ne demande `point_features` à `iter_positive_pairs` que si
+C1/C2 est sélectionné.
+
+**Prochaine étape : lancer C1** (15 epochs, même protocole que V0.1/V0.2 — comparaison
+systématique à `random_top1_acc`/`random_top8_recall`). Tester C1 seul avant C2 (ne pas
+conflater deux inconnues). Si C1/C2 restent aussi au niveau du hasard, conclusion :
+le matching point-à-point appris (quelle que soit la feature d'entrée, y compris la
+représentation interne du CNN) est lui-même insuffisant pour ce problème — à
+documenter comme limite du stage plutôt que de continuer à itérer sur les features.
 
 ## Métriques d'évaluation déjà disponibles (ne pas réécrire)
 
@@ -831,8 +839,8 @@ indépendante.
 Phase 0, 1, 2 confirmées/closes. Phase 3A : plomberie de données validée, modèle V0
 implémenté, bug de collapse dustbin trouvé+corrigé, ablations A (raw xyz/normales) et
 B (géométrie invariante faite main) toutes deux négatives (au niveau du hasard sur 15
-epochs). **Étape actuelle : ablation C (features internes du CNN, `point_features` du
-PointHead, dim=64)** — exposition côté modèle (`return_point_features`) et plomberie
-(`--use_cnn_features`) implémentées et committées, check de validation lancé sur le
-serveur, résultat en attente. Une fois validé : lancer C1 puis C2 (cf. ci-dessus) dans
-`phase3a_train_pair_matcher.py`.
+epochs). Ablation C (features internes du CNN, `point_features` du PointHead, dim=64)
+: exposition côté modèle + plomberie + check de validation tous faits et validés
+(`cnn_feat_dim=64`, 0 issue). `--feature_set cnn_feat`/`cnn_feat_geom` (C1/C2)
+implémentés. **Étape actuelle : lancer C1 (15 epochs, même protocole), comparer à
+`random_top1_acc`/`random_top8_recall`.**
