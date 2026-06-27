@@ -171,6 +171,7 @@ def build_pair_sample(
     target = np.zeros((N, N + 1), dtype=np.float32)
     contact_rows = 0
     matches_per_contact_row = []
+    effective_matches_per_contact_row = []
     for a in range(N):
         if not valid_i[a]:
             continue  # padded source row: no target, excluded from loss via valid_i
@@ -184,11 +185,21 @@ def build_pair_sample(
             b_star = int(np.argmin(row))
             target[a, b_star] = 1.0
             matches_per_contact_row.append(1)
+            effective_matches_per_contact_row.append(1.0)
         elif args.label_mode == "soft":
             w = np.exp(-(row[close] ** 2) / (args.label_sigma ** 2))
             w = w / w.sum()
             target[a, np.where(close)[0]] = w
+            # raw count of points within contact_eps -- on dense fracture surfaces this can
+            # be large (tens of points) without meaning the label is actually diffuse: most
+            # of those points can carry near-zero weight after the Gaussian normalization.
             matches_per_contact_row.append(int(close.sum()))
+            # effective number of matches (inverse participation ratio, 1/sum(w^2)): 1.0 for
+            # a one-hot-like label (sharp, weight concentrated on the true NN), tends toward
+            # close.sum() for a near-uniform label (diffuse, weak positional signal). This is
+            # the metric that actually tells us whether contact_eps/label_sigma produce a
+            # usable supervision target, not just "how many points are nearby".
+            effective_matches_per_contact_row.append(float(1.0 / np.sum(w ** 2)))
         else:
             raise ValueError(args.label_mode)
 
@@ -200,6 +211,9 @@ def build_pair_sample(
     diag["target_density"] = float((target[:, :N] > 0).sum()) / max(n_valid_rows, 1)
     diag["mean_matches_per_contact_row"] = (
         float(np.mean(matches_per_contact_row)) if matches_per_contact_row else float("nan")
+    )
+    diag["mean_effective_matches_per_contact_row"] = (
+        float(np.mean(effective_matches_per_contact_row)) if effective_matches_per_contact_row else float("nan")
     )
     # valid_target_col_rate: fraction of non-dustbin target mass that lands on a valid
     # (non-padded) j column -- should always be 1.0 by construction (d_mat forced to inf
@@ -467,6 +481,8 @@ def main():
     print(f"  mean_valid_points_i={mean('valid_points_i'):.1f}  mean_valid_points_j={mean('valid_points_j'):.1f}")
     print(f"  contact_row_rate={mean('contact_row_rate'):.2%}  dustbin_row_rate={mean('dustbin_row_rate'):.2%}")
     print(f"  target_density={mean('target_density'):.4f}  mean_matches_per_contact_row={mean('mean_matches_per_contact_row'):.2f}")
+    print(f"  mean_effective_matches_per_contact_row={mean('mean_effective_matches_per_contact_row'):.2f}  "
+          f"(1.0 = sharp/one-hot-like label, -> raw count = uniform/diffuse label, no real positional signal)")
     print(f"  valid_target_col_rate={mean('valid_target_col_rate'):.4f}")
 
     print("\n" + "=" * 100)
@@ -501,6 +517,7 @@ def main():
             "contact_row_rate": mean("contact_row_rate"), "dustbin_row_rate": mean("dustbin_row_rate"),
             "target_density": mean("target_density"),
             "mean_matches_per_contact_row": mean("mean_matches_per_contact_row"),
+            "mean_effective_matches_per_contact_row": mean("mean_effective_matches_per_contact_row"),
             "valid_target_col_rate": mean("valid_target_col_rate"),
             "n_sanity_issues": len(issues_all),
         }
