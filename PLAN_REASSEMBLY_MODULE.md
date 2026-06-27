@@ -811,12 +811,29 @@ automatiquement de `feature_set` (pas de flag séparé à garder synchronisé) �
 `epoch_pairs_in_chunks` ne demande `point_features` à `iter_positive_pairs` que si
 C1/C2 est sélectionné.
 
-**Prochaine étape : lancer C1** (15 epochs, même protocole que V0.1/V0.2 — comparaison
-systématique à `random_top1_acc`/`random_top8_recall`). Tester C1 seul avant C2 (ne pas
-conflater deux inconnues). Si C1/C2 restent aussi au niveau du hasard, conclusion :
-le matching point-à-point appris (quelle que soit la feature d'entrée, y compris la
-représentation interne du CNN) est lui-même insuffisant pour ce problème — à
-documenter comme limite du stage plutôt que de continuer à itérer sur les features.
+**Résultat C1 (`cnn_feat`+`cnn_score`, in_dim=65, 15 epochs, 2026-06-27) — premier
+signal positif propre de toute la Phase 3A.** `match_top8_recall` reste
+**au-dessus** de `random_top8_recall` sur les 15 epochs, sans exception, train ET val
+— contrairement à A et B où l'écart oscillait de part et d'autre de zéro. Écart
+train : +0.73pp (epoch0, 6.58% vs random 5.85%) → +1.38pp (epoch14, 6.48% vs random
+5.10%), légèrement croissant. Val similaire (+0.81 à +2.53pp selon l'epoch, plus
+bruité, n_steps~20-37). **Mais `match_top1_acc` reste sous le hasard tout le run**
+(0.50%→0.35% vs random 0.75%→0.66%) — le signal CNN aide à restreindre la zone
+plausible (top-8) mais pas encore à pointer précisément le bon point. `RotErr` plat
+~119-126° (V0, pas de pose loss). `dustbin_pred_rate` n'a atteint que 28.6% à
+l'epoch 14 (vrai taux ~65%) — recalibrage pas terminé, donc pas certain que l'écart
+plafonne déjà à ce niveau modeste.
+
+**Décision (2026-06-27) : tester C2 avant de prolonger C1**, pour rester comparable
+point par point avec le protocole A/B (15 epochs) avant de dépenser du temps sur un
+run plus long. Ajout de `top1_gap`/`top8_gap` (= match - random) explicitement dans
+les métriques/summary_json pour ne plus avoir à les recalculer à la main.
+
+**Prochaine étape : lancer C2** (`cnn_feat`+`geom_invariant`+`cnn_score`, in_dim=69,
+même protocole exact que C1 — epochs/lr/pairs_per_step/inits identiques). Lecture
+prévue : `top8_gap` C2 nettement > C1 (ex. +2 à +3pp) → la géométrie aide en plus du
+CNN, on prolonge C2 ; C2 ≈ C1 → garder C1 (plus simple), prolonger C1 ; C2 < C1 →
+la géométrie invariante n'ajoute rien aux features CNN, prolonger C1.
 
 ## Métriques d'évaluation déjà disponibles (ne pas réécrire)
 
