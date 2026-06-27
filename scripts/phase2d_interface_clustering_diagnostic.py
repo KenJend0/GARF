@@ -111,6 +111,16 @@ def main():
         help="Radius for the proximity graph used in connected-components clustering.",
     )
     parser.add_argument("--min_cluster_size", type=int, default=10)
+    parser.add_argument(
+        "--summary_json", default=None,
+        help="Optional path to dump a compact JSON summary -- avoids grepping the full "
+             "text log. Consumed by scripts/phase2_compare_summaries.py.",
+    )
+    parser.add_argument(
+        "--label", default=None,
+        help="Display name for this run in the summary JSON (default: derived from "
+             "mask_strategy/cluster_eps/min_cluster_size).",
+    )
     args = parser.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -145,6 +155,7 @@ def main():
 
     # Aggregated diagnostics
     n_clusters_per_frag = []
+    degree_per_frag = []           # graph degree (n. real neighbors), paired 1:1 with n_clusters_per_frag
     purity_weighted = []          # (purity, cluster_size) pairs -> size-weighted mean
     mixed_cluster_flags = []      # purity < 0.5
     noise_rate_per_frag = []
@@ -213,12 +224,6 @@ def main():
                         continue
                     n_fragments += 1
 
-                    frac_global_i = global_per_k[k_i][frac_idx_i]
-                    cluster_labels = cluster_points(frac_global_i, args.cluster_eps, args.min_cluster_size)
-                    valid_clusters = sorted(set(cluster_labels.tolist()) - {-1})
-                    n_clusters_per_frag.append(len(valid_clusters))
-                    noise_rate_per_frag.append(float((cluster_labels == -1).mean()))
-
                     # Neighbor label per fracture point of i: nearest neighbor fragment j
                     # (among i's actual graph neighbors) within CONTACT_EPS.
                     neighbors_of_i = [
@@ -226,6 +231,14 @@ def main():
                         for k_j, p_j in [ks_ps[idx_j]]
                         if idx_j != idx_i and graph_np[b, p_i, p_j]
                     ]
+
+                    frac_global_i = global_per_k[k_i][frac_idx_i]
+                    cluster_labels = cluster_points(frac_global_i, args.cluster_eps, args.min_cluster_size)
+                    valid_clusters = sorted(set(cluster_labels.tolist()) - {-1})
+                    n_clusters_per_frag.append(len(valid_clusters))
+                    degree_per_frag.append(len(neighbors_of_i))
+                    noise_rate_per_frag.append(float((cluster_labels == -1).mean()))
+
                     if not neighbors_of_i:
                         continue
 
@@ -270,13 +283,58 @@ def main():
     purities = np.array([p for p, _ in purity_weighted])
     sizes = np.array([s for _, s in purity_weighted])
     weighted_purity = float((purities * sizes).sum() / sizes.sum()) if len(sizes) else float("nan")
+
+    # Granularity: n_clusters vs graph degree per fragment. "Mean clusters/fragment"
+    # alone isn't interpretable on its own -- the actual goal is ~as many patches as
+    # interfaces, not just "more clusters". Only defined where degree > 0.
+    n_arr = np.array(n_clusters_per_frag)
+    deg_arr = np.array(degree_per_frag)
+    has_degree = deg_arr > 0
+    ratio = n_arr[has_degree] / deg_arr[has_degree] if has_degree.any() else np.array([])
+    mean_ratio = float(ratio.mean()) if len(ratio) else float("nan")
+    frac_clusters_ge_degree = float((ratio >= 1.0).mean()) if len(ratio) else float("nan")
+
     print(f"  Mean clusters / fragment        : {np.mean(n_clusters_per_frag):.2f}")
+    print(f"  Mean cluster/degree ratio        : {mean_ratio:.2f}")
+    print(f"  Fragments with clusters>=degree  : {frac_clusters_ge_degree:.2%}")
     print(f"  Noise rate (points)              : {np.mean(noise_rate_per_frag):.2%}")
     print(f"  Cluster purity (size-weighted)   : {weighted_purity:.2%}")
     print(f"  Mixed cluster rate (<50% purity) : {np.mean(mixed_cluster_flags):.2%}")
     print(f"  Edge coverage                    : {np.mean(edge_covered):.2%}")
     print(f"  Best-cluster CorrPrec upper bound: {np.mean(best_cluster_corrprec):.2%}")
     print(f"  n_fragments={n_fragments}  n_directed_edges={n_edges}  n_clusters_total={len(purity_weighted)}")
+
+    if args.summary_json:
+        import json as _json
+
+        label = args.label or f"{args.mask_strategy}_eps{args.cluster_eps}_min{args.min_cluster_size}"
+        summary = {
+            "label": label,
+            "categories": args.categories,
+            "split": args.split,
+            "config": {
+                "mask_strategy": args.mask_strategy,
+                "cluster_eps": args.cluster_eps,
+                "min_cluster_size": args.min_cluster_size,
+            },
+            "metrics": {
+                "n_fragments": n_fragments,
+                "n_directed_edges": n_edges,
+                "mean_clusters_per_fragment": float(np.mean(n_clusters_per_frag)) if n_clusters_per_frag else None,
+                "mean_cluster_degree_ratio": mean_ratio,
+                "frac_fragments_clusters_ge_degree": frac_clusters_ge_degree,
+                "noise_rate": float(np.mean(noise_rate_per_frag)) if noise_rate_per_frag else None,
+                "cluster_purity_weighted": weighted_purity,
+                "mixed_cluster_rate": float(np.mean(mixed_cluster_flags)) if mixed_cluster_flags else None,
+                "edge_coverage": float(np.mean(edge_covered)) if edge_covered else None,
+                "best_cluster_corrprec": float(np.mean(best_cluster_corrprec)) if best_cluster_corrprec else None,
+            },
+        }
+        summary_path = Path(args.summary_json)
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(summary_path, "w") as fh:
+            _json.dump(summary, fh, indent=2)
+        print(f"\nSaved compact summary to: {summary_path}")
 
 
 if __name__ == "__main__":
