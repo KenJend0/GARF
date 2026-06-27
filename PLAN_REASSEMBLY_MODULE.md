@@ -724,6 +724,92 @@ label peu piqué là où la géométrie locale est elle-même peu discriminante.
 écrire l'encodeur partagé + matching souple (row-softmax + dustbin) + weighted Kabsch
 différentiable, et la boucle d'entraînement (Phase 3A, positive pairs only).
 
+### Modèle V0 implémenté (`assembly/models/pair_matching/soft_kabsch_matcher.py`,
+`scripts/phase3a_train_pair_matcher.py`)
+
+Architecture minimale conforme au cadrage : `PointEncoder` (MLP partagé pointwise,
+LayerNorm+GELU) → `SoftCorrespondenceMatcher` (corrélation cosinus + colonne dustbin
+apprise, row-softmax) → `weighted_kabsch` (différentiable, vérifié contre une pose GT
+synthétique, erreur ~0.03° en float32). V0 = `L_corr` seul ; Kabsch calculé à chaque
+pas pour le monitoring (`Pose@30°`, `RotErr`) mais pas inclus dans le backward avant
+`--warmup_epochs` (réserve V1). Paires positives uniquement.
+
+**Bug trouvé et corrigé : collapse vers "tout dustbin".** Premier run V0 (5 epochs,
+`logit_scale` fixe `/sqrt(D)=11.3`) : `dustbin_pred_rate` converge vers 100% dès le
+step ~100, `contact_pred_rate=0%`, alors que `non_dustbin_confidence` restait haut et
+l'entropie proche du max — pas un problème de pondération contact/dustbin mais
+d'échelle. Les descripteurs normalisés L2 donnent une similarité cosinus dans `[-1,1]`,
+écrasée par `/sqrt(D)` dans `[-0.09,0.09]`, alors que le biais dustbin était un scalaire
+libre sans contrainte d'échelle — le moins cher à faire grossir pour réduire la loss sur
+les ~65% de lignes dustbin. **Fix : `logit_scale` appris (style CLIP, init `exp(log(10))`)**
+remplace le `/sqrt(D)` fixe. Diagnostics ajoutés : `logit_scale`, `dustbin_bias`,
+`match_logits_mean/std/min/max`, `dustbin_logit`, `max_match_logit_mean`,
+`dustbin_minus_max_match` (signe positif partout = dustbin domine structurellement).
+
+**Résultat V0.1 (15 epochs, `init_logit_scale=5` `init_dustbin_bias=1` — valeurs de
+convergence observées du run précédent, `scalar_lr_mult=0.1` pour ne pas laisser les 2
+scalaires absorber tout le gradient, `pairs_per_step=16`, features = xyz+normales+
+cnn_score+dist_to_centroid, in_dim=8) — collapse réglé mais aucun apprentissage réel :**
+`match_top1_acc` reste **sous** `random_top1_acc` tout le run (train epoch0: 0.70% vs
+random 0.75% ; epoch14: 0.30% vs random 0.66%), `match_top8_recall` reste **au niveau
+du hasard** (épart <0.5pt, dans le bruit). `RotErr` plat ~125-130°. La baisse de
+`l_corr` (5.87→5.47) est entièrement explicable par le recalibrage continu de
+`logit_scale`/`dustbin_bias`, pas par un signal de correspondance appris.
+
+**Cause probable identifiée :** `points_i`/`normals_i` et `points_j`/`normals_j` sont
+en coordonnées brutes, chacune dans le repère de rotation aléatoire **indépendant** du
+fragment (Phase 0) — donc non comparables entre `i` et `j`. 6 des 8 dimensions
+d'entrée ne portent structurellement aucun signal cross-fragment ; il ne reste que
+`cnn_score`+`dist_to_centroid`, trop faible pour discriminer parmi 512 candidats.
+
+**Ablation B — V0.2, features géométriques invariantes (`--feature_set geom_invariant`,
+in_dim=5 : consistency+curvature+roughness+dist_to_centroid+cnn_score, au lieu de
+xyz+normales brutes) : même conclusion négative.** 15 epochs, même protocole :
+`match_top1_acc` reste sous le hasard tout le run (epoch0: 0.70% vs random 0.75% ;
+epoch14: 0.41% vs random 0.66%), `match_top8_recall` oscille autour du hasard sans
+tendance (écarts ±0.3-0.5pt, bruit). `RotErr` plat ~122-127°. **Ni les coordonnées
+brutes (V0/V0.1) ni les descripteurs géométriques invariants faits main (V0.2) ne
+donnent au matcher un signal exploitable au-dessus du hasard, sur 15 epochs
+stabilisées.** Conforme à l'ordre d'ablation prévu (A négatif → B négatif → C).
+
+### Ablation C — features internes du CNN (en cours, 2026-06-27)
+
+**Inspection de `cnn_segmentation_model.py` (checkpoint Step15) :** `use_point_head=True`,
+`point_head_feat_dim=64`, `point_head_hidden_dim=128`. `PointHead.forward` fusionne
+`feat_2d` (64, projection 2D échantillonnée par point) + `feat_3d_encoder(feat_3d)` (32,
+xyz+normales+geo) → MLP `Linear(96,128)→ReLU→Linear(128,64)→ReLU→Linear(64,1)`. La
+cible retenue : l'activation **juste avant la dernière Linear** (dim 64) — l'embedding
+fusionné 2D+3D le plus riche disponible, déjà point-aligné (pas une feature-map image
+brute du U-Net, qui ne serait pas encore au niveau point).
+
+**Modification minimale (`assembly/models/cnn_segmentation_model.py`) :**
+`PointHead.forward(..., return_features=False)` retourne `(logits, point_features)` si
+activé (extraction via slicing `self.mlp[:-1]`, vérifié localement équivalent au forward
+complet). `CNNFracSeg.forward(batch, return_point_features=False)` propage ce flag et
+ajoute `out["point_features"]` (N_sum_valid, 64) au dict de sortie — même ordre/
+concatenation que `coarse_seg_pred`. Défaut `False` partout : comportement inchangé pour
+tous les appelants existants (training/eval steps, autres scripts).
+
+**Intégration dans `phase3a_pair_dataset_check.py` :** `--use_cnn_features` (off par
+défaut) → `iter_positive_pairs` appelle `model(batch_gpu, return_point_features=True)`,
+découpe `point_features` avec les **mêmes** `offsets` que `coarse_seg_pred`, puis
+`build_pair_sample` slice `cnn_feat_i/j` avec les **mêmes** `sel_i/sel_j` et
+`valid_i/valid_j` que tous les autres champs par point (points/normales/cnn_score/
+geom_feats) — aucun nouvel indice, donc pas de risque de désalignement silencieux.
+Sanity checks étendus (NaN, padding=0) pour `cnn_feat_i/j` quand actif.
+
+**Statut : check de plomberie lancé sur le serveur (`--use_cnn_features`), résultat pas
+encore reçu.** Attendu : `cnn_feat_dim=64` constant, `SANITY CHECK ISSUES: 0`, mêmes
+chiffres qu'avant sur les champs existants (`--use_cnn_features` est purement additif).
+
+**Prochaine étape (après validation du check) :** Ablation C1 (`cnn_feat`+`cnn_score`,
+in_dim=65) puis C2 (`cnn_feat`+`geom_invariant`+`cnn_score`, in_dim=69) dans
+`phase3a_train_pair_matcher.py`, même protocole V0 (15 epochs, comparaison à
+`random_top1_acc`/`random_top8_recall`). Si C1/C2 restent aussi au niveau du hasard,
+conclusion : le matching point-à-point appris (quelle que soit la feature d'entrée)
+est lui-même insuffisant pour ce problème — à documenter comme limite du stage plutôt
+que de continuer à itérer sur les features.
+
 ## Métriques d'évaluation déjà disponibles (ne pas réécrire)
 
 Dans `assembly/models/denoiser/modules/evaluation/evaluator.py` :
@@ -742,9 +828,11 @@ indépendante.
 
 ## Prochaine action concrète
 
-Phase 0, 1, 2 confirmées/closes. Cadrage Phase 3 décidé le 2026-06-27 (ci-dessus).
-Prochaine étape : écrire le dataset/sampler de paires positives (équivalent d'un
-"Phase 0" pour la Phase 3) — extraire les paires `graph[i,j]=True`, échantillonner
-N=512/1024 points depuis le masque `thresh0.3`, construire le label de correspondance
-souple via la logique `gt_edge` déjà implémentée, et vérifier les shapes/labels sur
-quelques batches réels avant d'écrire l'encodeur/matching/Kabsch différentiable.
+Phase 0, 1, 2 confirmées/closes. Phase 3A : plomberie de données validée, modèle V0
+implémenté, bug de collapse dustbin trouvé+corrigé, ablations A (raw xyz/normales) et
+B (géométrie invariante faite main) toutes deux négatives (au niveau du hasard sur 15
+epochs). **Étape actuelle : ablation C (features internes du CNN, `point_features` du
+PointHead, dim=64)** — exposition côté modèle (`return_point_features`) et plomberie
+(`--use_cnn_features`) implémentées et committées, check de validation lancé sur le
+serveur, résultat en attente. Une fois validé : lancer C1 puis C2 (cf. ci-dessus) dans
+`phase3a_train_pair_matcher.py`.
