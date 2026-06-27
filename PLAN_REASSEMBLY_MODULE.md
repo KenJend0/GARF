@@ -829,11 +829,25 @@ point par point avec le protocole A/B (15 epochs) avant de dépenser du temps su
 run plus long. Ajout de `top1_gap`/`top8_gap` (= match - random) explicitement dans
 les métriques/summary_json pour ne plus avoir à les recalculer à la main.
 
-**Prochaine étape : lancer C2** (`cnn_feat`+`geom_invariant`+`cnn_score`, in_dim=69,
-même protocole exact que C1 — epochs/lr/pairs_per_step/inits identiques). Lecture
-prévue : `top8_gap` C2 nettement > C1 (ex. +2 à +3pp) → la géométrie aide en plus du
-CNN, on prolonge C2 ; C2 ≈ C1 → garder C1 (plus simple), prolonger C1 ; C2 < C1 →
-la géométrie invariante n'ajoute rien aux features CNN, prolonger C1.
+**Résultat C2 (`cnn_feat`+`geom_invariant`+`cnn_score`, in_dim=69, 15 epochs,
+2026-06-27) — cas "C2 ≈ C1", pas d'amélioration nette.** `top8_gap` moyen sur les 15
+epochs : train 1.19pp (C2) vs 1.04pp (C1, +14% relatif, sous le seuil "clairement
+mieux" de +2-3pp fixé en amont) ; val 1.54pp (C2) vs 1.53pp (C1, quasi identique,
+écart << bruit val à n_steps~20-37). `top1_gap`, `RotErr`, `dustbin_pred_rate`
+(27.2% vs 28.6% epoch14) tous comparables entre C1/C2. **Décision : garder C1 (plus
+simple, in_dim=65 vs 69) — `geom_invariant` n'apporte rien une fois `cnn_feat` déjà
+présent**, cohérent avec B (géométrie invariante seule = hasard).
+
+**Ajout : `--resume_from`/`--start_epoch`** (`phase3a_train_pair_matcher.py`) pour
+prolonger un run existant sans repartir de zéro (charge le state_dict du matcher
+seul, pas l'optimizer ; `--start_epoch` garde la numérotation d'epoch globale
+cohérente dans les logs/summary_json).
+
+**Prochaine étape : prolonger C1 à 40 epochs** en reprenant
+`output/phase3a_matcher_c1/last.pt` (`--resume_from ... --start_epoch 15 --epochs 40`).
+Motivation : `dustbin_pred_rate` n'était pas stabilisé à l'epoch 15 (28.6%, loin du
+~65% cible) sur C1 comme C2 — pas encore certain que le `top8_gap` modeste observé
+plafonne déjà, ou continue de croître une fois le calibrage terminé.
 
 ## Métriques d'évaluation déjà disponibles (ne pas réécrire)
 
