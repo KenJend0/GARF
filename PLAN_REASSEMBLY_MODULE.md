@@ -488,6 +488,39 @@ résultat montre que le problème est **avant** le descripteur point-à-point (m
 voisinage de candidats) — un meilleur descripteur sur un pool contaminé par plusieurs
 interfaces ne résoudra pas le problème de fond.
 
+**Résultat sweep `--cluster_eps` (2026-06-27, `gt`, `min_cluster_size=10`) :** `0.04 →
+0.02 → 0.015 → 0.01` fragmente de plus en plus (`Clusters/Frag` 1.21→4.48,
+`Cluster/Deg` 0.62→1.89 — sur-segmentation à 0.01), mais **`EdgeCoverage` et
+`BestCorrPrec` plafonnent autour de 43-44%/37-38% dès `eps=0.02`** et ne progressent
+plus en dessous, alors que le bruit explose (`Noise` 11%→24.6%). `eps=0.02` est le
+meilleur compromis ; descendre plus bas n'apporte rien, juste plus de bruit.
+**Confirmé sur `thresh0.3` à `eps=0.02`** : résultats quasi identiques à `gt` (écarts
+< 1 point sur toutes les métriques — `EdgeCov` 43.35% vs 43.57%, `BestCorrPrec` 36.80%
+vs 37.23%) → le CNN préserve la structure spatiale des interfaces aussi bien que le
+masque GT. **Encore une fois, le CNN n'est pas le facteur limitant.**
+
+### Conclusion finale Phase 2D
+
+> La segmentation fracture binaire (CNN ou GT) est utile mais insuffisante pour le
+> matching pairwise. Le verrou n'est pas le matching point-à-point ni le prior CNN, mais
+> l'absence de séparation pair-specific des interfaces : un fragment touchant plusieurs
+> voisins a tous ses points fracture mélangés dans un même masque. Le clustering spatial
+> non supervisé (composantes connexes par proximité) récupère une partie réelle de ce
+> signal — `BestCorrPrec`≈37-38%, contre 2.6-3.2% sur le masque global non filtré, soit
+> ~12x mieux — mais son `EdgeCoverage` plafonne à ~44% quel que soit le réglage de `eps`,
+> ce qui montre que les interfaces ne sont pas entièrement séparables par simple
+> proximité spatiale : un peu plus de la moitié des arêtes (voisinages réels) ne sont
+> couvertes par aucun cluster dominant. Le CNN ne dégrade pas ce résultat par rapport au
+> masque GT (`thresh0.3` ≈ `gt` à `eps=0.02`), donc la limite est structurelle au
+> problème, pas à la qualité du prior de segmentation.
+
+**Décision pour la suite** (à discuter) : un module cluster-based léger (matcher chaque
+cluster contre son voisin candidat) récupérerait correctement la moitié des interfaces
+sans rien apprendre de nouveau, mais laisserait l'autre moitié non couverte ; un module
+appris de séparation/matching d'interfaces (la vraie Phase 3) serait nécessaire pour une
+couverture complète, mais plus coûteux à construire. Les deux pistes restent ouvertes —
+pas encore tranché.
+
 **Protocole en deux temps** (ne pas mélanger les deux questions) :
 - **A. Registration sur paires positives** (`graph[i,j]=True` uniquement, ce que fait déjà
   `phase2_geometric_baseline.py`) : rotation/translation error, inlier_ratio,
