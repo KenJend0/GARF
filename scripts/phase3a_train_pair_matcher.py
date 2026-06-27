@@ -55,26 +55,47 @@ from assembly.models.pair_matching.soft_kabsch_matcher import (
 )
 
 
-FEATURE_SET_DIMS = {"raw_xyz_normal": 8, "geom_invariant": 5}
+# in_dim per feature set. cnn_feat dim (64) confirmed empirically via
+# phase3a_pair_dataset_check.py --use_cnn_features (cnn_feat_dim=64, constant, Step15
+# checkpoint: point_head_hidden_dim=128 -> pre-final embedding = 128//2 = 64).
+CNN_FEAT_DIM = 64
+FEATURE_SET_DIMS = {
+    "raw_xyz_normal": 8,
+    "geom_invariant": 5,
+    "cnn_feat": CNN_FEAT_DIM + 1,            # C1: cnn_feat + cnn_score
+    "cnn_feat_geom": CNN_FEAT_DIM + 4 + 1,   # C2: cnn_feat + geom_invariant(4) + cnn_score
+}
+FEATURE_SET_NEEDS_CNN_FEAT = {"cnn_feat", "cnn_feat_geom"}
 
 
 def build_features(sample, feature_set: str = "geom_invariant"):
-    """Two feature sets, selected by --feature_set (V0.2 ablation -- see plan):
+    """Feature sets selected by --feature_set (ablation A/B/C -- see plan):
 
-    'raw_xyz_normal' (original V0/V0.1, in_dim=8): [points(3) + normals(3) + cnn_score(1)
-    + dist_to_centroid(1)]. V0/V0.1 training (15 epochs) showed match_top1_acc/
+    'raw_xyz_normal' (A, original V0/V0.1, in_dim=8): [points(3) + normals(3) +
+    cnn_score(1) + dist_to_centroid(1)]. 15-epoch training showed match_top1_acc/
     match_top8_recall stuck at or below the random baseline throughout -- root cause:
     points_i/normals_i and points_j/normals_j live in INDEPENDENT per-fragment random
     rotation frames (cf. Phase 0), so raw xyz/normal values are not directly comparable
     between i and j. 6 of the 8 dims carry no cross-fragment signal; only cnn_score and
     dist_to_centroid do, which is far too weak to discriminate among ~512 candidates.
 
-    'geom_invariant' (V0.2, in_dim=5, default): [consistency, curvature, roughness,
-    dist_to_centroid, cnn_score] -- i.e. the full HybridGeometryFeatures vector
-    (geom_feats[:, :4]) instead of raw xyz/normals. These are rotation/translation
-    invariant by construction (cf. Phase 2), so they ARE comparable across the two
-    independent fragment frames. points_i/points_j/normals_i/normals_j remain available
-    in the stacked batch for Kabsch (V1) -- only removed from what the ENCODER sees.
+    'geom_invariant' (B, V0.2, in_dim=5, default): [consistency, curvature, roughness,
+    dist_to_centroid, cnn_score] -- the full HybridGeometryFeatures vector
+    (geom_feats[:, :4]) instead of raw xyz/normals. Rotation/translation invariant by
+    construction (cf. Phase 2), so comparable across the two independent fragment
+    frames -- but ALSO stuck at/below random over 15 epochs. Both A and B exhausted.
+
+    'cnn_feat' (C1, in_dim=65): [point_features(64) + cnn_score(1)] -- the frozen CNN's
+    fused 2D+3D point-level embedding (cf. PointHead.forward return_features=True),
+    requires sample['cnn_feat_i']/['cnn_feat_j'] (--use_cnn_features upstream).
+    Tests whether the CNN's internal representation carries a cleaner cross-fragment
+    matching signal than any hand-crafted descriptor.
+
+    'cnn_feat_geom' (C2, in_dim=69): cnn_feat(64) + geom_invariant(4) + cnn_score(1) --
+    combination, tested only if C1 alone shows signal (don't conflate two unknowns).
+
+    points_i/points_j/normals_i/normals_j remain available in the stacked batch for
+    Kabsch (V1) regardless of feature_set -- only removed from what the ENCODER sees.
     """
     if feature_set == "raw_xyz_normal":
         dist_i = sample["geom_feats_i"][:, 3:4]
@@ -88,6 +109,16 @@ def build_features(sample, feature_set: str = "geom_invariant"):
     elif feature_set == "geom_invariant":
         feat_i = np.concatenate([sample["geom_feats_i"][:, :4], sample["cnn_score_i"]], axis=-1)
         feat_j = np.concatenate([sample["geom_feats_j"][:, :4], sample["cnn_score_j"]], axis=-1)
+    elif feature_set == "cnn_feat":
+        feat_i = np.concatenate([sample["cnn_feat_i"], sample["cnn_score_i"]], axis=-1)
+        feat_j = np.concatenate([sample["cnn_feat_j"], sample["cnn_score_j"]], axis=-1)
+    elif feature_set == "cnn_feat_geom":
+        feat_i = np.concatenate(
+            [sample["cnn_feat_i"], sample["geom_feats_i"][:, :4], sample["cnn_score_i"]], axis=-1
+        )
+        feat_j = np.concatenate(
+            [sample["cnn_feat_j"], sample["geom_feats_j"][:, :4], sample["cnn_score_j"]], axis=-1
+        )
     else:
         raise ValueError(feature_set)
     return feat_i.astype(np.float32), feat_j.astype(np.float32)
@@ -229,7 +260,11 @@ def epoch_pairs_in_chunks(loader, cnn_model, geo_extractor, device, args, rng, m
     """Group the directed positive pairs yielded by `iter_positive_pairs` into
     fixed-size chunks for batched training/eval steps."""
     chunk = []
-    for event in iter_positive_pairs(loader, cnn_model, geo_extractor, device, args, rng, max_batches):
+    use_cnn_features = args.feature_set in FEATURE_SET_NEEDS_CNN_FEAT
+    for event in iter_positive_pairs(
+        loader, cnn_model, geo_extractor, device, args, rng, max_batches,
+        use_cnn_features=use_cnn_features,
+    ):
         if event["type"] != "pair":
             continue
         chunk.append(event["sample"])
@@ -337,14 +372,13 @@ def main():
     parser.add_argument("--undirected", action="store_true")
     parser.add_argument(
         "--feature_set", default="geom_invariant", choices=list(FEATURE_SET_DIMS),
-        help="'geom_invariant' (V0.2, default, in_dim=5): rotation/translation-invariant "
-             "HybridGeometryFeatures (consistency/curvature/roughness/dist_to_centroid) + "
-             "cnn_score. 'raw_xyz_normal' (original V0/V0.1, in_dim=8): raw points+normals "
-             "+ cnn_score + dist_to_centroid -- kept only for before/after comparison; V0/"
-             "V0.1 training showed match_top1_acc/match_top8_recall stuck at or below the "
-             "random baseline over 15 epochs with this set, because points_i/normals_i and "
-             "points_j/normals_j live in independent per-fragment rotation frames and are "
-             "not directly comparable (see build_features()).",
+        help="Ablation A/B/C, see build_features() docstring for full rationale. "
+             "'raw_xyz_normal' (A, in_dim=8) and 'geom_invariant' (B, default, in_dim=5) "
+             "both stuck at/below the random baseline over 15 epochs. 'cnn_feat' (C1, "
+             "in_dim=65) and 'cnn_feat_geom' (C2, in_dim=69) use the frozen CNN's fused "
+             "point-level embedding (requires the Step15 checkpoint, use_point_head=True "
+             "-- automatically requests it from iter_positive_pairs, no separate flag "
+             "needed). Test C1 before C2 (don't conflate two unknowns).",
     )
     # Model args.
     parser.add_argument("--desc_dim", type=int, default=128)
