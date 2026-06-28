@@ -303,6 +303,8 @@ def run_epoch(loader, cnn_model, geo_extractor, device, args, rng, matcher_model
             optimizer.zero_grad()
             loss, metrics = compute_step(matcher_model, batch, args, use_pose_loss)
             loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(matcher_model.parameters(), args.grad_clip)
             optimizer.step()
         else:
             with torch.no_grad():
@@ -447,6 +449,15 @@ def main():
              "drowned out.",
     )
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--grad_clip", type=float, default=0.0,
+        help="Max gradient norm (torch.nn.utils.clip_grad_norm_), 0 = disabled (default, "
+             "matches Phase 3A/4A behavior). Strongly recommended for --matcher_arch "
+             "cross_attn (e.g. 1.0) -- a first run without it collapsed to a near-uniform "
+             "representation around epoch 5 (match_logits_std/dustbin_logit_std -> ~0, "
+             "loss INCREASED 5.3->7.2 instead of decreasing), a classic transformer "
+             "training-instability failure mode, not evidence against the architecture.",
+    )
     parser.add_argument("--contact_row_weight", type=float, default=2.0)
     parser.add_argument("--dustbin_row_weight", type=float, default=1.0)
     parser.add_argument(
