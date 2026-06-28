@@ -1031,6 +1031,97 @@ l'instabilité persiste malgré le clipping, envisager aussi un LR plus bas pour
 l'encodeur (`--lr` actuel 1e-3, possiblement trop élevé pour un transformer) avant de
 conclure sur l'architecture elle-même.
 
+**Run prolongé 4B (2026-06-28, `--resume_from output/phase3a_matcher_4b/last.pt
+--start_epoch 15 --epochs 40 --seed 2026`, `--grad_clip 1.0`, sinon protocole
+identique) — pas de redressement, instabilité confirmée plutôt que résolue.**
+`top8_gap` train oscille autour de zéro sur les 25 epochs (premier epoch +0.004pp,
+dernier epoch **-0.15pp**, plusieurs epochs négatives en cours de route) — nettement
+sous C1 (1.04pp) et 4A (1.01pp), cohérent avec la moyenne déjà mesurée sur le premier
+run 4B (0.19pp). `top8_gap` val part à +1.54pp (epoch15) mais devient instable et
+traverse zéro à plusieurs reprises (jusqu'à **-0.83pp**), pour finir à +0.43pp
+(epoch39) — contrairement à C1/4A où le gap val restait positif sur tout le run.
+**`dustbin_pred_rate` empire plutôt que de se rapprocher du vrai taux (~65%)** : train
+97.6%→99.3%, val atteint **100.0% à 4 reprises** (collapse total,
+`contact_pred_rate=0`) avant de remonter partiellement — pire que le premier run 4B
+(87-97%), pas la stabilisation espérée du grad clipping. `dustbin_minus_max_match`
+continue de croître (train 4.70→5.10, pic val 5.76) et `match_logits_std` reste bas et
+instable (creux jusqu'à 0.19-0.27 par endroits) — le grad clipping a empêché la
+divergence de loss observée au premier run, mais n'a pas résolu le collapse de
+représentation sous-jacent, juste ralenti/lissé sa manifestation. `rot_err_deg_mean`
+reste plat ~125-130° (attendu, `use_kabsch=false`).
+
+### Conclusion finale Phase 4B — clos (2026-06-28)
+
+> Le grad clipping a corrigé l'instabilité numérique grossière du premier run (loss qui
+> explosait, std qui s'effondrait à zéro net en quelques epochs), mais le verdict de
+> fond sur l'hypothèse d'interaction cross-fragment reste négatif, et même légèrement
+> pire qu'avant : `top8_gap` ne dépasse jamais durablement les niveaux de C1/4A,
+> oscille autour de zéro (parfois négatif) au lieu de croître comme en C1-long
+> (15→40 epochs, 1.04→1.61pp), et `dustbin_pred_rate` s'éloigne du vrai taux plutôt
+> que de s'en approcher (collapses répétés à 100% en val). **L'architecture
+> self-attention + cross-attention, telle qu'implémentée ici (2 couches, 4 têtes,
+> D=128), n'apporte donc pas l'interaction pairwise utile espérée** — soit la capacité
+> est mal exploitée (peu de pairs_per_step, pas assez de données par step pour
+> stabiliser un transformer), soit le signal de matching point-à-point reste
+> structurellement trop faible pour qu'une meilleure architecture d'encodeur seule le
+> débloque, cohérent avec la chaîne de preuve Phase 2/3A déjà établie. **Décision,
+> conforme à l'arbre fixé en amont : ne pas pousser plus loin 4B (pas de sweep
+> LR/architecture additionnel), passer à la Phase 4D.**
+
+## Phase 4D — Classifieur de compatibilité fragment-fragment (cadrage, 2026-06-28)
+
+**Pourquoi cette branche maintenant.** 4A et 4B ont chacun confirmé, sans résoudre, le
+même diagnostic : le signal de matching point-à-point issu de `cnn_feat` (Phase 3A C1)
+reste trop faible pour qu'aucune des deux pistes testées (dustbin par point + `L_contact`
+en 4A, interaction cross-attention en 4B) ne le débloque significativement au-dessus du
+hasard. Continuer à itérer sur le matching point-à-point (3e architecture, plus
+d'epochs, LR différent) risquerait de consommer le temps restant sans nouveau
+diagnostic — la Phase 4D pose une **question différente**, déjà identifiée comme
+fallback solide en Phase 2 (distinction Protocole A/B) et dans le cadrage Phase 4 :
+« deux fragments donnés vont-ils ensemble ? » plutôt que « quel point correspond à
+quel point ? ». Une réponse positive ici reste une contribution utile au réassemblage
+même si le matching pose-level fin échoue.
+
+**Question posée :** à partir des features déjà disponibles par fragment (`cnn_feat`
+agrégé, ou les descripteurs déjà calculés en Phase 2/3A), un classifieur peut-il
+distinguer une paire de fragments adjacente (`graph[i,j]=True`) d'une paire non-adjacente
+(`graph[i,j]=False`) — score de compatibilité, pas de pose.
+
+**Protocole (à ne pas mélanger avec 3A/4A/4B, cf. distinction Protocole A/B déjà
+établie en fin de Phase 2) :**
+- Paires positives : toutes les arêtes `graph[i,j]=True` (comme tous les runs Phase
+  3A/4A/4B).
+- Paires négatives : fragments non-adjacents du **même objet** (pas de fragments
+  d'objets différents — trop facile, ne testerait pas une vraie ambiguïté de
+  réassemblage). Échantillonnage 2-3x négatifs par positif (cf. Phase 3B déjà prévu),
+  pas de hard negatives dans une première itération.
+- Représentation de paire : agrégation simple des features point-level déjà
+  disponibles (`cnn_feat` Phase 3A C1, in_dim=64) par fragment — ex. mean/max pooling
+  sur les points fracture `thresh0.3` de chaque fragment, puis concat ou différence
+  des deux vecteurs agrégés, **avant** tout MLP de classification. Garder minimal,
+  cohérent avec l'esprit du plan (pas de nouvelle architecture lourde avant d'avoir un
+  premier signal).
+- Label : binaire (`graph[i,j]`), pas besoin du label soft `topk`/`sigma` de
+  3A/4A/4B (différent problème, pas de correspondance point-à-point ici).
+
+**Métriques :** AUC, AP (average precision), precision@k (k = nombre réel de voisins
+GT par fragment, déjà disponible via `graph`) — pas de `top8_gap`/`RotErr`, qui
+n'ont pas de sens pour cette question. Comparer à une baseline triviale (distance
+entre centroïdes de fragments, ou nombre de points fracture mutuellement proches sans
+apprentissage) pour situer le niveau de difficulté avant de juger le classifieur appris.
+
+**Fichiers prévus :** nouveau script `scripts/phase4d_pair_compatibility.py`
+(réutilise `iter_positive_pairs`/`build_pair_sample` de
+`scripts/phase3a_pair_dataset_check.py` pour les positifs ; ajoute un sampler de
+négatifs intra-objet à partir de `graph`) ; modèle de classification simple dans
+`assembly/models/pair_matching/` (nouveau fichier ou ajout dans
+`soft_kabsch_matcher.py`, à trancher à l'implémentation selon la taille du code).
+
+**Pas encore fait à ce stade : seulement le cadrage ci-dessus, aucun code écrit.**
+Prochaine étape concrète : vérifier la plomberie de sampling des négatifs (comme
+`phase3a_pair_dataset_check.py` l'avait fait pour les positifs) avant d'écrire le
+modèle, même ordre de prudence que pour 3A.
+
 ## Métriques d'évaluation déjà disponibles (ne pas réécrire)
 
 Dans `assembly/models/denoiser/modules/evaluation/evaluator.py` :
@@ -1053,8 +1144,10 @@ Phase 0, 1, 2 confirmées/closes. Phase 3A clôturée (2026-06-27, matcher minim
 insuffisant mais signal CNN confirmé réel — voir conclusion ci-dessus). Phase 4
 ouverte : **4A fait et clos** (dustbin par point + `L_contact`, deux bugs trouvés et
 corrigés, conclusion : confirme le diagnostic sans le résoudre — `top8_gap` ≈ C1,
-pas d'amélioration). **4B implémenté (cross-attention, ci-dessus), prêt à lancer.**
-Prochaine étape concrète : lancer l'entraînement avec `--matcher_arch cross_attn`
-(repartir de zéro, pas de `--resume_from`), `--pairs_per_step` réduit (4-8), même
-protocole sinon (15 epochs, `--feature_set cnn_feat`), comparer `top1_gap`/`top8_gap`
-à C1/4A.
+pas d'amélioration). **4B fait et clos** (cross-attention, run initial + run prolongé
+avec `--grad_clip 1.0`, conclusion : ne dépasse pas C1/4A, instabilité/collapse
+dustbin pas résolu par le clipping — voir conclusion ci-dessus). **4D cadré
+(2026-06-28, ci-dessus), aucun code écrit.** Prochaine étape concrète : implémenter
+le sampler de paires négatives intra-objet et vérifier sa plomberie (sanity checks
+dans l'esprit de `phase3a_pair_dataset_check.py`) avant d'écrire le classifieur de
+compatibilité fragment-fragment.
