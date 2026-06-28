@@ -1009,11 +1009,27 @@ padding géré via `key_padding_mask`, init identique à 4A pour `dustbin_logit`
 checkpoints 4A/C1/C2 non chargeables ici non plus (architecture différente). Repartir
 de zéro.
 
-**Prochaine étape : lancer 4B**, en réduisant `--pairs_per_step` (ex. 4-8 au lieu de
-16, le coût de l'attention est O(N²) par paire) et en gardant le reste du protocole
-identique (15 epochs, `--feature_set cnn_feat`, mêmes inits) pour comparer
-`top1_gap`/`top8_gap` à C1 et 4A. Critère de succès déjà fixé : `top8_gap` > C1/4A,
-`top1_gap` moins négatif (idéalement positif).
+**Premier run 4B (2026-06-28, `--pairs_per_step 8`) — bug d'implémentation puis
+instabilité d'entraînement, pas encore de verdict sur l'hypothèse.** Crash initial :
+`CrossAttentionBlock._apply()` écrasait `nn.Module._apply` (utilisé en interne par
+`.to(device)`) — méthode renommée en `_attend`, vérifié (`.to()` + forward/backward).
+
+Une fois lancé, **collapse de représentation classique des transformers** : entre
+l'epoch 4 et 5 (train), `match_logits_std`/`dustbin_logit_std` s'effondrent vers ~0
+(tous les logits, matching et dustbin, convergent vers la même valeur ≈ `scale`) —
+l'encodeur produit un descripteur quasi constant indépendamment de l'entrée. `loss`
+**augmente** 5.3→7.2 au lieu de descendre ; `top8_gap` tombe à ~0, parfois négatif
+(pire que le hasard) sur la majorité du run. Signature d'instabilité d'optimisation
+(LR constant élevé sans warmup/écrêtage sur un transformer), pas une preuve contre
+l'hypothèse d'interaction cross-fragment. **Fix : `--grad_clip`** (0=off par défaut,
+comportement Phase 3A/4A inchangé ; recommandé 1.0 pour `cross_attn`).
+
+**Prochaine étape : relancer 4B avec `--grad_clip 1.0`**, même protocole sinon (15
+epochs, `--feature_set cnn_feat`, `--pairs_per_step 8`, mêmes inits), pour enfin
+obtenir un verdict propre sur l'hypothèse d'interaction cross-fragment. Si
+l'instabilité persiste malgré le clipping, envisager aussi un LR plus bas pour
+l'encodeur (`--lr` actuel 1e-3, possiblement trop élevé pour un transformer) avant de
+conclure sur l'architecture elle-même.
 
 ## Métriques d'évaluation déjà disponibles (ne pas réécrire)
 
