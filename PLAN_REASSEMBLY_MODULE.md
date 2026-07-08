@@ -1260,8 +1260,30 @@ corrélation de phase (FFT 2D) pour la translation à chaque rotation → O(36 �
 log L) — raisonnable. À mesurer sur le serveur et documenter avant de lancer sur
 tout le dataset.
 
-**Fichier prévu :** `scripts/phase5a_depthmap_matching.py`. À ne créer qu'après
-5A.0 passé.
+**Fichier :** `scripts/phase5a_depthmap_matching.py` — **IMPLÉMENTÉ (2026-07-08)**.
+
+Constantes : `RESOLUTION=64`, `N_ANGLES=36` (pas 10°), `MIN_FRAC_POINTS=50`,
+`MAX_PLANARITY=0.15`, `MIN_OVERLAP_PIXELS=20`.
+
+Fonctions clés :
+- `compute_pca_frame(pts)` → centroid, u, v, n, planarity (eigvec de la plus petite valeur propre)
+- `rasterize(pts, …, resolution, pixel_size)` → dmap, valid, u_min, v_min (np.add.at)
+- `match_depthmaps(dmap_i, …, n_angles)` → FFT cross-corrélation par rotation + flip de normale ; score = -CC/overlap (complémentarité)
+- `build_correspondences(…)` → pts_i_3d, pts_j_3d pour Kabsch (paires pixel-à-pixel)
+- `process_pair(…)` → dict résultats par stratégie (gt / thresh0.3 / random)
+- `kabsch(P, Q)` → R, t (convention identique Phase 2)
+
+**À lancer sur le serveur — commande rapide :**
+```bash
+python scripts/phase5a_depthmap_matching.py \
+    --ckpt output/cnn_step15_final_model/last.ckpt \
+    --data_root /storage/student7/teyssir/data/breaking_bad_vol.hdf5 \
+    --experiment cnn_step15_final_model \
+    --categories everyday --split val --max_batches 50 \
+    --summary_json /tmp/student7/phase5a_quick.json
+```
+
+**Critère de succès :** Pose@30°/0.1 (GT) > référence Phase 2 oracle (9.6%).
 
 ### Phase 5B (si 5A marche) — Extension 3–5 fragments
 
@@ -1298,6 +1320,8 @@ corrigés, conclusion : confirme le diagnostic sans le résoudre — `top8_gap` 
 pas d'amélioration). **4B fait et clos** (cross-attention, run initial + run prolongé
 avec `--grad_clip 1.0`, conclusion : ne dépasse pas C1/4A, instabilité/collapse
 dustbin pas résolu par le clipping — voir conclusion ci-dessus). **4D cadré (2026-06-28, fallback, ci-dessus), aucun code écrit.** **5A.0 PASSÉ (2026-06-28, everyday/val, n=3803 objets 2-frags, médiane planéité=0.043).**
-Prochaine étape concrète : implémenter `scripts/phase5a_depthmap_matching.py`
-(Phase 5A) — pipeline depth-map sur les 3803 objets 2-fragments du val, conditions
-GT/thresh0.3/random, métriques RotErr/Pose@30.
+**`scripts/phase5a_depthmap_matching.py` IMPLÉMENTÉ (2026-07-08).** Prochaine
+étape concrète : lancer le run rapide sur le serveur (`--max_batches 50`) pour
+vérifier que le pipeline tourne sans erreur, puis run complet val
+(commande dans la section Phase 5A ci-dessus). Analyser résultats selon l'arbre
+de décision : Pose@30 (GT) vs 9.6% oracle Phase 2.
