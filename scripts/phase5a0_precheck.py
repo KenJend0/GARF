@@ -64,6 +64,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from hydra.utils import instantiate
 from scripts.analyze_errors import load_config_and_model
 from assembly.models.cnn_segmentation_model import CNNFracSeg
 from assembly.models.projection_mapping_utils import extract_fragment_list
@@ -129,14 +130,14 @@ def main():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--summary_json", default="")
     args = parser.parse_args()
+    args.model_type = "cnn"  # load_config_and_model requiert cet attribut
 
     device = torch.device(args.device)
     print(f"Device: {device}")
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    _, datamodule = load_config_and_model(
-        args.experiment, args.data_root, args.categories, None
-    )
+    cfg = load_config_and_model(args)
+    datamodule = instantiate(cfg.data)
     datamodule.setup("fit")
     dataset = (
         datamodule.val_dataset if args.split == "val"
