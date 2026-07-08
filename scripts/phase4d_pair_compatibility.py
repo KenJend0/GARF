@@ -192,9 +192,7 @@ def build_batch_pairs(
 
 # ── Precision@k ───────────────────────────────────────────────────────────────
 
-def precision_at_k_from_scores(
-    all_scores_by_frag, all_labels_by_frag
-):
+def precision_at_k_from_scores(all_scores_by_frag):
     """Précision@k : pour chaque fragment, ranker par score descendant, vérifier
     si les k vrais voisins sont dans le top-k.
     all_scores_by_frag : dict[frag_id → list[(score, label)]]
