@@ -1068,7 +1068,13 @@ reste plat ~125-130° (attendu, `use_kabsch=false`).
 > conforme à l'arbre fixé en amont : ne pas pousser plus loin 4B (pas de sweep
 > LR/architecture additionnel), passer à la Phase 4D.**
 
-## Phase 4D — Classifieur de compatibilité fragment-fragment (cadrage, 2026-06-28)
+## Phase 4D — Classifieur de compatibilité fragment-fragment (cadrage, 2026-06-28, fallback)
+
+> **Statut :** cadré mais pas encore lancé. Rétrogradé en fallback (voir Phase 5A.0
+> ci-dessous) : la Phase 5A sera tentée en premier. Si le pre-check 5A.0 échoue
+> (trop peu d'objets à 2 fragments, ou faces trop courbes), 4D devient la prochaine
+> action concrète sans modification supplémentaire — la plomberie décrite ci-dessous
+> reste intacte.
 
 **Pourquoi cette branche maintenant.** 4A et 4B ont chacun confirmé, sans résoudre, le
 même diagnostic : le signal de matching point-à-point issu de `cnn_feat` (Phase 3A C1)
@@ -1118,9 +1124,121 @@ négatifs intra-objet à partir de `graph`) ; modèle de classification simple d
 `soft_kabsch_matcher.py`, à trancher à l'implémentation selon la taille du code).
 
 **Pas encore fait à ce stade : seulement le cadrage ci-dessus, aucun code écrit.**
-Prochaine étape concrète : vérifier la plomberie de sampling des négatifs (comme
+Sera implémenté en cas d'échec du pre-check Phase 5A.0 (voir ci-dessous) — dans
+ce cas, la prochaine étape concrète sera le sampler de négatifs intra-objet (comme
 `phase3a_pair_dataset_check.py` l'avait fait pour les positifs) avant d'écrire le
-modèle, même ordre de prudence que pour 3A.
+modèle.
+
+## Phase 5 — Depth-map fracture-face matching (piste tuteur, 2026-06-28)
+
+**Motivation.** Les Phases 3A/4A/4B ont épuisé le matching point-à-point sur le
+masque fracture global : ni les features CNN seules (3A C1/C2), ni le dustbin par
+point (4A), ni la cross-attention (4B) n'ont dépassé durablement la baseline
+aléatoire. La Phase 2D a identifié le verrou structural en amont : ~62% des points
+fracture n'ont pas de correspondance disponible dans le voisin évalué à cause du
+mélange d'interfaces multi-voisins. **La piste tuteur proposée ici change de niveau
+d'abstraction :** au lieu de matcher des points individuels, on projette la *face
+de fracture* de chaque fragment en une depth map 2D (après estimation d'un repère
+local par PCA), puis on cherche un alignement 2D (rotation + translation) par score
+de complémentarité relief. La complémentarité est la contrainte physique forte
+manquante : `depth_A(u,v) ≈ -depth_B(R_θ(u,v) + t)` — bosse contre creux.
+
+**Stratégie conditionnelle.** Phase 5 est une branche expérimentale, pas une
+direction garantie. Son déclenchement est conditionné au pre-check 5A.0 :
+- Pre-check OK → Phase 5A prioritaire, 4D en fallback.
+- Pre-check KO → 4D directement, 5A archivée comme piste future.
+
+### Phase 5A.0 — Pre-check (script à lancer, aucun modèle appris)
+
+**Deux vérifications avant toute implémentation lourde :**
+
+**V1 — Population suffisante.** Compter les objets à **exactement 2 fragments** dans
+`everyday/train` et `everyday/val`. Critère indicatif : ≥100 paires positives val
+pour avoir des statistiques robustes dans le rapport de stage. En-dessous, les
+résultats seront trop fragiles pour être une conclusion centrale.
+
+**V2 — Planéité des faces de fracture.** Sur les objets à 2 fragments, extraire
+les points du masque GT fracture, réappliquer le `scale` (comme Phase 0, formule
+`points_gt_scale = pointclouds_gt[i] * scale[i]` si on travaille en repère
+assemblé, ou `pointclouds[i] * scale[i]` si repère local), puis PCA sur ces points :
+```
+eigenvalues = eigvalsh(cov)  # trié croissant
+planarity = lambda_min / (lambda1 + lambda2 + lambda3)
+```
+- `planarity ≈ 0` → face quasi-plane (bon pour une projection en height field)
+- `planarity ≈ 0.33` → isotrope (sphère, pas exploitable en depth map 2D)
+
+Critère indicatif : médiane de planéité < 0.10 sur les deux fragments pour qu'une
+depth map locale soit une représentation pertinente. Rapporter aussi la distribution
+(percentiles 25/50/75/90), pas seulement la médiane.
+
+**Rapporter aussi** :
+- `n_2frag_train`, `n_2frag_val`, `n_pos_pairs_val` (= n_2frag_val, toujours 1
+  paire positive par objet 2-fragments)
+- Distribution de `n_frac_points_per_face` (nb de points fracture GT par face) —
+  si trop peu de points (< 30-50), la PCA sera bruitée et la depth map trop éparse
+- Proportion d'objets exclus parce qu'une des deux faces a < 10 points fracture
+  (face de fracture quasi-vide, ex: fragment gros avec peu de contact)
+
+Implémenté dans `scripts/phase5a0_precheck.py`.
+
+**Arbre de décision après le pre-check :**
+```
+n_pos_pairs_val >= 100   ET   median_planarity < 0.10  ?
+  OUI → Phase 5A depth-map matching prioritaire (cadrage ci-dessous)
+  NON → Phase 4D compatibility classifier (cadrage ci-dessus)
+```
+
+### Phase 5A — Two-fragment depth-map matching (cadrage, sujet au pre-check)
+
+**Restriction à 2 fragments.** Supprime presque entièrement le confound
+multi-voisins identifié en Phase 2D : avec 2 fragments, chaque point fracture d'un
+fragment a un seul voisin possible, donc le masque fracture est déjà pair-specific
+sans avoir besoin d'un clustering ni d'un oracle pair-specific. C'est la condition
+minimale pour isoler la capacité du matching depth-map en elle-même, avant de
+réintroduire la complexité multi-fragments.
+
+**Pipeline Phase 5A :**
+```
+CNN Step 15 thresh0.3 (ou masque GT)
+→ objets à 2 fragments uniquement (filtré par points_per_part)
+→ réapplication du scale : raw_i = pointclouds[i] * scale[i]
+→ PCA sur les points fracture → repère local (u, v, n)
+→ planarity check (exclure si planarity > seuil, à fixer selon 5A.0)
+→ projection en depth map 2D (rasterization en grille u×v)
+→ sweep : θ ∈ [0°, 360°, pas 10°] + translation 2D (grille ou phase shift FFT)
+→ score = mean_abs(depth_A(u,v) + depth_B(R_θ(u,v)+t)) sur la zone d'overlap
+→ conversion de la meilleure pose 2D en pose 3D candidate (via repère PCA)
+→ évaluation : RotErr, TransErr, Pose@30°/0.1, Pose@15°/0.05
+```
+
+**Trois conditions** (même logique que toutes les phases précédentes) :
+- masque GT fracture → matching (oracle mask, isole la responsabilité du matching)
+- masque CNN thresh0.3 → matching
+- points aléatoires (même budget) → contrôle
+
+Lecture : si GT échoue, l'hypothèse depth-map locale ne suffit pas (faces trop
+courbes, résolution trop basse, ou score de complémentarité inadapté) — conclusion
+valide pour le rapport. Si GT marche mais CNN échoue, problème de filtrage.
+
+**Coût estimé** : sweep 36 rotations × translation 2D sur image L×L (ex. 64×64).
+Si sliding brut : O(36 × L² × L²) par paire — trop lent pour L=128. Alternative :
+corrélation de phase (FFT 2D) pour la translation à chaque rotation → O(36 × L²
+log L) — raisonnable. À mesurer sur le serveur et documenter avant de lancer sur
+tout le dataset.
+
+**Fichier prévu :** `scripts/phase5a_depthmap_matching.py`. À ne créer qu'après
+5A.0 passé.
+
+### Phase 5B (si 5A marche) — Extension 3–5 fragments
+
+Si Phase 5A valide l'hypothèse sur 2 fragments, réintroduire le vrai problème :
+quelle face de fracture d'un fragment correspond à quel voisin parmi 2-4 autres ?
+Le clustering spatial (Phase 2D, `eps=0.02`) avait donné `EdgeCoverage≈44%` et
+`BestCorrPrec≈37%` — à combiner avec le matching depth-map pour sélectionner la
+meilleure paire cluster-cluster.
+
+**Pas encore cadré.** Dépend du résultat de 5A.
 
 ## Métriques d'évaluation déjà disponibles (ne pas réécrire)
 
@@ -1146,8 +1264,8 @@ ouverte : **4A fait et clos** (dustbin par point + `L_contact`, deux bugs trouv�
 corrigés, conclusion : confirme le diagnostic sans le résoudre — `top8_gap` ≈ C1,
 pas d'amélioration). **4B fait et clos** (cross-attention, run initial + run prolongé
 avec `--grad_clip 1.0`, conclusion : ne dépasse pas C1/4A, instabilité/collapse
-dustbin pas résolu par le clipping — voir conclusion ci-dessus). **4D cadré
-(2026-06-28, ci-dessus), aucun code écrit.** Prochaine étape concrète : implémenter
-le sampler de paires négatives intra-objet et vérifier sa plomberie (sanity checks
-dans l'esprit de `phase3a_pair_dataset_check.py`) avant d'écrire le classifieur de
-compatibilité fragment-fragment.
+dustbin pas résolu par le clipping — voir conclusion ci-dessus). **4D cadré (2026-06-28, fallback, ci-dessus), aucun code écrit.** **5A.0 cadré
+(2026-06-28, ci-dessus), script écrit : `scripts/phase5a0_precheck.py`.** Prochaine
+étape concrète : lancer le pre-check 5A.0 sur le serveur (everyday/train+val, pas
+de GPU requis si on utilise seulement le masque GT) et appliquer l'arbre de décision
+selon les résultats.
