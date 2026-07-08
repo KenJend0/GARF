@@ -1182,11 +1182,44 @@ depth map locale soit une représentation pertinente. Rapporter aussi la distrib
 
 Implémenté dans `scripts/phase5a0_precheck.py`.
 
+**Résultat pre-check (2026-06-28, everyday/val, n=7872 objets scannés) — PASSÉ.**
+```
+Distribution num_parts :
+  2 fragments : 3803 objets (48.3%)  ← cible 5A
+  3 fragments : 1408 objets (17.9%)
+  4+ fragments : le reste
+
+V1 — Population :
+  n_2frag_val = 3803 (>> seuil 100) : OK
+  Exclus (face < 10 pts fracture GT) : 139 (3.6%)
+  Retenus pour planéité : 3664
+
+V2 — Planéité (GT mask, n=7467 faces) :
+  mean=0.063, std=0.058
+  p25=0.016, p50=0.043, p75=0.098, p90=0.150, max=0.269
+  Critère médiane < 0.10 : OK (médiane=0.043)
+
+n_frac_pts_per_face :
+  p25=56, p50=340, p75=1805, p90=3052
+  → forte dispersion ; filtre taille dans Phase 5A (exclure faces < 50-100 pts)
+```
+**Décision : Phase 5A depth-map matching PRIORITAIRE (4D en fallback).**
+
+Notes post-precheck :
+- 48% des objets val ont exactement 2 fragments — population très large, résultats
+  seront statistiquement solides même avec un sous-ensemble limité du val.
+- p75 planéité = 0.098 → 75% des faces individuelles passent le critère 0.10 ;
+  les 25% restantes (faces courbes) peuvent être filtrées dans 5A avec un seuil.
+- La faible variance entre p25 et p90 (0.016→0.150) montre une distribution
+  relativement homogène — pas de bi-modalité plane/sphérique qui rendrait le
+  pipeline inapplicable à une grande fraction des objets.
+- p25 n_frac_pts = 56 pts : quelques faces éparses, un filtre `min_frac_points`
+  (ex. 50) dans le script 5A éliminera les cas à PCA bruitée.
+
 **Arbre de décision après le pre-check :**
 ```
-n_pos_pairs_val >= 100   ET   median_planarity < 0.10  ?
-  OUI → Phase 5A depth-map matching prioritaire (cadrage ci-dessous)
-  NON → Phase 4D compatibility classifier (cadrage ci-dessus)
+→ Phase 5A depth-map matching PRIORITAIRE (4D en fallback)
+   (les deux critères passés avec marges larges)
 ```
 
 ### Phase 5A — Two-fragment depth-map matching (cadrage, sujet au pre-check)
@@ -1264,8 +1297,7 @@ ouverte : **4A fait et clos** (dustbin par point + `L_contact`, deux bugs trouv�
 corrigés, conclusion : confirme le diagnostic sans le résoudre — `top8_gap` ≈ C1,
 pas d'amélioration). **4B fait et clos** (cross-attention, run initial + run prolongé
 avec `--grad_clip 1.0`, conclusion : ne dépasse pas C1/4A, instabilité/collapse
-dustbin pas résolu par le clipping — voir conclusion ci-dessus). **4D cadré (2026-06-28, fallback, ci-dessus), aucun code écrit.** **5A.0 cadré
-(2026-06-28, ci-dessus), script écrit : `scripts/phase5a0_precheck.py`.** Prochaine
-étape concrète : lancer le pre-check 5A.0 sur le serveur (everyday/train+val, pas
-de GPU requis si on utilise seulement le masque GT) et appliquer l'arbre de décision
-selon les résultats.
+dustbin pas résolu par le clipping — voir conclusion ci-dessus). **4D cadré (2026-06-28, fallback, ci-dessus), aucun code écrit.** **5A.0 PASSÉ (2026-06-28, everyday/val, n=3803 objets 2-frags, médiane planéité=0.043).**
+Prochaine étape concrète : implémenter `scripts/phase5a_depthmap_matching.py`
+(Phase 5A) — pipeline depth-map sur les 3803 objets 2-fragments du val, conditions
+GT/thresh0.3/random, métriques RotErr/Pose@30.
