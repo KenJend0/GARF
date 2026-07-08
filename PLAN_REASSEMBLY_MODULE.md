@@ -1116,18 +1116,39 @@ n'ont pas de sens pour cette question. Comparer à une baseline triviale (distan
 entre centroïdes de fragments, ou nombre de points fracture mutuellement proches sans
 apprentissage) pour situer le niveau de difficulté avant de juger le classifieur appris.
 
-**Fichiers prévus :** nouveau script `scripts/phase4d_pair_compatibility.py`
-(réutilise `iter_positive_pairs`/`build_pair_sample` de
-`scripts/phase3a_pair_dataset_check.py` pour les positifs ; ajoute un sampler de
-négatifs intra-objet à partir de `graph`) ; modèle de classification simple dans
-`assembly/models/pair_matching/` (nouveau fichier ou ajout dans
-`soft_kabsch_matcher.py`, à trancher à l'implémentation selon la taille du code).
+**Fichier :** `scripts/phase4d_pair_compatibility.py` — **IMPLÉMENTÉ (2026-07-08)**.
 
-**Pas encore fait à ce stade : seulement le cadrage ci-dessus, aucun code écrit.**
-Sera implémenté en cas d'échec du pre-check Phase 5A.0 (voir ci-dessous) — dans
-ce cas, la prochaine étape concrète sera le sampler de négatifs intra-objet (comme
-`phase3a_pair_dataset_check.py` l'avait fait pour les positifs) avant d'écrire le
-modèle.
+Architecture : MLP 3 couches (input 256 → hidden 128 → 64 → 1), dropout 0.2.
+Représentation de paire : mean+max pool de `point_features` (64-dim) sur les points
+fracture de chaque fragment → 128-dim par fragment → concat → 256-dim pour la paire.
+Négatifs : toutes les paires non-adjacentes intra-objet, sous-échantillonnées à
+`NEG_RATIO=3 × n_pos` max. BCE avec `pos_weight=n_neg/n_pos` dynamique.
+Évaluation : 3 conditions (gt / thresh0.3 / random) × {AUC, AP, Prec@k}.
+Baseline triviale incluse : `-distance_inter_centroïdes` (AUC attendu ~0.5-0.7).
+
+**Commandes serveur :**
+```bash
+# Test rapide
+python scripts/phase4d_pair_compatibility.py \
+    --ckpt output/cnn_step15_final_model/last.ckpt \
+    --data_root /storage/student7/teyssir/data/breaking_bad_vol.hdf5 \
+    --experiment cnn_step15_final_model \
+    --categories everyday --epochs 20 \
+    --max_batches_train 100 --max_batches_val 50 \
+    --summary_json /tmp/student7/phase4d_quick.json
+
+# Run complet
+python scripts/phase4d_pair_compatibility.py \
+    --ckpt output/cnn_step15_final_model/last.ckpt \
+    --data_root /storage/student7/teyssir/data/breaking_bad_vol.hdf5 \
+    --experiment cnn_step15_final_model \
+    --categories everyday --epochs 40 \
+    --summary_json /tmp/student7/phase4d_val.json
+```
+
+**Critère de succès :** AUC (thresh0.3) > baseline centroïde + marge significative
+(> 0.05 pp), signalant que les features CNN encodent une compatibilité de fracture
+au-delà de la proximité géométrique brute.
 
 ## Phase 5 — Depth-map fracture-face matching (piste tuteur, 2026-06-28)
 
@@ -1362,6 +1383,7 @@ pire que le hasard, 80% de paires filtrées. Cause : faces Breaking Bad trop pla
 (médiane planéité=0.043) → signal depth-map quasi-nul → pas de complémentarité
 discriminante. Phase 5B annulée (conditionnait à 5A).
 
-**Prochaine étape concrète : Phase 4D — compatibility classifier.**
-Plan cadré en section Phase 4D (ci-dessus). Aucun code écrit à ce jour.
-Implémenter `scripts/phase4d_compatibility_classifier.py`.
+**`scripts/phase4d_pair_compatibility.py` IMPLÉMENTÉ (2026-07-08).** Prochaine
+étape : lancer le run rapide sur le serveur pour vérifier que le pipeline tourne,
+puis run complet 40 epochs. Arbre de décision : AUC (thresh0.3) > baseline
+centroïde → signal réel ; AUC >> 0.5 → feature CNN discriminante de compatibilité.
