@@ -1285,15 +1285,52 @@ python scripts/phase5a_depthmap_matching.py \
 
 **Critère de succès :** Pose@30°/0.1 (GT) > référence Phase 2 oracle (9.6%).
 
+---
+
+### Conclusion finale Phase 5A — CLOSE (2026-07-08)
+
+**Run :** `--max_batches 50`, `everyday/val`, 103 paires 2-frags traitées.
+
+```
+Strategy          N   Skip  RotErr°  TransErr Pose@30/0.1 Pose@15/0.05  N_corr
+gt               21     82   155.02    0.5272       0.00%        0.00%    38.5
+thresh0.3        16     87   159.36    0.5186       0.00%        0.00%    45.9
+random            3    100   122.73    0.5113       0.00%        0.00%    42.7
+```
+
+**Verdict : négatif.** Deux symptômes distincts, deux causes distinctes.
+
+**(1) Skip rate anormal : 80% pour gt.**
+MIN_FRAC_POINTS=50 + MAX_PLANARITY=0.15 + condition OR par fragment → les seuils
+s'appliquent sur DEUX fragments indépendants, la probabilité de survie est le produit
+des deux taux de survie individuels. Avec p25 n_frac_pts=56 (pré-check), ~25% des
+faces échouent déjà au filtre taille.
+
+**(2) RotErr ≈ 155° — pire que le hasard (attendu ~90°).**
+La rotation aléatoire uniforme donne en moyenne ~90°. Obtenir 155° ≈ 180° signifie
+que le matcher trouve **systématiquement la pose inverse** (dos-à-dos) plutôt
+que la pose correcte.
+
+**Cause fondamentale : faces de fracture trop plates.**
+Médiane planéité = 0.043 → le relief de la depth map est quasi-nul. Quand
+`depth_i ≈ 0` et `depth_j ≈ 0`, la cross-corrélation `CC(depth_i, depth_j_rot) ≈ 0`
+**quelle que soit la rotation**. Le score `-CC/overlap` est alors dominé par des
+artefacts de bord : la zone où `overlap` est minimal (shift extrême) donne un
+dénominateur quasi-nul qui gonfle artificiellement le score → argmax converge
+vers une translation maximale et une rotation arbitraire (souvent 180°).
+
+**Le signal de complémentarité depth-map nécessite un relief suffisant.**
+Les faces de fracture du dataset Breaking Bad sont trop lisses pour cette approche.
+La planéité très faible (bonne pour valider la rasterisation) est aussi une limite :
+les fragments se cassent selon des plans, pas des surfaces texturées.
+
+**Phase 5A close — Phase 5B annulée** (conditionnait à 5A réussi).
+
+---
+
 ### Phase 5B (si 5A marche) — Extension 3–5 fragments
 
-Si Phase 5A valide l'hypothèse sur 2 fragments, réintroduire le vrai problème :
-quelle face de fracture d'un fragment correspond à quel voisin parmi 2-4 autres ?
-Le clustering spatial (Phase 2D, `eps=0.02`) avait donné `EdgeCoverage≈44%` et
-`BestCorrPrec≈37%` — à combiner avec le matching depth-map pour sélectionner la
-meilleure paire cluster-cluster.
-
-**Pas encore cadré.** Dépend du résultat de 5A.
+**Annulée.** Phase 5A négative — voir conclusion ci-dessus.
 
 ## Métriques d'évaluation déjà disponibles (ne pas réécrire)
 
@@ -1320,8 +1357,11 @@ corrigés, conclusion : confirme le diagnostic sans le résoudre — `top8_gap` 
 pas d'amélioration). **4B fait et clos** (cross-attention, run initial + run prolongé
 avec `--grad_clip 1.0`, conclusion : ne dépasse pas C1/4A, instabilité/collapse
 dustbin pas résolu par le clipping — voir conclusion ci-dessus). **4D cadré (2026-06-28, fallback, ci-dessus), aucun code écrit.** **5A.0 PASSÉ (2026-06-28, everyday/val, n=3803 objets 2-frags, médiane planéité=0.043).**
-**`scripts/phase5a_depthmap_matching.py` IMPLÉMENTÉ (2026-07-08).** Prochaine
-étape concrète : lancer le run rapide sur le serveur (`--max_batches 50`) pour
-vérifier que le pipeline tourne sans erreur, puis run complet val
-(commande dans la section Phase 5A ci-dessus). Analyser résultats selon l'arbre
-de décision : Pose@30 (GT) vs 9.6% oracle Phase 2.
+**Phase 5A CLOSE — NÉGATIF (2026-07-08)** : Pose@30=0% (GT et CNN), RotErr≈155°
+pire que le hasard, 80% de paires filtrées. Cause : faces Breaking Bad trop plates
+(médiane planéité=0.043) → signal depth-map quasi-nul → pas de complémentarité
+discriminante. Phase 5B annulée (conditionnait à 5A).
+
+**Prochaine étape concrète : Phase 4D — compatibility classifier.**
+Plan cadré en section Phase 4D (ci-dessus). Aucun code écrit à ce jour.
+Implémenter `scripts/phase4d_compatibility_classifier.py`.
