@@ -306,14 +306,16 @@ def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, a
             continue
 
         # Taille physique commune : chaque pixel couvre la même surface pour les deux maps
+        ci = frac_i - c_i
+        cj = frac_j - c_j
         span_i = max(
-            float((frac_i - c_i) @ u_i).max() - float((frac_i - c_i) @ u_i).min(),
-            float((frac_i - c_i) @ v_i).max() - float((frac_i - c_i) @ v_i).min(),
+            float((ci @ u_i).max() - (ci @ u_i).min()),
+            float((ci @ v_i).max() - (ci @ v_i).min()),
             1e-8,
         )
         span_j = max(
-            float((frac_j - c_j) @ u_j).max() - float((frac_j - c_j) @ u_j).min(),
-            float((frac_j - c_j) @ v_j).max() - float((frac_j - c_j) @ v_j).min(),
+            float((cj @ u_j).max() - (cj @ u_j).min()),
+            float((cj @ v_j).max() - (cj @ v_j).min()),
             1e-8,
         )
         pixel_size = max(span_i, span_j) * 1.1 / args.resolution
