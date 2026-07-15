@@ -13,7 +13,7 @@ Usage:
         --ckpt /storage/student7/teyssir/code/output/cnn_step15_final_model/last.ckpt \
         --data_root /storage/student7/teyssir/data/breaking_bad_vol.hdf5 \
         --experiment cnn_step15_final_model \
-        --n_warmup 10 --n_measure 100
+        --n_warmup 30 --n_measure 100
 
     # + PTv3/FracSeg comparison:
     python scripts/benchmark_inference.py \
@@ -21,7 +21,7 @@ Usage:
         --data_root /storage/student7/teyssir/data/breaking_bad_vol.hdf5 \
         --experiment cnn_step15_final_model \
         --garf_ckpt /path/to/GARF_mini.ckpt \
-        --n_warmup 10 --n_measure 100
+        --n_warmup 30 --n_measure 100
 """
 
 import argparse
@@ -51,7 +51,7 @@ def parse_args():
     p.add_argument("--experiment",  required=True,  help="Hydra experiment name (datamodule config only)")
     p.add_argument("--garf_ckpt",   default=None,   help="Optional PTv3/FracSeg checkpoint for comparison")
     p.add_argument("--categories",  default=None,   help="Comma-separated categories override, e.g. artifact")
-    p.add_argument("--n_warmup",    type=int, default=10,  help="Warmup batches (excluded from timing)")
+    p.add_argument("--n_warmup",    type=int, default=30,  help="Warmup batches (excluded from timing)")
     p.add_argument("--n_measure",   type=int, default=100, help="Measured batches")
     return p.parse_args()
 
@@ -74,7 +74,7 @@ def _time_model(model, loader, device, n_warmup, n_measure, label):
     n_params = sum(p.numel() for p in model.parameters())
 
     times_ms = []
-    n_frags_total = 0
+    n_frags_per_sample = []
     it = iter(loader)
 
     with torch.no_grad():
@@ -102,9 +102,12 @@ def _time_model(model, loader, device, n_warmup, n_measure, label):
             t1 = time.perf_counter()
 
             times_ms.append((t1 - t0) * 1000.0)
-            n_frags_total += K
+            n_frags_per_sample.append(K)
 
     times_ms = np.array(times_ms)
+    n_frags_arr = np.array(n_frags_per_sample)
+    n_frags_total = n_frags_arr.sum()
+
     print(f"\n=== {label} ===")
     print(f"  Params: {n_params:,}")
     print(f"  Objects measured: {len(times_ms)}  (avg {n_frags_total / max(len(times_ms), 1):.1f} fragments/object)")
@@ -113,6 +116,22 @@ def _time_model(model, loader, device, n_warmup, n_measure, label):
     print(f"  Per-fragment latency (mean/object / avg fragments per object): "
           f"{times_ms.mean() / max(n_frags_total / max(len(times_ms), 1), 1e-9):.3f} ms")
     print(f"  Throughput: {1000.0 / times_ms.mean():.2f} objects/sec")
+
+    # Latency broken down by fragment count — separates "scales with K" (expected,
+    # not fixable) from residual per-sample noise (GPU contention / cudnn warmup).
+    corr = np.corrcoef(n_frags_arr, times_ms)[0, 1] if len(times_ms) > 1 else float("nan")
+    print(f"  Correlation(latency, n_fragments): {corr:.2f}")
+    print(f"  Latency by fragment-count bucket:")
+    buckets = [(1, 3), (4, 6), (7, 10), (11, 100)]
+    for lo, hi in buckets:
+        mask = (n_frags_arr >= lo) & (n_frags_arr <= hi)
+        if mask.sum() == 0:
+            continue
+        sub = times_ms[mask]
+        print(f"    K in [{lo:>2},{hi:>3}]  n={mask.sum():3d}  "
+              f"mean={sub.mean():6.2f} ms  median={np.median(sub):6.2f} ms  "
+              f"per-fragment={sub.mean() / np.mean(n_frags_arr[mask]):.3f} ms")
+
     return times_ms
 
 
@@ -122,6 +141,10 @@ def main():
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
+        # Fragment count (hence 2D-projection tensor shape) varies per object,
+        # so cudnn needs a few warmup iters per distinct shape to autotune —
+        # bumped default --n_warmup accordingly.
+        torch.backends.cudnn.benchmark = True
 
     # --- CNN ---
     cnn_args = _NS(args.experiment, args.data_root, args.categories, model_type="cnn", batch_size=1)
