@@ -110,6 +110,39 @@ def _gather_neighbors(points: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     return points[batch_idx, idx]                            # (K, N, k, 3)
 
 
+def _batched_eigh(cov: torch.Tensor, chunk_size: int = 8192):
+    """
+    torch.linalg.eigh over a large batch of small (3, 3) matrices, chunked.
+
+    cusolver's batched eigh path (cusolverDnXsyevBatched) has an internal
+    batch-size ceiling — flattening (K, N, 3, 3) with K fragments * N=5000
+    points easily exceeds it (e.g. K=15 -> 75,000 matrices), raising
+    CUSOLVER_STATUS_INVALID_VALUE even with no NaNs involved. Chunking the
+    eigh call keeps each call under the limit; it does not change the result
+    (each 3x3 matrix is decomposed independently regardless of chunk
+    boundaries) and is still far fewer Python-level calls than the original
+    K-fragment loop this replaces.
+    """
+    orig_shape = cov.shape                                    # (..., 3, 3)
+    flat = cov.reshape(-1, orig_shape[-2], orig_shape[-1])
+    total = flat.shape[0]
+
+    if total <= chunk_size:
+        eigenvalues, eigenvectors = torch.linalg.eigh(flat)
+    else:
+        eigvals_chunks, eigvecs_chunks = [], []
+        for start in range(0, total, chunk_size):
+            ev, evec = torch.linalg.eigh(flat[start:start + chunk_size])
+            eigvals_chunks.append(ev)
+            eigvecs_chunks.append(evec)
+        eigenvalues = torch.cat(eigvals_chunks, dim=0)
+        eigenvectors = torch.cat(eigvecs_chunks, dim=0)
+
+    eigenvalues = eigenvalues.reshape(*orig_shape[:-1])       # (..., 3)
+    eigenvectors = eigenvectors.reshape(*orig_shape)          # (..., 3, 3)
+    return eigenvalues, eigenvectors
+
+
 def _local_pca(points: torch.Tensor, idx: torch.Tensor):
     """
     Compute local PCA covariance eigendecomposition for each point's neighborhood.
@@ -138,7 +171,7 @@ def _local_pca(points: torch.Tensor, idx: torch.Tensor):
     # torch.linalg.eigh: eigenvalues ascending, eigenvectors as columns
     # eigh does not support float16 on CUDA — upcast temporarily
     orig_dtype = cov.dtype
-    eigenvalues, eigenvectors = torch.linalg.eigh(cov.float())  # (N,3), (N,3,3)
+    eigenvalues, eigenvectors = _batched_eigh(cov.float())       # (...,3), (...,3,3)
     eigenvalues = eigenvalues.to(orig_dtype)
     eigenvectors = eigenvectors.to(orig_dtype)
 
