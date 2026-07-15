@@ -380,6 +380,145 @@ def baseline_centroid(loader, cnn_model, device, args, rng, max_batches=0, cnn_d
     }
 
 
+# ── Cache : extraction une seule fois, entraînement sur numpy arrays ──────────
+
+def extract_to_cache(train_loader, val_loader, cnn_model, cache_path, args, rng, cnn_device):
+    """Extrait les features CNN une seule fois pour train+val, sauvegarde dans cache_path.
+    Cache format : .npz avec arrays (split)_(strat)_vecs et (split)_(strat)_labels."""
+    from pathlib import Path
+    print(f"\nExtraction des features CNN vers cache : {cache_path}")
+    print("(opération unique, ~6h sur CPU — lancez en screen et revenez demain)")
+
+    result = {}
+    for split_name, loader in (("train", train_loader), ("val", val_loader)):
+        print(f"\n  Split : {split_name}")
+        strat_vecs   = {s: [] for s in ("gt", "thresh0.3", "random")}
+        strat_labels = {s: [] for s in ("gt", "thresh0.3", "random")}
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(loader):
+                if batch_idx % 50 == 0:
+                    print(f"    batch {batch_idx}...")
+                batch_cpu = {
+                    k: v.to(cnn_device) if isinstance(v, torch.Tensor) else v
+                    for k, v in batch.items()
+                }
+                frag_list, valid_pcs, K = extract_fragment_list(
+                    batch_cpu["pointclouds"], batch_cpu["points_per_part"]
+                )
+                if K == 0:
+                    continue
+                frag_sizes = [f.shape[0] for f in frag_list]
+
+                out = cnn_model(batch_cpu, return_point_features=True)
+                feat_flat  = out["point_features"].float().cpu().numpy()
+                score_flat = out["coarse_seg_pred"].float().cpu().numpy()
+                gt_flat    = out["coarse_seg_gt"].long().cpu().numpy()
+
+                valid_np = valid_pcs.cpu().numpy()
+                B, P     = valid_np.shape
+                bp_pairs = [(b, p) for b in range(B) for p in range(P) if valid_np[b, p]]
+
+                scale_np = batch["scale"].numpy()
+                if scale_np.ndim == 2:
+                    scale_np = scale_np[:, :, None]
+                graph_np = batch["graph"].numpy()
+
+                offsets        = np.concatenate([[0], np.cumsum(frag_sizes)])
+                cnn_feat_per_k = [feat_flat [offsets[k]:offsets[k+1]] for k in range(K)]
+                score_per_k    = [score_flat[offsets[k]:offsets[k+1]] for k in range(K)]
+                gt_per_k       = [gt_flat   [offsets[k]:offsets[k+1]] for k in range(K)]
+                pc_per_k       = [frag_list [k].cpu().numpy()          for k in range(K)]
+
+                object_to_ks = defaultdict(list)
+                for k, (b, p) in enumerate(bp_pairs):
+                    object_to_ks[b].append((k, p))
+
+                for strat in ("gt", "thresh0.3", "random"):
+                    vecs, labels, _ = build_batch_pairs(
+                        cnn_feat_per_k, score_per_k, gt_per_k, pc_per_k,
+                        scale_np, bp_pairs, graph_np, object_to_ks, strat, rng,
+                    )
+                    if vecs:
+                        strat_vecs[strat].extend(vecs)
+                        strat_labels[strat].extend(labels)
+
+        for strat in ("gt", "thresh0.3", "random"):
+            key = strat.replace(".", "")   # "thresh03" pour clé numpy valide
+            result[f"{split_name}_{key}_vecs"]   = np.array(strat_vecs[strat],   dtype=np.float32)
+            result[f"{split_name}_{key}_labels"] = np.array(strat_labels[strat], dtype=np.int8)
+            n = len(strat_labels[strat])
+            print(f"    {split_name}/{strat}: {n} paires, "
+                  f"pos={sum(strat_labels[strat])}, neg={n-sum(strat_labels[strat])}")
+
+    Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(cache_path, **result)
+    print(f"\nCache sauvegardé : {cache_path}  "
+          f"({Path(cache_path).stat().st_size / 1e6:.1f} MB)")
+    return result
+
+
+def train_epoch_cached(cache, mlp, optimizer, device, args, rng):
+    """Epoch d'entraînement sur les features pré-calculées (pas de CNN)."""
+    mlp.train()
+    strat_key = args.train_strat.replace(".", "")
+    vecs   = cache[f"train_{strat_key}_vecs"]
+    labels = cache[f"train_{strat_key}_labels"].astype(np.float32)
+
+    # Shuffle
+    idx = rng.permutation(len(vecs))
+    vecs, labels = vecs[idx], labels[idx]
+
+    # Mini-batch sur les paires
+    batch_sz   = 2048
+    total_loss = 0.0
+    n_batches  = 0
+    for start in range(0, len(vecs), batch_sz):
+        x = torch.tensor(vecs  [start:start+batch_sz], dtype=torch.float32, device=device)
+        y = torch.tensor(labels[start:start+batch_sz], dtype=torch.float32, device=device)
+        n_pos = y.sum().clamp(min=1)
+        n_neg = (1 - y).sum().clamp(min=1)
+        pos_w = torch.tensor([n_neg / n_pos], device=device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+        optimizer.zero_grad()
+        logits = mlp(x)
+        loss   = criterion(logits, y)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        n_batches  += 1
+    return total_loss / max(n_batches, 1)
+
+
+def evaluate_cached(cache, mlp, device, args):
+    """Évaluation sur les features pré-calculées (pas de CNN)."""
+    mlp.eval()
+    results = {}
+    with torch.no_grad():
+        for strat in ("gt", "thresh0.3", "random"):
+            key    = strat.replace(".", "")
+            vecs   = cache.get(f"val_{key}_vecs")
+            labels = cache.get(f"val_{key}_labels")
+            if vecs is None or len(vecs) == 0:
+                results[strat] = {}
+                continue
+            x      = torch.tensor(vecs, dtype=torch.float32, device=device)
+            logits = mlp(x).cpu().numpy()
+            scores = 1 / (1 + np.exp(-logits))
+            lb     = labels.astype(np.int32)
+            if lb.sum() == 0:
+                results[strat] = {}
+                continue
+            results[strat] = {
+                "n_pairs": len(lb),
+                "n_pos":   int(lb.sum()),
+                "auc":     float(roc_auc_score(lb, scores)),
+                "ap":      float(average_precision_score(lb, scores)),
+                "prec_at_k": 0.0,   # précision@k nécessite infos par-fragment (non stockées)
+            }
+    return results
+
+
 # ── Boucle d'entraînement ────────────────────────────────────────────────────
 
 def train_epoch(loader, cnn_model, mlp, optimizer, device, args, rng, max_batches=0, cnn_device=None):
@@ -477,6 +616,12 @@ def main():
     parser.add_argument("--max_batches_val",   type=int, default=0)
     parser.add_argument("--seed",         type=int, default=42)
     parser.add_argument("--device",       default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--cache_file",   default="",
+                        help="Chemin .npz pour cacher les features CNN (extraction unique). "
+                             "Si le fichier existe : charger et sauter le CNN. "
+                             "Si non : extraire, sauvegarder, puis entraîner.")
+    parser.add_argument("--extract_only", action="store_true",
+                        help="Extraire le cache et quitter sans entraîner.")
     parser.add_argument("--summary_json", default="")
     args = parser.parse_args()
 
@@ -525,6 +670,29 @@ def main():
     n_params = sum(p.numel() for p in mlp.parameters())
     print(f"MLP params: {n_params:,}  |  pair_dim={PAIR_DIM} → hidden={args.hidden_dim} → 1")
 
+    # ── Cache : extraction ou chargement ─────────────────────────────────────
+    cache = None
+    if args.cache_file:
+        from pathlib import Path as _P
+        if _P(args.cache_file).exists():
+            print(f"\nChargement cache : {args.cache_file}")
+            raw = np.load(args.cache_file)
+            cache = {k: raw[k] for k in raw.files}
+            for s in ("gt", "thresh03", "random"):
+                n = len(cache.get(f"train_{s}_labels", []))
+                print(f"  train/{s}: {n} paires")
+            print("  → CNN non chargé pour l'entraînement (cache utilisé)")
+        else:
+            cache = extract_to_cache(train_loader, val_loader, cnn_model,
+                                     args.cache_file, args, rng, cnn_device)
+            if args.extract_only:
+                print("--extract_only : extraction terminée, fin.")
+                return
+    elif args.extract_only:
+        cache = extract_to_cache(train_loader, val_loader, cnn_model,
+                                 "/tmp/phase4d_cache.npz", args, rng, cnn_device)
+        return
+
     # ── Baseline centroïde (avant tout entraînement) ─────────────────────────
     print("\nBaseline centroïde (val)...")
     base_res = baseline_centroid(val_loader, cnn_model, device, args, rng, args.max_batches_val,
@@ -534,24 +702,37 @@ def main():
 
     # ── Boucle d'entraînement ─────────────────────────────────────────────────
     history = []
-    print(f"\nEntraînement — {args.epochs} epochs\n")
+    use_cache = cache is not None
+    mode_str  = "cache" if use_cache else "online (CNN par batch)"
+    print(f"\nEntraînement — {args.epochs} epochs  [{mode_str}]\n")
     print(f"{'Epoch':>5} {'TrainLoss':>10} {'AUC_gt':>8} {'AUC_t03':>8} "
-          f"{'AP_gt':>7} {'AP_t03':>7} {'P@k_gt':>7} {'P@k_t03':>8}")
-    print("-" * 65)
+          f"{'AP_gt':>7} {'AP_t03':>7} {'P@k_gt':>7} {'P@k_t03':>8}  {'Time':>6}  ETA")
+    print("-" * 80)
 
     best_auc_val  = 0.0
     best_epoch    = 0
     best_state    = None
+    import time as _time
+    epoch_times   = []
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_epoch(
-            train_loader, cnn_model, mlp, optimizer, device, args, rng,
-            args.max_batches_train, cnn_device=cnn_device,
-        )
-        val_res = evaluate(
-            val_loader, cnn_model, mlp, device, args, rng, args.max_batches_val,
-            cnn_device=cnn_device,
-        )
+        t0 = _time.time()
+        if use_cache:
+            train_loss = train_epoch_cached(cache, mlp, optimizer, device, args, rng)
+            val_res    = evaluate_cached(cache, mlp, device, args)
+        else:
+            train_loss = train_epoch(
+                train_loader, cnn_model, mlp, optimizer, device, args, rng,
+                args.max_batches_train, cnn_device=cnn_device,
+            )
+            val_res = evaluate(
+                val_loader, cnn_model, mlp, device, args, rng, args.max_batches_val,
+                cnn_device=cnn_device,
+            )
+        elapsed = _time.time() - t0
+        epoch_times.append(elapsed)
+        remaining = (args.epochs - epoch) * float(np.mean(epoch_times[-5:]))
+        eta_str = f"{remaining/3600:.1f}h" if remaining > 3600 else f"{remaining/60:.0f}m"
 
         auc_gt  = val_res.get("gt",         {}).get("auc",       0.0)
         auc_t03 = val_res.get("thresh0.3",  {}).get("auc",       0.0)
@@ -561,7 +742,8 @@ def main():
         pak_t03 = val_res.get("thresh0.3",  {}).get("prec_at_k", 0.0)
 
         print(f"{epoch:>5} {train_loss:>10.4f} {auc_gt:>8.4f} {auc_t03:>8.4f} "
-              f"{ap_gt:>7.4f} {ap_t03:>7.4f} {pak_gt:>7.4f} {pak_t03:>8.4f}")
+              f"{ap_gt:>7.4f} {ap_t03:>7.4f} {pak_gt:>7.4f} {pak_t03:>8.4f}"
+              f"  {elapsed:>6.0f}s  ETA {eta_str}")
 
         ref_auc = auc_t03 if args.train_strat == "thresh0.3" else auc_gt
         if ref_auc > best_auc_val:
