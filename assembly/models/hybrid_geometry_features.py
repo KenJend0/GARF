@@ -64,27 +64,76 @@ def _knn_indices(points: torch.Tensor, k: int) -> torch.Tensor:
     return idx
 
 
+def _knn_indices_batched(points: torch.Tensor, k: int) -> torch.Tensor:
+    """
+    Brute-force k nearest neighbor indices, batched over K fragments that all
+    share the same point count N (the common case: sample_method=uniform).
+
+    Args:
+        points : (K, N, 3) coordinates, K independent fragments
+        k      : number of neighbors (self excluded)
+
+    Returns:
+        idx    : (K, N, k) integer tensor of neighbor indices, local to each
+                 fragment (never crosses fragment boundaries — each fragment's
+                 (N, N) distance matrix is computed independently within the
+                 batched dim, exactly like calling _knn_indices K times).
+    """
+    sq = (points ** 2).sum(dim=-1, keepdim=True)              # (K, N, 1)
+    dist2 = sq + sq.transpose(1, 2) - 2.0 * (points @ points.transpose(1, 2))  # (K, N, N)
+    dist2 = dist2.clamp(min=0.0)
+    diag = torch.eye(points.shape[1], device=points.device, dtype=torch.bool)
+    dist2 = dist2.masked_fill(diag.unsqueeze(0), float("inf"))  # exclude self, per fragment
+    _, idx = dist2.topk(k, dim=-1, largest=False)               # (K, N, k)
+    return idx
+
+
+def _gather_neighbors(points: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    """
+    Gather neighbor coordinates, supporting both a single fragment and a
+    batch of K fragments (each fragment's indices only ever reference points
+    within that same fragment — no cross-fragment mixing).
+
+    Args:
+        points : (N, 3)        or  (K, N, 3)
+        idx    : (N, k)        or  (K, N, k)
+
+    Returns:
+        neighbors : (N, k, 3)  or  (K, N, k, 3)
+    """
+    if points.dim() == 2:
+        return points[idx]                                  # (N, k, 3)
+
+    K, N, _ = points.shape
+    k = idx.shape[-1]
+    batch_idx = torch.arange(K, device=points.device).view(K, 1, 1).expand(-1, N, k)
+    return points[batch_idx, idx]                            # (K, N, k, 3)
+
+
 def _local_pca(points: torch.Tensor, idx: torch.Tensor):
     """
     Compute local PCA covariance eigendecomposition for each point's neighborhood.
+    Works for a single fragment or a batch of K fragments sharing the same N
+    (each fragment's PCA is computed independently — this only vectorizes the
+    K sequential Python calls into one, it does not mix fragments together).
 
     Args:
-        points : (N, 3)
-        idx    : (N, k) neighbor indices
+        points : (N, 3)        or  (K, N, 3)
+        idx    : (N, k)        or  (K, N, k)  neighbor indices
 
     Returns:
-        eigenvalues  : (N, 3)  sorted descending (λ_0 ≥ λ_1 ≥ λ_2)
-        eigenvectors : (N, 3, 3)  columns are eigenvectors
-                       eigenvectors[:, :, 2] = direction of smallest variance
+        eigenvalues  : (N, 3)  or (K, N, 3)   sorted descending (λ_0 ≥ λ_1 ≥ λ_2)
+        eigenvectors : (N, 3, 3)  or (K, N, 3, 3)  columns are eigenvectors
+                       [..., 2] = direction of smallest variance
                        = PCA-estimated surface normal
     """
-    N, k = idx.shape
-    neighbors = points[idx]                             # (N, k, 3)
-    centroid = neighbors.mean(dim=1, keepdim=True)      # (N, 1, 3)
-    centered = neighbors - centroid                     # (N, k, 3)
+    k = idx.shape[-1]
+    neighbors = _gather_neighbors(points, idx)          # (..., N, k, 3)
+    centroid = neighbors.mean(dim=-2, keepdim=True)     # (..., N, 1, 3)
+    centered = neighbors - centroid                     # (..., N, k, 3)
 
-    # Unnormalized covariance matrix (N, 3, 3)
-    cov = centered.transpose(1, 2) @ centered / max(k - 1, 1)
+    # Unnormalized covariance matrix (..., N, 3, 3)
+    cov = centered.transpose(-2, -1) @ centered / max(k - 1, 1)
 
     # torch.linalg.eigh: eigenvalues ascending, eigenvectors as columns
     # eigh does not support float16 on CUDA — upcast temporarily
@@ -227,6 +276,77 @@ class HybridGeometryFeatures(nn.Module):
             features.append(dists / mean_d)                       # (N, 1) ratio > 1 = periphery
 
         return torch.cat(features, dim=-1)                       # (N, out_dim)
+
+    @torch.no_grad()
+    def forward_fragment_list(
+        self,
+        xyz_list: list,
+        normals_list: list,
+    ) -> list:
+        """
+        Batched equivalent of calling forward_single(xyz_list[k], normals_list[k])
+        for k in range(K) in a Python loop — same formulas, same per-fragment
+        kNN/PCA (fragments never see each other's points), just computed as one
+        vectorized (K, N, ...) call instead of K sequential (N, ...) calls.
+
+        Falls back to the per-fragment loop when fragments don't share the same
+        point count N (only the uniform-sampling path guarantees that).
+
+        Args:
+            xyz_list     : list of K tensors (N, 3)
+            normals_list : list of K tensors (N, 3)
+
+        Returns:
+            list of K tensors (N, out_dim) — same order, same values (up to
+            float rounding) as the per-fragment loop.
+        """
+        K = len(xyz_list)
+        if K == 0:
+            return []
+        N0 = xyz_list[0].shape[0]
+        if any(x.shape[0] != N0 for x in xyz_list):
+            return [self.forward_single(xyz_list[i], normals_list[i]) for i in range(K)]
+
+        xyz = torch.stack(xyz_list, dim=0)              # (K, N, 3)
+        normals = torch.stack(normals_list, dim=0)      # (K, N, 3)
+
+        N = xyz.shape[1]
+        k_actual = min(self.k, N - 1)
+        if k_actual < 2:
+            out = torch.zeros(K, N, self.out_dim, device=xyz.device, dtype=xyz.dtype)
+            return [out[i] for i in range(K)]
+
+        idx = _knn_indices_batched(xyz, k_actual)                  # (K, N, k)
+        eigenvalues, eigenvectors = _local_pca(xyz, idx)           # (K,N,3), (K,N,3,3)
+
+        pca_normal = eigenvectors[..., 2]                          # (K, N, 3)
+        dot = (pca_normal * normals).sum(dim=-1, keepdim=True)     # (K, N, 1)
+        pca_normal = pca_normal * dot.sign()
+        consistency = dot.abs()
+
+        features = [consistency]
+        if self.use_normals:
+            features.append(normals)
+        if self.use_curvature:
+            total_var = eigenvalues.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            curvature = eigenvalues[..., 2:3] / total_var          # (K, N, 1)
+            features.append(curvature)
+        if self.use_roughness:
+            neighbors = _gather_neighbors(xyz, idx)                # (K, N, k, 3)
+            centroid = neighbors.mean(dim=-2, keepdim=True)        # (K, N, 1, 3)
+            offset = neighbors - centroid                          # (K, N, k, 3)
+            n_exp = pca_normal.unsqueeze(-2)                       # (K, N, 1, 3)
+            perp_dist = (offset * n_exp).sum(dim=-1).abs()         # (K, N, k)
+            roughness = perp_dist.mean(dim=-1, keepdim=True)       # (K, N, 1)
+            features.append(roughness)
+        if self.use_dist_to_centroid:
+            centroid = xyz.mean(dim=1, keepdim=True)               # (K, 1, 3)
+            dists = (xyz - centroid).norm(dim=-1, keepdim=True)    # (K, N, 1)
+            mean_d = dists.mean(dim=1, keepdim=True).clamp(min=1e-6)
+            features.append(dists / mean_d)
+
+        out = torch.cat(features, dim=-1)                          # (K, N, out_dim)
+        return [out[i] for i in range(K)]
 
     def forward(
         self,

@@ -722,10 +722,7 @@ class CNNFracSeg(pl.LightningModule):
         # to 2D as extra image channels. No gradients — pure geometric descriptors.
         geo_features_list = None
         if self.use_geo_features and normal_list is not None:
-            geo_features_list = [
-                self.geo_extractor.forward_single(frag_list[k], normal_list[k])
-                for k in range(K)
-            ]
+            geo_features_list = self.geo_extractor.forward_fragment_list(frag_list, normal_list)
 
         # 3. Orthographic projection → (K, V, C, H, W) + corner/weight maps
         images, pix_corners_list, pix_weights_list, count_list = self.projector(
