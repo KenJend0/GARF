@@ -212,7 +212,7 @@ def precision_at_k_from_scores(all_scores_by_frag):
 
 # ── Évaluation sur un split ───────────────────────────────────────────────────
 
-def evaluate(loader, cnn_model, mlp, device, args, rng, max_batches=0):
+def evaluate(loader, cnn_model, mlp, device, args, rng, max_batches=0, cnn_device=None):
     """Évalue le MLP sur un split complet.
     Retourne un dict {strat: {auc, ap, prec_at_k, baseline_auc}} pour les 3 conditions.
     """
@@ -222,12 +222,13 @@ def evaluate(loader, cnn_model, mlp, device, args, rng, max_batches=0):
     # pour prec@k : (objet_b, frag_k) → [(score, label)]
     per_frag = {s: defaultdict(list) for s in ("gt", "thresh0.3", "random")}
 
+    _cnn_dev = cnn_device if cnn_device is not None else device
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
             if max_batches > 0 and batch_idx >= max_batches:
                 break
             batch_gpu = {
-                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                k: v.to(_cnn_dev) if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()
             }
             frag_list, valid_pcs, K = extract_fragment_list(
@@ -319,17 +320,18 @@ def evaluate(loader, cnn_model, mlp, device, args, rng, max_batches=0):
 
 # ── Baseline centroïde ────────────────────────────────────────────────────────
 
-def baseline_centroid(loader, cnn_model, device, args, rng, max_batches=0):
+def baseline_centroid(loader, cnn_model, device, args, rng, max_batches=0, cnn_device=None):
     """Baseline triviale : score = -distance inter-centroïdes (plus proches = plus compatibles).
     Évaluation AUC sur le val.
     """
+    _cnn_dev = cnn_device if cnn_device is not None else device
     scores_all, labels_all = [], []
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
             if max_batches > 0 and batch_idx >= max_batches:
                 break
             batch_gpu = {
-                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                k: v.to(_cnn_dev) if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()
             }
             frag_list, valid_pcs, K = extract_fragment_list(
@@ -380,16 +382,17 @@ def baseline_centroid(loader, cnn_model, device, args, rng, max_batches=0):
 
 # ── Boucle d'entraînement ────────────────────────────────────────────────────
 
-def train_epoch(loader, cnn_model, mlp, optimizer, device, args, rng, max_batches=0):
+def train_epoch(loader, cnn_model, mlp, optimizer, device, args, rng, max_batches=0, cnn_device=None):
     mlp.train()
     total_loss = 0.0
     n_batches  = 0
+    _cnn_dev   = cnn_device if cnn_device is not None else device
 
     for batch_idx, batch in enumerate(loader):
         if max_batches > 0 and batch_idx >= max_batches:
             break
         batch_gpu = {
-            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            k: v.to(_cnn_dev) if isinstance(v, torch.Tensor) else v
             for k, v in batch.items()
         }
 
@@ -504,15 +507,17 @@ def main():
         collate_fn=datamodule.dataset_cls.collate_fn,
     )
 
-    # ── Modèle CNN figé ───────────────────────────────────────────────────────
-    print(f"Loading checkpoint: {args.ckpt}")
-    cnn_model = CNNFracSeg.load_from_checkpoint(args.ckpt, map_location=device, weights_only=False)
+    # ── Modèle CNN figé sur CPU ───────────────────────────────────────────────
+    # Le CNN (~5 GiB) dépasse la mémoire GPU disponible en cohabitation.
+    # Inférence CPU (torch.no_grad) ; seul le MLP (41k params) va sur device.
+    cnn_device = torch.device("cpu")
+    print(f"Loading checkpoint: {args.ckpt} (CNN sur CPU, MLP sur {device})")
+    cnn_model = CNNFracSeg.load_from_checkpoint(args.ckpt, map_location=cnn_device, weights_only=False)
     cnn_model.eval()
-    cnn_model.to(device)
     for p in cnn_model.parameters():
         p.requires_grad_(False)
 
-    # ── MLP classifieur ───────────────────────────────────────────────────────
+    # ── MLP classifieur sur device (GPU) ──────────────────────────────────────
     mlp = PairCompatibilityMLP(
         pair_dim=PAIR_DIM, hidden=args.hidden_dim, dropout=args.dropout
     ).to(device)
@@ -522,7 +527,8 @@ def main():
 
     # ── Baseline centroïde (avant tout entraînement) ─────────────────────────
     print("\nBaseline centroïde (val)...")
-    base_res = baseline_centroid(val_loader, cnn_model, device, args, rng, args.max_batches_val)
+    base_res = baseline_centroid(val_loader, cnn_model, device, args, rng, args.max_batches_val,
+                                 cnn_device=cnn_device)
     print(f"  Baseline centroïde : AUC={base_res.get('auc','—'):.4f}  "
           f"AP={base_res.get('ap','—'):.4f}  n_pairs={base_res.get('n_pairs',0)}")
 
@@ -540,10 +546,11 @@ def main():
     for epoch in range(1, args.epochs + 1):
         train_loss = train_epoch(
             train_loader, cnn_model, mlp, optimizer, device, args, rng,
-            args.max_batches_train,
+            args.max_batches_train, cnn_device=cnn_device,
         )
         val_res = evaluate(
-            val_loader, cnn_model, mlp, device, args, rng, args.max_batches_val
+            val_loader, cnn_model, mlp, device, args, rng, args.max_batches_val,
+            cnn_device=cnn_device,
         )
 
         auc_gt  = val_res.get("gt",         {}).get("auc",       0.0)
@@ -572,7 +579,8 @@ def main():
     # Évaluation finale avec le meilleur checkpoint
     if best_state is not None:
         mlp.load_state_dict(best_state)
-    final_val = evaluate(val_loader, cnn_model, mlp, device, args, rng, args.max_batches_val)
+    final_val = evaluate(val_loader, cnn_model, mlp, device, args, rng, args.max_batches_val,
+                         cnn_device=cnn_device)
 
     print("\n── Résultats finaux (best checkpoint, val) ──")
     header = f"{'Strategy':<12} {'N_pairs':>8} {'AUC':>7} {'AP':>7} {'Prec@k':>8}"
