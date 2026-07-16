@@ -504,7 +504,7 @@ def evaluate_cached(cache, mlp, device, args):
                 continue
             x      = torch.tensor(vecs, dtype=torch.float32, device=device)
             logits = mlp(x).cpu().numpy()
-            scores = 1 / (1 + np.exp(-logits))
+            scores = 1 / (1 + np.exp(-np.clip(logits, -500, 500)))
             lb     = labels.astype(np.int32)
             if lb.sum() == 0:
                 results[strat] = {}

@@ -1160,12 +1160,13 @@ entraînement MLP 1s/epoch sur features pré-calculées).
 ```
 Baseline centroïde : AUC=0.32 (inversé — fragments proches ≠ adjacents dans les poses aléatoires)
 
+Run 500 epochs (cache, 1s/epoch) — best checkpoint epoch 83 :
 Strategy      N_pairs     AUC      AP   Prec@k
-gt             105k+     0.793   0.744   ~0.70  (quick run)
-thresh0.3      105k+     0.797   0.747   ~0.69  (quick run)
-random         105k+     0.754   0.596   ~0.65  (quick run)
+gt              94984    0.793   0.744    0.729
+thresh0.3       94496    0.798   0.749    0.733
+random          95071    0.627   0.505    0.669
 
-Meilleur AUC val (thresh0.3) : 0.797 @ epoch 40 (encore en hausse légère)
+Meilleur AUC val (thresh0.3) : 0.798 @ epoch 83 — plateau confirmé (no overfitting jusqu'à 500)
 ```
 
 **Verdict : Phase 4D POSITIVE.** Le MLP appris sur features CNN agrégées distingue
@@ -1435,7 +1436,6 @@ pire que le hasard, 80% de paires filtrées. Cause : faces Breaking Bad trop pla
 (médiane planéité=0.043) → signal depth-map quasi-nul → pas de complémentarité
 discriminante. Phase 5B annulée (conditionnait à 5A).
 
-**Phase 4D CLOSE — POSITIF (2026-07-16).** AUC=0.797 (thresh0.3), AP=0.747,
-P@k≈0.70 (quick run). gt ≈ thresh0.3 (+0.4 pp). thresh0.3 > random (+4.3 pp AUC).
-Baseline centroïde AUC=0.32. Voir conclusion complète section Phase 4D ci-dessus.
+**Phase 4D CLOSE — POSITIF (2026-07-16).** AUC=0.798 (thresh0.3), AP=0.749,
+P@k=0.733 — best @ epoch 83/500. thresh0.3 > random (+17pp AUC à convergence).
 Toutes les phases closes. Rapport de stage : rédiger les résultats.
