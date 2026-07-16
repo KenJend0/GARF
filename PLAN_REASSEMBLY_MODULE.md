@@ -1150,6 +1150,58 @@ python scripts/phase4d_pair_compatibility.py \
 (> 0.05 pp), signalant que les features CNN encodent une compatibilité de fracture
 au-delà de la proximité géométrique brute.
 
+---
+
+### Conclusion finale Phase 4D — POSITIF (2026-07-16)
+
+**Run complet :** `everyday/val`, 40 epochs, mode cache (extraction CNN une fois,
+entraînement MLP 1s/epoch sur features pré-calculées).
+
+```
+Baseline centroïde : AUC=0.32 (inversé — fragments proches ≠ adjacents dans les poses aléatoires)
+
+Strategy      N_pairs     AUC      AP   Prec@k
+gt             105k+     0.793   0.744   ~0.70  (quick run)
+thresh0.3      105k+     0.797   0.747   ~0.69  (quick run)
+random         105k+     0.754   0.596   ~0.65  (quick run)
+
+Meilleur AUC val (thresh0.3) : 0.797 @ epoch 40 (encore en hausse légère)
+```
+
+**Verdict : Phase 4D POSITIVE.** Le MLP appris sur features CNN agrégées distingue
+les paires adjacentes des non-adjacentes avec AUC = 0.797.
+
+Trois faits confirmés :
+
+**(1) gt ≈ thresh0.3 (+0.4 pp).**
+Le masque CNN prédit est presque aussi informatif que le masque GT pour agréger les
+features. La segmentation fracture du Step 15 est suffisamment précise pour ce cas
+d'usage — pas besoin d'un oracle.
+
+**(2) thresh0.3 > random (+4.3 pp AUC, +15 pp AP).**
+Les points fracture spécifiquement portent plus d'information de compatibilité que
+des points aléatoires sur le même fragment. Le masque fracture CNN est discriminant.
+
+**(3) AUC = 0.797 >> hasard (0.50).**
+Les features `point_features` (64-dim, PointHead) encodent un signal de
+compatibilité fragment-fragment genuinement appris — non trivial, au-delà de la
+proximité géométrique brute (baseline centroïde = 0.32, inversée).
+
+**Implications pour le rapport de stage :**
+- La question "deux fragments vont-ils ensemble ?" est résoluble à AUC≈0.80 avec
+  features CNN et un MLP minimal (41k params).
+- Ce classifieur peut filtrer les paires incompatibles avant une estimation de pose
+  coûteuse (Prec@k≈0.70 → 70% des vrais voisins retrouvés dans le top-k).
+- L'approche reste partielle : on détecte la compatibilité mais pas la pose.
+  Combiner 4D (compatibilité) + 3A (matching) reste une piste ouverte.
+
+**Limites :**
+- P@k = 0 dans le JSON final = artefact du mode cache (par-fragment non stocké).
+  La vraie valeur (~0.70) vient du quick run (max_batches 50/100).
+- Modèle encore en hausse à epoch 40 → relancer `--epochs 80` sur le cache
+  (`--cache_file ...`) prend < 1 min.
+- AUC plafonne probablement vers 0.81-0.82 (la difficulté intrinsèque du problème).
+
 ## Phase 5 — Depth-map fracture-face matching (piste tuteur, 2026-06-28)
 
 **Motivation.** Les Phases 3A/4A/4B ont épuisé le matching point-à-point sur le
@@ -1383,7 +1435,7 @@ pire que le hasard, 80% de paires filtrées. Cause : faces Breaking Bad trop pla
 (médiane planéité=0.043) → signal depth-map quasi-nul → pas de complémentarité
 discriminante. Phase 5B annulée (conditionnait à 5A).
 
-**`scripts/phase4d_pair_compatibility.py` IMPLÉMENTÉ (2026-07-08).** Prochaine
-étape : lancer le run rapide sur le serveur pour vérifier que le pipeline tourne,
-puis run complet 40 epochs. Arbre de décision : AUC (thresh0.3) > baseline
-centroïde → signal réel ; AUC >> 0.5 → feature CNN discriminante de compatibilité.
+**Phase 4D CLOSE — POSITIF (2026-07-16).** AUC=0.797 (thresh0.3), AP=0.747,
+P@k≈0.70 (quick run). gt ≈ thresh0.3 (+0.4 pp). thresh0.3 > random (+4.3 pp AUC).
+Baseline centroïde AUC=0.32. Voir conclusion complète section Phase 4D ci-dessus.
+Toutes les phases closes. Rapport de stage : rédiger les résultats.
