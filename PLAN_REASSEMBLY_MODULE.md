@@ -1438,4 +1438,70 @@ discriminante. Phase 5B annulée (conditionnait à 5A).
 
 **Phase 4D CLOSE — POSITIF (2026-07-16).** AUC=0.798 (thresh0.3), AP=0.749,
 P@k=0.733 — best @ epoch 83/500. thresh0.3 > random (+17pp AUC à convergence).
-Toutes les phases closes. Rapport de stage : rédiger les résultats.
+
+## Phase 6 — Compatibility-guided pose refinement (cadrage, 2026-07-16)
+
+**Pourquoi.** Le diagnostic est maintenant net : segmentation OK (Step 15),
+compatibilité de paire OK (4D, AUC≈0.80), pose KO (3A/4A/4B/5A tous négatifs).
+Décision explicite du tuteur et de l'utilisateur : ne plus retenter une nouvelle
+variante du matching point-à-point (3e architecture, plus d'epochs...) — pivoter vers un
+**raffinement de pose en deux étages** (identifier les bonnes paires via 4D, puis
+raffiner une pose candidate localement) plutôt que ré-estimer la pose from scratch.
+
+**Risque identifié et acté avant de coder quoi que ce soit :** un P@k=0.733 sur 4D
+veut dire ~27% des vrais voisins manqués si on prend une décision dure top-k — sur
+un objet à 8-10 fragments, ça peut suffire à casser tout l'assemblage global (erreur
+de voisinage → mauvaise pose → contamination du reste). **4D doit donc être utilisé
+comme filtre souple à haut recall (candidate generator), jamais comme décision finale
+des voisins.**
+
+**Sous-phases, dans cet ordre strict (pas de refinement avant d'avoir la table
+Phase 6.0) :**
+- **Phase 6.0 — Recall@k sweep de 4D** (implémenté ci-dessous) : mesure si 4D peut
+  fournir une shortlist top-k/2k/3k/5k à haut recall, PAR FRAGMENT (pas sur les
+  paires mélangées comme le Prec@k de la 4D), stratifié par nombre de fragments de
+  l'objet (2 / 3-5 / 6-10 / 11+ — les objets à 2 fragments sont non-informatifs,
+  rapportés à part, jamais utilisés pour la décision).
+- **Phase 6A — Refinement oracle** (pas encore codé) : sur les vraies paires GT
+  uniquement, pose GT perturbée (5°/15°/30°/60° rotation + bruit translation),
+  objectif local (Chamfer symétrique fracture + opposition de normales + pénalité
+  de pénétration/overlap) → est-ce qu'on reconverge vers la pose GT ? Question :
+  "un objectif local peut-il améliorer une pose déjà proche ?", indépendamment de
+  4D — sert de borne haute avant de brancher quoi que ce soit dessus.
+- **Phase 6B — Pipeline réel** (seulement si 6.0 ET 6A passent) : 4D comme shortlist
+  large (pas top-k strict) → refinement local sur les candidats → score géométrique
+  + cohérence globale pour la décision finale. Explicitement PAS "4D choisit les
+  voisins puis on assemble greedily" (risque d'accumulation d'erreurs déjà identifié).
+
+**Critères de décision Phase 6.0 (objets 3+ fragments uniquement, stratégie
+thresh0.3 = condition réelle, gt = référence oracle) :**
+```
+Go  6A  si Recall@3k >= 90% OU Recall@5k >= 95%,
+        ET avg_kept_ratio@5k < ~0.8 (sinon le "haut recall" est trivial —
+        garder quasi tout le monde donne recall≈100% sans être une shortlist utile)
+No-go   si Recall@5k < 90%, ou si top-5k dégénère vers quasi tous les fragments
+```
+
+**Implémenté (2026-07-16) : `scripts/phase6_0_recall_sweep.py`.** Réutilise
+directement l'infrastructure 4D (`aggregate_fragment`, `PairCompatibilityMLP`,
+CNN Step 15 figé) — pas de ré-entraînement. Nécessite un checkpoint MLP sauvegardé :
+ajout de `--model_out` à `phase4d_pair_compatibility.py` (le script 4D original ne
+sauvegardait aucun poids, seulement un JSON de résultats — corrigé). Pour chaque
+fragment i d'un objet, classe tous les autres fragments du même objet par score MLP
+symétrique décroissant (même score que le Prec@k 4D, calculé une fois par paire non
+ordonnée), mesure si les n_pos vrais voisins GT sont dans le top n_pos/2·n_pos/
+3·n_pos/5·n_pos. Sortie : table par bucket de complexité (Recall@k/2k/3k/5k,
+kept_ratio@5k, n_frags) + verdict go/no-go automatique par stratégie.
+
+**Pas encore lancé sur le serveur.** Nécessite d'abord de relancer
+`phase4d_pair_compatibility.py` avec `--model_out` (le run 500-epochs du 2026-07-16
+n'a pas sauvegardé de checkpoint) pour obtenir un `mlp_ckpt` à charger.
+
+## Prochaine action concrète (mise à jour 2026-07-16)
+
+1. Relancer `phase4d_pair_compatibility.py` (mode cache déjà validé, ~1s/epoch)
+   avec `--model_out output/phase4d_mlp/best.pt` pour obtenir le checkpoint MLP.
+2. Lancer `scripts/phase6_0_recall_sweep.py --mlp_ckpt output/phase4d_mlp/best.pt
+   --strategies thresh0.3 gt --split val` sur le serveur.
+3. Lire la table par bucket + le verdict go/no-go avant d'écrire une seule ligne de
+   code de refinement (Phase 6A).

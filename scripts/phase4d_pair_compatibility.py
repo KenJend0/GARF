@@ -623,6 +623,10 @@ def main():
     parser.add_argument("--extract_only", action="store_true",
                         help="Extraire le cache et quitter sans entraîner.")
     parser.add_argument("--summary_json", default="")
+    parser.add_argument("--model_out", default="",
+                        help="Chemin .pt pour sauvegarder le state_dict du meilleur MLP "
+                             "(+ hidden_dim/dropout/pair_dim/best_epoch), pour réutilisation "
+                             "en aval (ex. Phase 6 recall sweep). Vide = pas de sauvegarde.")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -777,6 +781,19 @@ def main():
 
     print(f"\nRéférence baseline centroïde : AUC={base_res.get('auc','—'):.4f}  AP={base_res.get('ap','—'):.4f}")
     print("(AUC > baseline centroïde = signal appris réel ; AUC >> 0.5 = forte compatibilité)")
+
+    # ── Sauvegarde du modèle (pour réutilisation en aval, ex. Phase 6) ────────
+    if args.model_out and best_state is not None:
+        Path(args.model_out).parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "state_dict":   best_state,
+            "hidden_dim":   args.hidden_dim,
+            "dropout":      args.dropout,
+            "pair_dim":     PAIR_DIM,
+            "best_epoch":   best_epoch,
+            "best_auc_val": best_auc_val,
+        }, args.model_out)
+        print(f"Modèle MLP sauvegardé : {args.model_out}")
 
     # ── Export JSON ───────────────────────────────────────────────────────────
     if args.summary_json:
