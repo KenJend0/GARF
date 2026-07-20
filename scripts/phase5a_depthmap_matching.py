@@ -79,7 +79,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from scipy.ndimage import rotate as ndimage_rotate
+from scipy.ndimage import rotate as ndimage_rotate, binary_dilation
 from scipy.spatial.transform import Rotation as R_scipy
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -378,7 +378,7 @@ def planarity_stratification(planarity, rot_err, pose30, pose15):
 
 
 def oracle_overlap_frac(frac_i, c_j, u_j, v_j, valid_j, u_min_j, v_min_j,
-                         resolution, pixel_size, R_ij_gt, t_ij_gt):
+                         resolution, pixel_size, R_ij_gt, t_ij_gt, dilate_px=0):
     """Recouvrement des footprints à la VRAIE pose GT — aucune recherche, aucun score.
 
     Transforme les points fracture de i dans le repère de j via la vraie pose
@@ -393,6 +393,14 @@ def oracle_overlap_frac(frac_i, c_j, u_j, v_j, valid_j, u_min_j, v_min_j,
     loin de 1, le problème est en amont : la correspondance entre les DEUX
     masques de fracture (bruit d'échantillonnage, seuil CNN/GT), pas la
     recherche de pose.
+
+    `dilate_px` (diagnostic ajouté le 2026-07-20, piste 1 de la roadmap
+    Phase 7) : dilate les deux footprints de `dilate_px` pixels avant de
+    mesurer le recouvrement — teste si l'écart au plafond théorique (mesuré à
+    dilate_px=0, ~0.758 sur GT) vient simplement du bruit de discrétisation/
+    échantillonnage indépendant entre les deux faces (auquel cas dilater suffit
+    à faire remonter le plafond) ou d'une asymétrie plus profonde entre les
+    deux masques (auquel cas dilater n'aide pas beaucoup).
     """
     pts_i_in_j = (R_ij_gt @ frac_i.T).T + t_ij_gt
     pts_c = pts_i_in_j - c_j
@@ -405,8 +413,14 @@ def oracle_overlap_frac(frac_i, c_j, u_j, v_j, valid_j, u_min_j, v_min_j,
     pred_valid = np.zeros((resolution, resolution), dtype=bool)
     pred_valid[v_pix, u_pix] = True
 
-    overlap = int(np.logical_and(pred_valid, valid_j).sum())
-    denom = max(min(int(pred_valid.sum()), int(valid_j.sum())), 1)
+    valid_j_use = valid_j
+    if dilate_px > 0:
+        struct = np.ones((2 * dilate_px + 1, 2 * dilate_px + 1), dtype=bool)
+        pred_valid = binary_dilation(pred_valid, structure=struct)
+        valid_j_use = binary_dilation(valid_j, structure=struct)
+
+    overlap = int(np.logical_and(pred_valid, valid_j_use).sum())
+    denom = max(min(int(pred_valid.sum()), int(valid_j_use.sum())), 1)
     return float(overlap / denom)
 
 
@@ -467,6 +481,13 @@ def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, a
             frac_i, c_j, u_j, v_j, valid_j, u_min_j, v_min_j,
             args.resolution, pixel_size, R_ij_gt, t_ij_gt,
         )
+        oracle_ovlp_sweep = {
+            d: oracle_overlap_frac(
+                frac_i, c_j, u_j, v_j, valid_j, u_min_j, v_min_j,
+                args.resolution, pixel_size, R_ij_gt, t_ij_gt, dilate_px=d,
+            )
+            for d in args.dilate_sweep
+        }
 
         best_score, best_theta, best_shift, best_flip, best_overlap_frac = match_depthmaps(
             dmap_i, valid_i, dmap_j, valid_j, args.n_angles, score_mode=args.score_mode)
@@ -494,6 +515,7 @@ def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, a
             "best_flip":    bool(best_flip),
             "overlap_frac": float(best_overlap_frac),
             "oracle_overlap_frac": float(oracle_ovlp),
+            "oracle_overlap_frac_sweep": {str(d): float(v) for d, v in oracle_ovlp_sweep.items()},
             "n_corr":       len(pts_i3),
             "planarity":    (float(plan_i), float(plan_j)),
             "n_frac_pts":   (len(frac_i), len(frac_j)),
@@ -529,6 +551,14 @@ def main():
                              "faces jusqu'ici exclues matchent mieux ou moins bien — "
                              "cf. incohérence relevée le 2026-07-20 entre 'trop plat' et "
                              "'on exclut les plus courbées sans jamais les tester'.")
+    parser.add_argument("--dilate_sweep", type=int, nargs="+", default=[0, 1, 2, 3, 4],
+                        help="Rayons de dilatation (en pixels) testés pour "
+                             "oracle_overlap_frac (piste 1 de la roadmap Phase 7, "
+                             "2026-07-20) — mesure si le plafond théorique (~0.758 "
+                             "sur GT à dilate=0) remonte vers 1.0 en dilatant "
+                             "légèrement les footprints, ce qui indiquerait que "
+                             "l'écart est surtout du bruit de discrétisation/"
+                             "échantillonnage plutôt qu'une vraie asymétrie des masques.")
     parser.add_argument("--device",      default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--summary_json", default="")
     args = parser.parse_args()
@@ -646,6 +676,8 @@ def main():
                         accum[strat]["best_score"].append(res["best_score"])
                         accum[strat]["overlap_frac"].append(res["overlap_frac"])
                         accum[strat]["oracle_overlap_frac"].append(res["oracle_overlap_frac"])
+                        for d_str, v in res["oracle_overlap_frac_sweep"].items():
+                            accum[strat][f"oracle_ovlp_d{d_str}"].append(v)
                         accum[strat]["planarity"].append(float(np.mean(res["planarity"])))
 
     elapsed = time.time() - t0
@@ -730,6 +762,29 @@ def main():
           " correspondance entre masques de fracture, pas la recherche de pose. Si OvlpFrac\n"
           " (trouvé par la recherche) est nettement < OracleOvlp, c'est la recherche qui rate\n"
           " un alignement pourtant disponible dans les données.)")
+
+    # ── Sweep de dilatation : le plafond remonte-t-il en lissant les masques ? ──
+    print(f"\nSWEEP DILATATION (OracleOvlp moyen par rayon de dilatation, piste 1 Phase 7)")
+    dsweep_header = f"{'Strategy':<12}" + "".join(f"{'d='+str(d):>8}" for d in args.dilate_sweep)
+    print(dsweep_header)
+    print("-" * len(dsweep_header))
+    for strat in ("gt", "thresh0.3", "random"):
+        acc = accum[strat]
+        if not acc.get("rot_err"):
+            continue
+        row_vals = {}
+        row = f"{strat:<12}"
+        for d in args.dilate_sweep:
+            vals = acc.get(f"oracle_ovlp_d{d}", [])
+            m = float(np.mean(vals)) if vals else 0.0
+            row_vals[str(d)] = m
+            row += f"{m:>8.3f}"
+        print(row)
+        summary[strat]["oracle_ovlp_dilate_sweep"] = row_vals
+    print("(Lecture : si le plafond remonte nettement vers 1.0 dès d=1-2px, l'écart est\n"
+          " surtout du bruit de discrétisation/échantillonnage -- une densification légère\n"
+          " suffirait (piste 1). S'il stagne, c'est une asymétrie plus profonde entre les\n"
+          " deux masques, pas juste un problème de résolution de grille.)")
 
     if args.summary_json:
         Path(args.summary_json).parent.mkdir(parents=True, exist_ok=True)
