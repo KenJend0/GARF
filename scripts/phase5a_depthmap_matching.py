@@ -79,7 +79,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from scipy.ndimage import rotate as ndimage_rotate, binary_dilation
+from scipy.ndimage import rotate as ndimage_rotate, binary_dilation, gaussian_filter
 from scipy.spatial.transform import Rotation as R_scipy
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -102,6 +102,15 @@ DEFAULT_MAX_PLANARITY  = 0.15    # planéité PCA > seuil → face trop courbe �
                                   # au lieu de seulement stratifier ce qui est déjà gardé)
 MIN_OVERLAP_PIXELS     = 20      # correspondances 3D < N → skip Kabsch
 POSE_SUCCESS_THRESH    = [(30.0, 0.1), (15.0, 0.05)]
+
+# Seuil de masse (après flou gaussien du canal "count") au-delà duquel une case
+# est considérée "valid" en mode splat gaussien (piste 1, tentative 2 : après le
+# rejet de la dilatation binaire seule le 2026-07-20, cf. plan — la dilatation
+# gonfle le recouvrement de `random` presque autant que `gt`). Contrairement à
+# la dilatation, le splat gaussien pondère par la position réelle des points
+# plutôt que d'étendre aveuglément un masque déjà là. Valeur empirique, pas
+# encore calée finement — à ajuster si besoin après le premier sweep.
+GAUSSIAN_VALID_THRESH  = 0.2
 
 # Tranches de planéité pour la stratification post-hoc (bornes alignées sur les
 # percentiles du pré-check Phase 5A.0 : p25=0.016, p50=0.043, p75=0.098, p90=0.150 ;
@@ -171,23 +180,63 @@ def compute_pca_frame(pts: np.ndarray):
     return centroid, u, v, n, planarity
 
 
+def points_to_valid_mask(u_coords, v_coords, u_min, v_min, resolution, pixel_size,
+                          dilate_px: int = 0, gaussian_sigma_px: float = 0.0):
+    """Points (u,v) déjà projetés → masque `valid` (case couverte). Partagée
+    entre `rasterize()` et `oracle_overlap_frac()` pour traiter dilatation et
+    splat gaussien de façon strictement cohérente aux deux endroits.
+
+    `dilate_px` : dilatation binaire (piste 1, tentative 1 — REJETÉE le
+    2026-07-20 : gonfle `random` presque autant que `gt`, `Pose@30` n'en
+    profite pas). Conservée pour comparaison, pas recommandée par défaut.
+
+    `gaussian_sigma_px` : splat gaussien (piste 1, tentative 2) — au lieu
+    d'étendre aveuglément le masque, floute le canal "nombre de points par
+    case" avec un noyau gaussien, pondérant chaque case voisine par la
+    distance réelle aux points plutôt que de l'inclure en tout-ou-rien.
+    Une case devient `valid` si la masse gaussienne accumulée dépasse
+    `GAUSSIAN_VALID_THRESH`.
+    """
+    u_pix = np.clip(((u_coords - u_min) / pixel_size).astype(int), 0, resolution - 1)
+    v_pix = np.clip(((v_coords - v_min) / pixel_size).astype(int), 0, resolution - 1)
+
+    count = np.zeros((resolution, resolution), dtype=np.float64)
+    np.add.at(count, (v_pix, u_pix), 1.0)
+
+    if gaussian_sigma_px > 0:
+        count_smooth = gaussian_filter(count, sigma=gaussian_sigma_px, mode="constant")
+        valid = count_smooth > GAUSSIAN_VALID_THRESH
+    else:
+        valid = count > 0
+
+    if dilate_px > 0:
+        struct = np.ones((2 * dilate_px + 1, 2 * dilate_px + 1), dtype=bool)
+        valid = binary_dilation(valid, structure=struct)
+
+    return valid, u_pix, v_pix
+
+
 def rasterize(pts: np.ndarray, centroid, u, v, n, resolution: int, pixel_size: float,
-              dilate_px: int = 0):
+              dilate_px: int = 0, gaussian_sigma_px: float = 0.0):
     """Projette les points fracture en depth map 2D.
     depth = composante selon n depuis le centroïde.
     Retourne (dmap [R,R], valid [R,R bool], u_min, v_min).
 
-    `dilate_px` (piste 1 Phase 7, 2026-07-20) : dilate le masque `valid` de
-    `dilate_px` pixels après rasterisation, pour compenser le bruit
-    d'échantillonnage indépendant entre les deux faces d'une fracture
-    (cf. sweep de dilatation sur `oracle_overlap_frac` : d=1 fait remonter le
-    plafond GT de 0.757 à 0.992). Les cases nouvellement ajoutées gardent
-    depth=0 (valeur neutre, sur le plan ajusté) — pas de fausse valeur
-    fabriquée. ATTENTION (constaté le même jour) : `random` bénéficie presque
-    autant que `gt` de la dilatation — ce n'est probablement qu'un pansement
-    sur le bruit d'échantillonnage, pas une vraie correction de correspondance
-    ; à garder léger (d=1) et à valider sur `Pose@30` avant de le considérer
-    comme un vrai gain plutôt qu'un contournement.
+    `dilate_px` (piste 1 Phase 7, 2026-07-20, tentative 1 — REJETÉE) : dilate
+    le masque `valid` de `dilate_px` pixels après rasterisation. Fait
+    remonter `OracleOvlp` (0.757→0.992 à d=1 sur GT) mais `random` en
+    profite presque autant (0.430→0.830) et `Pose@30` n'en profite PAS
+    (18.28% vs 20.87% sans dilatation, mesuré le 2026-07-20) — un pansement
+    sur le bruit d'échantillonnage, pas une vraie correction de
+    correspondance. Conservée pour comparaison, désactivée par défaut.
+
+    `gaussian_sigma_px` (piste 1, tentative 2, 2026-07-20) : au lieu
+    d'étendre aveuglément le masque, floute `dmap` (canal profondeur, somme
+    pondérée) ET le canal "nombre de points" avec un noyau gaussien de même
+    sigma (flou correct d'une moyenne pondérée : flouter numérateur et
+    dénominateur séparément, puis diviser — pas flouter la moyenne déjà
+    calculée). Utilise la position réelle des points plutôt qu'un
+    remplissage tout-ou-rien.
     """
     pts_c = pts - centroid
     u_coords = pts_c @ u
@@ -200,13 +249,20 @@ def rasterize(pts: np.ndarray, centroid, u, v, n, resolution: int, pixel_size: f
     u_pix = np.clip(((u_coords - u_min) / pixel_size).astype(int), 0, resolution - 1)
     v_pix = np.clip(((v_coords - v_min) / pixel_size).astype(int), 0, resolution - 1)
 
-    dmap  = np.zeros((resolution, resolution), dtype=np.float64)
-    count = np.zeros((resolution, resolution), dtype=np.float64)
-    np.add.at(dmap,  (v_pix, u_pix), depths)
-    np.add.at(count, (v_pix, u_pix), 1.0)
+    dmap_sum = np.zeros((resolution, resolution), dtype=np.float64)
+    count    = np.zeros((resolution, resolution), dtype=np.float64)
+    np.add.at(dmap_sum, (v_pix, u_pix), depths)
+    np.add.at(count,    (v_pix, u_pix), 1.0)
 
-    valid = count > 0
-    dmap[valid] /= count[valid]
+    if gaussian_sigma_px > 0:
+        dmap_sum = gaussian_filter(dmap_sum, sigma=gaussian_sigma_px, mode="constant")
+        count    = gaussian_filter(count,    sigma=gaussian_sigma_px, mode="constant")
+        valid = count > GAUSSIAN_VALID_THRESH
+    else:
+        valid = count > 0
+
+    dmap = np.zeros((resolution, resolution), dtype=np.float64)
+    dmap[valid] = dmap_sum[valid] / count[valid]
 
     if dilate_px > 0:
         struct = np.ones((2 * dilate_px + 1, 2 * dilate_px + 1), dtype=bool)
@@ -446,13 +502,17 @@ def frac_pts_stratification(n_frac_pts, oracle_ovlp, rot_err, pose30, pose15):
     return rows
 
 
-def oracle_overlap_frac(frac_i, c_j, u_j, v_j, valid_j, u_min_j, v_min_j,
-                         resolution, pixel_size, R_ij_gt, t_ij_gt, dilate_px=0):
+def oracle_overlap_frac(frac_i, frac_j, c_j, u_j, v_j, u_min_j, v_min_j,
+                         resolution, pixel_size, R_ij_gt, t_ij_gt,
+                         dilate_px=0, gaussian_sigma_px=0.0):
     """Recouvrement des footprints à la VRAIE pose GT — aucune recherche, aucun score.
 
     Transforme les points fracture de i dans le repère de j via la vraie pose
     (R_ij_gt, t_ij_gt), les projette sur le plan (u_j, v_j) de j, et mesure la
-    fraction de cases qui coïncident avec le footprint réel de j (`valid_j`).
+    fraction de cases qui coïncident avec le footprint réel de j (reconstruit
+    à partir de `frac_j`, PAS d'un `valid_j` déjà calculé ailleurs — pour que
+    i et j soient traités par le MÊME `points_to_valid_mask()`, avec la même
+    dilatation/splat, une comparaison symétrique et cohérente).
 
     Plafond théorique de `overlap_frac` (cf. discussion 2026-07-20) : les deux
     faces d'une même fracture partagent le même contour par construction, donc
@@ -463,33 +523,27 @@ def oracle_overlap_frac(frac_i, c_j, u_j, v_j, valid_j, u_min_j, v_min_j,
     masques de fracture (bruit d'échantillonnage, seuil CNN/GT), pas la
     recherche de pose.
 
-    `dilate_px` (diagnostic ajouté le 2026-07-20, piste 1 de la roadmap
-    Phase 7) : dilate les deux footprints de `dilate_px` pixels avant de
-    mesurer le recouvrement — teste si l'écart au plafond théorique (mesuré à
-    dilate_px=0, ~0.758 sur GT) vient simplement du bruit de discrétisation/
-    échantillonnage indépendant entre les deux faces (auquel cas dilater suffit
-    à faire remonter le plafond) ou d'une asymétrie plus profonde entre les
-    deux masques (auquel cas dilater n'aide pas beaucoup).
+    `dilate_px` (piste 1, tentative 1 — REJETÉE le 2026-07-20) et
+    `gaussian_sigma_px` (piste 1, tentative 2) : voir `points_to_valid_mask()`.
     """
     pts_i_in_j = (R_ij_gt @ frac_i.T).T + t_ij_gt
-    pts_c = pts_i_in_j - c_j
-    u_coords = pts_c @ u_j
-    v_coords = pts_c @ v_j
+    pts_c_i = pts_i_in_j - c_j
+    u_coords_i = pts_c_i @ u_j
+    v_coords_i = pts_c_i @ v_j
 
-    u_pix = np.clip(((u_coords - u_min_j) / pixel_size).astype(int), 0, resolution - 1)
-    v_pix = np.clip(((v_coords - v_min_j) / pixel_size).astype(int), 0, resolution - 1)
+    pts_c_j = frac_j - c_j
+    u_coords_j = pts_c_j @ u_j
+    v_coords_j = pts_c_j @ v_j
 
-    pred_valid = np.zeros((resolution, resolution), dtype=bool)
-    pred_valid[v_pix, u_pix] = True
+    pred_valid, _, _ = points_to_valid_mask(
+        u_coords_i, v_coords_i, u_min_j, v_min_j, resolution, pixel_size,
+        dilate_px=dilate_px, gaussian_sigma_px=gaussian_sigma_px)
+    valid_j, _, _ = points_to_valid_mask(
+        u_coords_j, v_coords_j, u_min_j, v_min_j, resolution, pixel_size,
+        dilate_px=dilate_px, gaussian_sigma_px=gaussian_sigma_px)
 
-    valid_j_use = valid_j
-    if dilate_px > 0:
-        struct = np.ones((2 * dilate_px + 1, 2 * dilate_px + 1), dtype=bool)
-        pred_valid = binary_dilation(pred_valid, structure=struct)
-        valid_j_use = binary_dilation(valid_j, structure=struct)
-
-    overlap = int(np.logical_and(pred_valid, valid_j_use).sum())
-    denom = max(min(int(pred_valid.sum()), int(valid_j_use.sum())), 1)
+    overlap = int(np.logical_and(pred_valid, valid_j).sum())
+    denom = max(min(int(pred_valid.sum()), int(valid_j.sum())), 1)
     return float(overlap / denom)
 
 
@@ -537,9 +591,11 @@ def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, a
         pixel_size = max(span_i, span_j) * 1.1 / args.resolution
 
         dmap_i, valid_i, u_min_i, v_min_i = rasterize(
-            frac_i, c_i, u_i, v_i, n_i, args.resolution, pixel_size, dilate_px=args.dilate_px)
+            frac_i, c_i, u_i, v_i, n_i, args.resolution, pixel_size,
+            dilate_px=args.dilate_px, gaussian_sigma_px=args.gaussian_sigma_px)
         dmap_j, valid_j, u_min_j, v_min_j = rasterize(
-            frac_j, c_j, u_j, v_j, n_j, args.resolution, pixel_size, dilate_px=args.dilate_px)
+            frac_j, c_j, u_j, v_j, n_j, args.resolution, pixel_size,
+            dilate_px=args.dilate_px, gaussian_sigma_px=args.gaussian_sigma_px)
 
         n_pix_i, n_pix_j = int(valid_i.sum()), int(valid_j.sum())
         if n_pix_i < MIN_OVERLAP_PIXELS or n_pix_j < MIN_OVERLAP_PIXELS:
@@ -547,16 +603,20 @@ def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, a
             continue
 
         oracle_ovlp = oracle_overlap_frac(
-            frac_i, c_j, u_j, v_j, valid_j, u_min_j, v_min_j,
+            frac_i, frac_j, c_j, u_j, v_j, u_min_j, v_min_j,
             args.resolution, pixel_size, R_ij_gt, t_ij_gt,
         )
-        oracle_ovlp_sweep = {
-            d: oracle_overlap_frac(
-                frac_i, c_j, u_j, v_j, valid_j, u_min_j, v_min_j,
+        oracle_ovlp_sweep = {}
+        for d in args.dilate_sweep:
+            oracle_ovlp_sweep[f"d{d}"] = oracle_overlap_frac(
+                frac_i, frac_j, c_j, u_j, v_j, u_min_j, v_min_j,
                 args.resolution, pixel_size, R_ij_gt, t_ij_gt, dilate_px=d,
             )
-            for d in args.dilate_sweep
-        }
+        for g in args.gaussian_sweep:
+            oracle_ovlp_sweep[f"g{g}"] = oracle_overlap_frac(
+                frac_i, frac_j, c_j, u_j, v_j, u_min_j, v_min_j,
+                args.resolution, pixel_size, R_ij_gt, t_ij_gt, gaussian_sigma_px=g,
+            )
 
         best_score, best_theta, best_shift, best_flip, best_overlap_frac = match_depthmaps(
             dmap_i, valid_i, dmap_j, valid_j, args.n_angles, score_mode=args.score_mode)
@@ -584,7 +644,7 @@ def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, a
             "best_flip":    bool(best_flip),
             "overlap_frac": float(best_overlap_frac),
             "oracle_overlap_frac": float(oracle_ovlp),
-            "oracle_overlap_frac_sweep": {str(d): float(v) for d, v in oracle_ovlp_sweep.items()},
+            "oracle_overlap_frac_sweep": {k: float(v) for k, v in oracle_ovlp_sweep.items()},
             "n_corr":       len(pts_i3),
             "planarity":    (float(plan_i), float(plan_j)),
             "n_frac_pts":   (len(frac_i), len(frac_j)),
@@ -635,6 +695,20 @@ def main():
                              "légèrement les footprints, ce qui indiquerait que "
                              "l'écart est surtout du bruit de discrétisation/"
                              "échantillonnage plutôt qu'une vraie asymétrie des masques.")
+    parser.add_argument("--gaussian_sigma_px", type=float, default=0.0,
+                        help="Applique un splat gaussien (sigma en pixels) dans le "
+                             "pipeline réel (recherche + score), pas seulement le "
+                             "diagnostic oracle. Défaut 0.0 = comportement inchangé. "
+                             "Piste 1, tentative 2 (2026-07-20), après le rejet de la "
+                             "dilatation binaire seule (--dilate_px) qui gonflait "
+                             "random presque autant que gt.")
+    parser.add_argument("--gaussian_sweep", type=float, nargs="+",
+                        default=[0.0, 0.5, 1.0, 1.5, 2.0],
+                        help="Sigmas (en pixels) testés pour oracle_overlap_frac en "
+                             "mode splat gaussien (piste 1, tentative 2, 2026-07-20) — "
+                             "à comparer à --dilate_sweep : vérifier que l'écart gt vs "
+                             "random se maintient (contrairement à la dilatation, où "
+                             "il s'effondrait de 0.327 à 0.027 entre d=0 et d=4).")
     parser.add_argument("--device",      default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--summary_json", default="")
     args = parser.parse_args()
@@ -752,8 +826,8 @@ def main():
                         accum[strat]["best_score"].append(res["best_score"])
                         accum[strat]["overlap_frac"].append(res["overlap_frac"])
                         accum[strat]["oracle_overlap_frac"].append(res["oracle_overlap_frac"])
-                        for d_str, v in res["oracle_overlap_frac_sweep"].items():
-                            accum[strat][f"oracle_ovlp_d{d_str}"].append(v)
+                        for key, v in res["oracle_overlap_frac_sweep"].items():
+                            accum[strat][f"oracle_ovlp_{key}"].append(v)
                         accum[strat]["planarity"].append(float(np.mean(res["planarity"])))
                         accum[strat]["n_frac_pts"].append(float(np.mean(res["n_frac_pts"])))
 
@@ -894,6 +968,30 @@ def main():
           " surtout du bruit de discrétisation/échantillonnage -- une densification légère\n"
           " suffirait (piste 1). S'il stagne, c'est une asymétrie plus profonde entre les\n"
           " deux masques, pas juste un problème de résolution de grille.)")
+
+    # ── Sweep splat gaussien : piste 1, tentative 2, après le rejet de la
+    # dilatation binaire seule (2026-07-20) ────────────────────────────────────
+    print(f"\nSWEEP SPLAT GAUSSIEN (OracleOvlp moyen par sigma, piste 1 tentative 2)")
+    gsweep_header = f"{'Strategy':<12}" + "".join(f"{'σ='+str(g):>8}" for g in args.gaussian_sweep)
+    print(gsweep_header)
+    print("-" * len(gsweep_header))
+    for strat in ("gt", "thresh0.3", "random"):
+        acc = accum[strat]
+        if not acc.get("rot_err"):
+            continue
+        row_vals = {}
+        row = f"{strat:<12}"
+        for g in args.gaussian_sweep:
+            vals = acc.get(f"oracle_ovlp_g{g}", [])
+            m = float(np.mean(vals)) if vals else 0.0
+            row_vals[str(g)] = m
+            row += f"{m:>8.3f}"
+        print(row)
+        summary[strat]["oracle_ovlp_gaussian_sweep"] = row_vals
+    print("(Lecture : contrairement à la dilatation binaire, le splat gaussien pondère\n"
+          " par la distance réelle aux points -- garde-fou à vérifier : l'écart gt vs\n"
+          " random doit se maintenir ou grandir avec sigma, pas s'effondrer comme avec\n"
+          " la dilatation. S'il s'effondre pareil, le splat a le même défaut.)")
 
     if args.summary_json:
         Path(args.summary_json).parent.mkdir(parents=True, exist_ok=True)
