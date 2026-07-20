@@ -159,10 +159,24 @@ def compute_pca_frame(pts: np.ndarray):
     return centroid, u, v, n, planarity
 
 
-def rasterize(pts: np.ndarray, centroid, u, v, n, resolution: int, pixel_size: float):
+def rasterize(pts: np.ndarray, centroid, u, v, n, resolution: int, pixel_size: float,
+              dilate_px: int = 0):
     """Projette les points fracture en depth map 2D.
     depth = composante selon n depuis le centroïde.
-    Retourne (dmap [R,R], valid [R,R bool], u_min, v_min)."""
+    Retourne (dmap [R,R], valid [R,R bool], u_min, v_min).
+
+    `dilate_px` (piste 1 Phase 7, 2026-07-20) : dilate le masque `valid` de
+    `dilate_px` pixels après rasterisation, pour compenser le bruit
+    d'échantillonnage indépendant entre les deux faces d'une fracture
+    (cf. sweep de dilatation sur `oracle_overlap_frac` : d=1 fait remonter le
+    plafond GT de 0.757 à 0.992). Les cases nouvellement ajoutées gardent
+    depth=0 (valeur neutre, sur le plan ajusté) — pas de fausse valeur
+    fabriquée. ATTENTION (constaté le même jour) : `random` bénéficie presque
+    autant que `gt` de la dilatation — ce n'est probablement qu'un pansement
+    sur le bruit d'échantillonnage, pas une vraie correction de correspondance
+    ; à garder léger (d=1) et à valider sur `Pose@30` avant de le considérer
+    comme un vrai gain plutôt qu'un contournement.
+    """
     pts_c = pts - centroid
     u_coords = pts_c @ u
     v_coords = pts_c @ v
@@ -181,6 +195,11 @@ def rasterize(pts: np.ndarray, centroid, u, v, n, resolution: int, pixel_size: f
 
     valid = count > 0
     dmap[valid] /= count[valid]
+
+    if dilate_px > 0:
+        struct = np.ones((2 * dilate_px + 1, 2 * dilate_px + 1), dtype=bool)
+        valid = binary_dilation(valid, structure=struct)
+
     return dmap, valid, u_min, v_min
 
 
@@ -468,9 +487,9 @@ def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, a
         pixel_size = max(span_i, span_j) * 1.1 / args.resolution
 
         dmap_i, valid_i, u_min_i, v_min_i = rasterize(
-            frac_i, c_i, u_i, v_i, n_i, args.resolution, pixel_size)
+            frac_i, c_i, u_i, v_i, n_i, args.resolution, pixel_size, dilate_px=args.dilate_px)
         dmap_j, valid_j, u_min_j, v_min_j = rasterize(
-            frac_j, c_j, u_j, v_j, n_j, args.resolution, pixel_size)
+            frac_j, c_j, u_j, v_j, n_j, args.resolution, pixel_size, dilate_px=args.dilate_px)
 
         n_pix_i, n_pix_j = int(valid_i.sum()), int(valid_j.sum())
         if n_pix_i < MIN_OVERLAP_PIXELS or n_pix_j < MIN_OVERLAP_PIXELS:
@@ -551,6 +570,13 @@ def main():
                              "faces jusqu'ici exclues matchent mieux ou moins bien — "
                              "cf. incohérence relevée le 2026-07-20 entre 'trop plat' et "
                              "'on exclut les plus courbées sans jamais les tester'.")
+    parser.add_argument("--dilate_px", type=int, default=0,
+                        help="Dilate le masque `valid` de N pixels dans le pipeline réel "
+                             "(recherche + score), pas seulement le diagnostic oracle. "
+                             "Défaut 0 = comportement inchangé. À tester avec 1 d'abord "
+                             "(cf. sweep du 2026-07-20 : d=1 fait remonter OracleOvlp gt "
+                             "de 0.757 à 0.992, mais random en profite presque autant — "
+                             "probablement un pansement, pas une vraie correction).")
     parser.add_argument("--dilate_sweep", type=int, nargs="+", default=[0, 1, 2, 3, 4],
                         help="Rayons de dilatation (en pixels) testés pour "
                              "oracle_overlap_frac (piste 1 de la roadmap Phase 7, "
