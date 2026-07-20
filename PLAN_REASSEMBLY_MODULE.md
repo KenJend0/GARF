@@ -1629,20 +1629,99 @@ matching par relief fonctionne bien.
   (Phase 2D/2B) reviendrait donc immédiatement sur ce dataset, contrairement à
   Breaking Bad filtré à 2 fragments.
 
+### Diagnostics post-réouverture (2026-07-20, avant tout code d'amélioration)
+
+Deux diagnostics ajoutés à `phase5a_depthmap_matching.py` pour trancher entre
+plusieurs causes possibles avant d'investir dans les 5 pistes d'amélioration —
+esprit habituel du projet (diagnostic avant grosse implémentation).
+
+**Diagnostic A — Stratification par planéité (`--max_planarity 0.333`, N=2415,
+`joint`, GT) : l'hypothèse du tuteur ("plus de courbure aiderait") est
+CONTREDITE, pas confirmée.**
+
+```
+Bin          N    RotErr°  Pose@30   Pose@15
+<0.02        23     93.73   26.09%    21.74%
+0.02-0.05    69     85.52   34.78%    17.39%
+0.05-0.10   225     92.37   28.44%    15.11%
+0.10-0.15   211    101.32   24.17%     9.95%
+0.15-0.20   121     94.68   24.79%    10.74%
+0.20+        59    116.45   10.17%     3.39%
+```
+
+`Pose@15` (critère strict) baisse quasiment de façon monotone en s'éloignant de
+la platitude : 21.74%→17.39%→15.11%→9.95%→10.74%→**3.39%**. `random` reste à 0%
+dans toutes les tranches (pas un artefact d'évaluation). **Plus une face est
+courbée, moins bon est le résultat — l'inverse de ce qui était attendu.**
+Explication retenue : la méthode entière (PCA + plan unique + rasterisation)
+suppose une face quasi-plane ; quand la courbure augmente, cette hypothèse se
+dégrade et ce qui ressemble à "plus de relief" est probablement du bruit de
+projection PCA, pas un vrai signal de complémentarité exploitable. **Conclusion :
+chercher des faces plus courbées ne suffira pas avec la représentation
+actuelle (PCA + plan unique) — il faudrait une représentation qui gère mieux
+la non-planéité** (ex. paramétrisation par self-organizing map, cf. discussion
+du 2026-07-20, plutôt que la PCA classique).
+
+**Diagnostic B — `oracle_overlap_frac` (recouvrement à la VRAIE pose GT, sans
+recherche) : le vrai goulot est en amont, pas dans la recherche.**
+
+```
+Strategy    OvlpFrac (trouvé)   OracleOvlp (plafond théorique)   Ratio
+gt                0.659                    0.758                 87%
+thresh0.3         0.624                    0.722                 86%
+random            0.764                    0.493                  —  (recherche gagne un mauvais recouvrement à une pose fausse)
+```
+
+Deux faces d'une même fracture partagent le même contour par construction —
+l'overlap DEVRAIT tendre vers 1 à la vraie pose. Il plafonne à **0.758**, pas 1.0
+— ~24% du plus petit contour ne correspond jamais, même dans le meilleur des
+cas (bruit d'échantillonnage indépendant entre les deux faces, seuil GT/CNN
+pas parfaitement symétrique). La recherche, elle, atteint déjà ~87% de ce
+plafond — **améliorer l'algorithme de recherche a un potentiel limité tant que
+le plafond lui-même (la correspondance entre masques) n'est pas amélioré.**
+
+Sur `random` : la recherche trouve un BON recouvrement (0.764) à une pose
+FAUSSE (RotErr≈132°) — confirme que le recouvrement seul peut être trompé par
+la silhouette générale du fragment, pas seulement par la fracture spécifique.
+Argument supplémentaire pour ne jamais utiliser `overlap_only` seul en
+production, cohérent avec le choix de `joint` comme défaut.
+
+### Roadmap des améliorations, priorisée par les diagnostics ci-dessus (2026-07-20)
+
+| # | Piste | Justification (diagnostic) | Lien avec les 5 pistes du tuteur |
+|---|---|---|---|
+| 1 | Densifier/lisser les masques de fracture (interpolation, seuil plus cohérent entre les 2 côtés) | Diagnostic B : le plafond réel est 0.758, pas 1.0 — le levier avec le plus de marge | "Extrapolation si trop plat" |
+| 2 | Stratifier aussi par `n_frac_pts` (déjà loggé, pas encore agrégé) | Vérifier si la sparsité (p25=56 pts) explique une partie du plafond à 0.758 | Prépare la piste 3 |
+| 3 | Résolution adaptative à la densité + fenêtre glissante (grille plus petite pour fragments épars) | Découle de la discussion du 2026-07-20 sur la taille fixe des depth maps | "Plus de résolution(s)" + "sliding de fenêtre" |
+| 4 | Représentation non-planaire pour les faces courbées (ex. SOM au lieu de PCA+plan unique) | Diagnostic A : la courbure nuit avec la représentation actuelle | Nouvelle piste, cohérente avec la conviction du tuteur mais pas dans sa liste initiale |
+| 5 | Plus de features par pixel (normales, features CNN Step15) | Peu risqué, mais n'attaque pas le vrai goulot (le plafond de correspondance) | "Plus de features" |
+| 6 | Modèle appris sur les depth maps | Le plus ambitieux — plafonné par le même problème amont tant qu'il n'est pas résolu | "Modèle appris" |
+
+**Ordre recommandé : 1 et 2 d'abord** (diagnostics/améliorations peu coûteux qui
+attaquent directement le goulot identifié), **puis 3-6** (plus de travail
+d'implémentation, gain potentiellement plafonné par le même problème amont
+sinon).
+
 **Prochaine action concrète, dans l'ordre (diagnostic avant grosse implémentation) :**
-1. Télécharger un objet simple du dataset TU Wien (Brick ou Venus, peu de
+1. Stratifier par `n_frac_pts` (piste 2 ci-dessus) — même logique que la
+   stratification planéité, données déjà loggées.
+2. Prototyper une densification/interpolation légère des masques de fracture
+   (piste 1) et remesurer `OracleOvlp` — objectif : voir si le plafond 0.758
+   peut monter avant de toucher à quoi que ce soit d'autre.
+3. Télécharger un objet simple du dataset TU Wien (Brick ou Venus, peu de
    fragments) et vérifier concrètement s'il existe une pose GT exploitable
    (dans les fichiers, une éventuelle publication associée, ou à défaut aucune
    — auquel cas définir un protocole d'évaluation qualitatif/manuel).
-2. Mesurer la planéité des faces de fracture sur ce dataset (réutiliser le
-   script de la Phase 5A.0) — vérifie l'hypothèse du tuteur (surfaces plus
-   irrégulières) avant d'investir dans les 5 pistes d'amélioration ci-dessus.
-3. Tester le CNN Step 15 en zero-shot sur ce dataset (comme le split `artifact`
+4. Mesurer la planéité des faces de fracture sur ce dataset (réutiliser le
+   script de la Phase 5A.0) — vérifie si les surfaces réelles sont
+   effectivement plus irrégulières que Breaking Bad, sachant maintenant que
+   plus de courbure n'aide pas avec la représentation PCA actuelle (diagnostic
+   A) — donc ce test doit être lu comme "combien de faces seraient hors de la
+   plage exploitable actuelle", pas comme validation directe de l'hypothèse
+   du tuteur.
+5. Tester le CNN Step 15 en zero-shot sur ce dataset (comme le split `artifact`
    du projet) — pas de garantie de transfert, format de points/normales
    probablement différent de Breaking Bad.
-4. Cadrer et prioriser les 5 pistes d'amélioration une par une — probablement
-   résolution + features en premier (moins ambigu que sliding window et
-   extrapolation, qui ont encore un `(?)` dans leur définition même).
 
 ## Métriques d'évaluation déjà disponibles (ne pas réécrire)
 
