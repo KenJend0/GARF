@@ -95,17 +95,22 @@ from torch.utils.data import DataLoader
 DEFAULT_RESOLUTION     = 64      # taille de la depth map (RESOLUTION × RESOLUTION px)
 DEFAULT_N_ANGLES       = 36      # sweep rotation : 360/36 = 10° par pas
 MIN_FRAC_POINTS        = 50      # moins de N pts fracture → skip (PCA bruitée)
-MAX_PLANARITY          = 0.15    # planéité PCA > seuil → face trop courbe → skip
+DEFAULT_MAX_PLANARITY  = 0.15    # planéité PCA > seuil → face trop courbe → skip
+                                  # (overridable via --max_planarity ; 0.333 = isotrope,
+                                  # borne théorique haute — cf. discussion 2026-07-20 :
+                                  # augmenter le seuil teste les faces jusqu'ici exclues,
+                                  # au lieu de seulement stratifier ce qui est déjà gardé)
 MIN_OVERLAP_PIXELS     = 20      # correspondances 3D < N → skip Kabsch
 POSE_SUCCESS_THRESH    = [(30.0, 0.1), (15.0, 0.05)]
 
 # Tranches de planéité pour la stratification post-hoc (bornes alignées sur les
-# percentiles du pré-check Phase 5A.0 : p25=0.016, p50=0.043, p75=0.098, p90=0.150).
-# Sert à vérifier si "moins plat" corrèle vraiment avec un meilleur matching parmi
-# les paires GARDÉES (pas juste à exclure les plus courbées via MAX_PLANARITY et
-# conclure "trop plat" sans jamais avoir testé le sens inverse de la corrélation).
-PLANARITY_BINS = [0.0, 0.02, 0.05, 0.10, MAX_PLANARITY + 1e-9]
-PLANARITY_LABELS = ["<0.02", "0.02-0.05", "0.05-0.10", f"0.10-{MAX_PLANARITY}"]
+# percentiles du pré-check Phase 5A.0 : p25=0.016, p50=0.043, p75=0.098, p90=0.150 ;
+# étendues jusqu'à 0.333 = isotrope, indépendamment du seuil --max_planarity utilisé,
+# pour rester comparables d'un run à l'autre même si le seuil change). Sert à
+# vérifier si "moins plat" corrèle vraiment avec un meilleur matching, plutôt que de
+# le supposer en excluant simplement les faces les plus courbées.
+PLANARITY_BINS = [0.0, 0.02, 0.05, 0.10, 0.15, 0.20, 0.334]
+PLANARITY_LABELS = ["<0.02", "0.02-0.05", "0.05-0.10", "0.10-0.15", "0.15-0.20", "0.20+"]
 
 
 # ── Géométrie ─────────────────────────────────────────────────────────────────
@@ -395,7 +400,7 @@ def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, a
         c_i, u_i, v_i, n_i, plan_i = compute_pca_frame(frac_i)
         c_j, u_j, v_j, n_j, plan_j = compute_pca_frame(frac_j)
 
-        if plan_i > MAX_PLANARITY or plan_j > MAX_PLANARITY:
+        if plan_i > args.max_planarity or plan_j > args.max_planarity:
             results[strat] = {"skip": "too_curved",
                               "planarity": (float(plan_i), float(plan_j))}
             continue
@@ -478,6 +483,13 @@ def main():
                         help="relief = formule d'origine (buggée, garde-fou overlap>0.5px) ; "
                              "overlap_only = contour seul, sans relief (teste l'hypothèse "
                              "contour-suffit) ; joint = fix, relief_score * overlap_frac.")
+    parser.add_argument("--max_planarity", type=float, default=DEFAULT_MAX_PLANARITY,
+                        help="Seuil de planéité au-delà duquel une face est jugée "
+                             "trop courbe et la paire skippée (défaut 0.15). Augmenter "
+                             "(ex. 0.333 = isotrope, borne théorique) pour tester si les "
+                             "faces jusqu'ici exclues matchent mieux ou moins bien — "
+                             "cf. incohérence relevée le 2026-07-20 entre 'trop plat' et "
+                             "'on exclut les plus courbées sans jamais les tester'.")
     parser.add_argument("--device",      default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--summary_json", default="")
     args = parser.parse_args()
