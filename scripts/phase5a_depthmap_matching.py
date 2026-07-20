@@ -377,6 +377,39 @@ def planarity_stratification(planarity, rot_err, pose30, pose15):
     return rows
 
 
+def oracle_overlap_frac(frac_i, c_j, u_j, v_j, valid_j, u_min_j, v_min_j,
+                         resolution, pixel_size, R_ij_gt, t_ij_gt):
+    """Recouvrement des footprints à la VRAIE pose GT — aucune recherche, aucun score.
+
+    Transforme les points fracture de i dans le repère de j via la vraie pose
+    (R_ij_gt, t_ij_gt), les projette sur le plan (u_j, v_j) de j, et mesure la
+    fraction de cases qui coïncident avec le footprint réel de j (`valid_j`).
+
+    Plafond théorique de `overlap_frac` (cf. discussion 2026-07-20) : les deux
+    faces d'une même fracture partagent le même contour par construction, donc
+    à la vraie pose l'overlap DEVRAIT tendre vers 1. Si le meilleur overlap
+    trouvé par la recherche (`match_depthmaps`) est loin de ce plafond, le
+    problème est la recherche (pose/score). Si le plafond lui-même est déjà
+    loin de 1, le problème est en amont : la correspondance entre les DEUX
+    masques de fracture (bruit d'échantillonnage, seuil CNN/GT), pas la
+    recherche de pose.
+    """
+    pts_i_in_j = (R_ij_gt @ frac_i.T).T + t_ij_gt
+    pts_c = pts_i_in_j - c_j
+    u_coords = pts_c @ u_j
+    v_coords = pts_c @ v_j
+
+    u_pix = np.clip(((u_coords - u_min_j) / pixel_size).astype(int), 0, resolution - 1)
+    v_pix = np.clip(((v_coords - v_min_j) / pixel_size).astype(int), 0, resolution - 1)
+
+    pred_valid = np.zeros((resolution, resolution), dtype=bool)
+    pred_valid[v_pix, u_pix] = True
+
+    overlap = int(np.logical_and(pred_valid, valid_j).sum())
+    denom = max(min(int(pred_valid.sum()), int(valid_j.sum())), 1)
+    return float(overlap / denom)
+
+
 def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, args, rng):
     """Traite une paire dirigée i→j. Retourne un dict de résultats par stratégie."""
     results = {}
@@ -430,6 +463,11 @@ def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, a
             results[strat] = {"skip": "sparse_dmap", "n_pix": (n_pix_i, n_pix_j)}
             continue
 
+        oracle_ovlp = oracle_overlap_frac(
+            frac_i, c_j, u_j, v_j, valid_j, u_min_j, v_min_j,
+            args.resolution, pixel_size, R_ij_gt, t_ij_gt,
+        )
+
         best_score, best_theta, best_shift, best_flip, best_overlap_frac = match_depthmaps(
             dmap_i, valid_i, dmap_j, valid_j, args.n_angles, score_mode=args.score_mode)
 
@@ -455,6 +493,7 @@ def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, a
             "best_theta":   float(best_theta),
             "best_flip":    bool(best_flip),
             "overlap_frac": float(best_overlap_frac),
+            "oracle_overlap_frac": float(oracle_ovlp),
             "n_corr":       len(pts_i3),
             "planarity":    (float(plan_i), float(plan_j)),
             "n_frac_pts":   (len(frac_i), len(frac_j)),
@@ -606,6 +645,7 @@ def main():
                         accum[strat]["n_corr"].append(res["n_corr"])
                         accum[strat]["best_score"].append(res["best_score"])
                         accum[strat]["overlap_frac"].append(res["overlap_frac"])
+                        accum[strat]["oracle_overlap_frac"].append(res["oracle_overlap_frac"])
                         accum[strat]["planarity"].append(float(np.mean(res["planarity"])))
 
     elapsed = time.time() - t0
@@ -614,7 +654,7 @@ def main():
 
     # ── Résumé tabulaire ──────────────────────────────────────────────────────
     header = (f"{'Strategy':<12} {'N':>6} {'Skip':>6} {'RotErr°':>8} "
-              f"{'TransErr':>9} {'Pose@30/0.1':>11} {'Pose@15/0.05':>12} {'N_corr':>7} {'OvlpFrac':>8}")
+              f"{'TransErr':>9} {'Pose@30/0.1':>11} {'Pose@15/0.05':>12} {'N_corr':>7} {'OvlpFrac':>8} {'OracleOvlp':>10}")
     print(header)
     print("-" * len(header))
 
@@ -637,9 +677,10 @@ def main():
         p15      = 100.0 * float(np.mean(acc.get("pose_15deg_0.05", [0])))
         nc_mean  = float(np.mean(acc["n_corr"]))
         ov_mean  = float(np.mean(acc.get("overlap_frac", [0])))
+        oo_mean  = float(np.mean(acc.get("oracle_overlap_frac", [0])))
 
         print(f"{strat:<12} {n_ok:>6} {n_skip:>6} {re_mean:>8.2f} "
-              f"{te_mean:>9.4f} {p30:>10.2f}% {p15:>11.2f}% {nc_mean:>7.1f} {ov_mean:>8.3f}")
+              f"{te_mean:>9.4f} {p30:>10.2f}% {p15:>11.2f}% {nc_mean:>7.1f} {ov_mean:>8.3f} {oo_mean:>10.3f}")
 
         summary[strat] = {
             "n_ok": n_ok, "n_skip": n_skip,
@@ -650,6 +691,7 @@ def main():
             "pose_15deg_0.05": p15,
             "n_corr_mean": nc_mean,
             "overlap_frac_mean": ov_mean,
+            "oracle_overlap_frac_mean": oo_mean,
         }
 
     # ── Stratification par planéité : "moins plat" corrèle-t-il avec un
@@ -683,6 +725,11 @@ def main():
     print(f"\nRéférence Phase 2 global : Pose@30 ≈ 1.3-3.2%  |  gt_edge oracle : Pose@30 ≈ 9.6%")
     print(f"score_mode={args.score_mode}  "
           f"(relief=formule d'origine buggée, overlap_only=contour seul, joint=fix)")
+    print("(OracleOvlp = recouvrement des footprints à la VRAIE pose GT, sans recherche —\n"
+          " plafond théorique de OvlpFrac. Si OracleOvlp << 1, le facteur limitant est la\n"
+          " correspondance entre masques de fracture, pas la recherche de pose. Si OvlpFrac\n"
+          " (trouvé par la recherche) est nettement < OracleOvlp, c'est la recherche qui rate\n"
+          " un alignement pourtant disponible dans les données.)")
 
     if args.summary_json:
         Path(args.summary_json).parent.mkdir(parents=True, exist_ok=True)
