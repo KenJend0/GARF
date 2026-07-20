@@ -1402,6 +1402,48 @@ les fragments se cassent selon des plans, pas des surfaces texturées.
 
 ---
 
+### Réouverture partielle (2026-07-20) — défaut identifié dans la formule de score
+
+En préparant une présentation orale sur ce mail, remise en cause a posteriori de la
+conclusion "négatif, définitif" : le score `-CC/overlap` utilisé dans `match_depthmaps()`
+divise par le recouvrement au lieu de le récompenser, avec un garde-fou quasiment
+inexistant (`overlap > 0.5 PIXEL`). Or `overlap` est déjà calculé, via FFT, pour
+CHAQUE décalage testé — c'est la forme du contour de la zone de fracture qui coïncide
+à ce décalage précis, une info de contour indépendante du relief. À faible
+recouvrement, diviser par un dénominateur minuscule peut gonfler artificiellement le
+score, ce qui est cohérent avec le biais observé (convergence systématique vers
+~180°, cf. conclusion Phase 5A ci-dessus) — un artefact numérique plutôt qu'un vrai
+optimum.
+
+**Hypothèse non testée jusqu'ici, en particulier pertinente à 2 fragments :** les deux
+faces d'une même fracture partagent exactement le même contour — cette forme seule
+(sans aucun relief) pourrait suffire à fixer la rotation, même sur des faces
+parfaitement plates.
+
+**Corrigé dans `scripts/phase5a_depthmap_matching.py` (2026-07-20) :** nouveau
+paramètre `--score_mode {relief, overlap_only, joint}` sur `match_depthmaps()` :
+- `relief` : formule d'origine (buggée), conservée pour comparaison directe.
+- `overlap_only` : score = fraction de recouvrement du contour SEULE (`overlap_frac`,
+  normalisé par `min(n_valid_i, n_valid_j_rot)`), sans aucun relief — teste
+  isolément l'hypothèse "le contour suffit".
+- `joint` (nouveau défaut) : `score = relief_score * overlap_frac` — pénalité
+  continue, sans seuil arbitraire à caler : un bon score de relief à recouvrement
+  quasi nul est ramené vers 0 au lieu d'exploser par division ; un bon recouvrement
+  sans complémentarité de relief ne suffit pas non plus à gagner seul.
+
+`overlap_frac` à la meilleure hypothèse est maintenant loggé dans les résultats
+(`results[strat]["overlap_frac"]`) et le résumé (`OvlpFrac` dans le tableau,
+`overlap_frac_mean` dans le JSON) pour diagnostiquer sans devoir tout relancer.
+
+**Pas encore relancé sur le serveur.** Commande de comparaison des 3 modes (quick
+run, 50 batches) documentée dans le docstring du script. Si `overlap_only` ou
+`joint` fait significativement mieux que `relief` sur `gt`/`gt_edge`-like conditions,
+la conclusion "Phase 5A négatif, définitif" doit être révisée en "négatif avec la
+formule d'origine seulement" — **la présentation orale du 2026-07-20 reflète déjà
+cette nuance** (verdict "not fully conclusive" plutôt que "closed").
+
+---
+
 ### Phase 5B (si 5A marche) — Extension 3–5 fragments
 
 **Annulée.** Phase 5A négative — voir conclusion ci-dessus.
@@ -1493,15 +1535,51 @@ ordonnée), mesure si les n_pos vrais voisins GT sont dans le top n_pos/2·n_pos
 3·n_pos/5·n_pos. Sortie : table par bucket de complexité (Recall@k/2k/3k/5k,
 kept_ratio@5k, n_frags) + verdict go/no-go automatique par stratégie.
 
-**Pas encore lancé sur le serveur.** Nécessite d'abord de relancer
-`phase4d_pair_compatibility.py` avec `--model_out` (le run 500-epochs du 2026-07-16
-n'a pas sauvegardé de checkpoint) pour obtenir un `mlp_ckpt` à charger.
+### Conclusion Phase 6.0 — NO-GO (2026-07-16)
+
+**Run :** `everyday/val`, `mlp_ckpt` best_epoch=83 (AUC=0.798), stratégies
+`thresh0.3` et `gt`.
+
+```
+Stratégie thresh0.3 :
+Group           Recall@k  Recall@2k  Recall@3k  Recall@5k  KeptRatio@5k  N_frags
+2                  100.0%     100.0%     100.0%     100.0%        100.0%     7426
+3-5                 85.0%      98.4%      99.7%     100.0%         99.1%     8926
+6-10                58.3%      86.7%      96.2%      99.5%         97.4%     6659
+11+                 45.8%      70.6%      83.8%      94.5%         82.9%     9497
+All multi (3+)      63.1%      84.8%      92.8%      97.8%         92.5%    25082
+
+Stratégie gt : quasi identique (63e décimale près) sur tous les buckets.
+```
+
+**Lecture (pas le verdict brut du script, qui confond deux effets différents) :**
+
+Le `kept_ratio@5k` proche de 100% sur 3-5/6-10 est un **artefact du multiplicateur
+×5**, pas une dégénérescence du classifieur : dès que l'objet a peu de fragments,
+`5×n_pos` (5× le degré GT) dépasse `n_other`, donc "garder le top-5k" revient
+mécaniquement à garder presque tout l'objet, quelle que soit la qualité du score —
+ces buckets ne sont pas informatifs pour juger 4D comme filtre.
+
+**Le seul bucket réellement discriminant est 11+ fragments — celui où un filtre
+serait le plus utile** (objets complexes, exactement la préoccupation soulevée dès
+la Phase 1 : "le recall peut s'effondrer sur les objets complexes"). Résultat :
+`Recall@3k=83.8%` (sous le seuil 90%), `Recall@5k=94.5%` (juste sous 95%),
+`KeptRatio@5k=82.9%` (il faut garder ~83% des candidats pour atteindre ce recall —
+filtrage réel mais modeste). `gt≈thresh0.3` confirme une nouvelle fois que le CNN
+n'est pas en cause — c'est le MLP de compatibilité qui plafonne sur les objets
+complexes.
+
+**Verdict (critère strict acté avant le run) : NO-GO.** 83.8%/94.5% sur 11+ ne
+passe pas les seuils 90%/95%. 4D reste un résultat de stage solide en tant que tel
+(compatibilité de paire, AUC≈0.80) mais **ne peut pas servir de shortlist à haut
+recall pour guider un refinement de pose sur les objets complexes** — décision
+prise pour éviter d'empiler les erreurs (voir mise en garde du tuteur, Phase 6
+cadrage). **Phase 6.0 close. Phase 6A/6B non lancées, branche fermée.**
 
 ## Prochaine action concrète (mise à jour 2026-07-16)
 
-1. Relancer `phase4d_pair_compatibility.py` (mode cache déjà validé, ~1s/epoch)
-   avec `--model_out output/phase4d_mlp/best.pt` pour obtenir le checkpoint MLP.
-2. Lancer `scripts/phase6_0_recall_sweep.py --mlp_ckpt output/phase4d_mlp/best.pt
-   --strategies thresh0.3 gt --split val` sur le serveur.
-3. Lire la table par bucket + le verdict go/no-go avant d'écrire une seule ligne de
-   code de refinement (Phase 6A).
+Toutes les phases de matching/filtrage sont closes (0/1/2/3A/4A/4B/4D/5A/6.0).
+4D (compatibilité fragment-fragment, AUC≈0.80) reste le résultat positif principal
+du volet réassemblage. Rédaction du rapport de stage sur cette base — synthèse des
+conclusions par phase déjà écrite dans ce fichier, pas besoin de code supplémentaire
+sauf nouvelle direction explicitement décidée avec le tuteur.

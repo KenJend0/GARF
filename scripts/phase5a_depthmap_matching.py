@@ -16,7 +16,11 @@ Pipeline par paire (i=fragment0, j=fragment1) :
   3. PCA sur les points fracture → repère local (u, v, n) + centroïde
   4. Rasterization en depth map 2D (grille RESOLUTION×RESOLUTION, taille physique commune)
   5. Sweep rotation [0°, 360°, pas 360/N_ANGLES] × FFT translation (complémentarité)
-     Score = -CC(depth_i, depth_j_rot) / overlap (maximiser : depth_i ≈ -depth_j_rot)
+     Score (--score_mode, défaut "joint") = relief_score * overlap_frac — voir
+     match_depthmaps() pour le détail. "relief" reproduit la formule d'origine
+     (bug identifié le 2026-07-16 : garde-fou overlap>0.5 PIXEL, quasi inexistant,
+     laisse le score exploser à faible recouvrement) ; "overlap_only" teste
+     isolément si la forme du contour de la fracture suffit sans aucun relief.
      Testé aussi avec flip de la normale de j (ambiguïté de signe PCA)
   6. Reconstruction 3D des correspondances depuis le meilleur alignement 2D
   7. Kabsch sur les correspondances → R_est, t_est
@@ -47,6 +51,19 @@ Usage (sur le serveur) :
         --experiment cnn_step15_final_model \\
         --categories everyday --split val \\
         --summary_json /tmp/student7/phase5a_val.json
+
+    # Comparer les 3 formules de score (2026-07-20, suite à la remise en cause de la
+    # formule d'origine) : relancer avec --score_mode relief / overlap_only / joint
+    # sur le MEME quick run pour comparer directement :
+    for MODE in relief overlap_only joint; do
+        CUDA_VISIBLE_DEVICES=1 python scripts/phase5a_depthmap_matching.py \\
+            --ckpt output/cnn_step15_final_model/last.ckpt \\
+            --data_root /storage/student7/teyssir/data/breaking_bad_vol.hdf5 \\
+            --experiment cnn_step15_final_model \\
+            --categories everyday --split val --max_batches 50 \\
+            --score_mode $MODE \\
+            --summary_json /tmp/student7/phase5a_${MODE}.json
+    done
 """
 
 import argparse
@@ -152,15 +169,34 @@ def rasterize(pts: np.ndarray, centroid, u, v, n, resolution: int, pixel_size: f
 
 # ── Matching ──────────────────────────────────────────────────────────────────
 
-def match_depthmaps(dmap_i, valid_i, dmap_j, valid_j, n_angles: int):
-    """Sweep rotation + FFT translation, score = complémentarité normalisée.
+def match_depthmaps(dmap_i, valid_i, dmap_j, valid_j, n_angles: int, score_mode: str = "joint"):
+    """Sweep rotation + FFT translation, score = complémentarité + qualité de recouvrement.
 
-    Pour chaque rotation θ de dmap_j, on calcule CC(depth_i, depth_j_rot) par FFT
-    et on prend la translation qui maximise -CC / overlap (profil de j oppose profil de i).
-    Testé aussi avec flip (inverser le signe de depth_j avant rotation) pour lever
-    l'ambiguïté de signe de la normale PCA de j.
+    Pour chaque rotation θ de dmap_j (et chaque flip de normale), on calcule pour
+    TOUS les décalages simultanément (FFT) :
+      - CC[sy,sx]      : corrélation croisée des profondeurs (complémentarité de relief)
+      - overlap[sy,sx] : nombre de pixels valides communs à ce décalage précis
+      - overlap_frac[sy,sx] = overlap / min(n_valid_i, n_valid_j_rot) — fraction du
+        contour de la face qui coïncide à ce décalage (0=aucun recouvrement, 1=un
+        contour totalement inclus dans l'autre). C'est le signal de FORME du contour
+        de la zone de fracture, indépendant du relief.
 
-    Retourne (best_score, best_theta_deg, best_shift_yx_pixels, best_flip).
+    score_mode :
+      - "relief"       : formule originale, -CC/overlap avec un garde-fou quasi inexistant
+                         (overlap > 0.5 PIXEL) — reproduit le bug identifié le 2026-07-16 :
+                         à faible recouvrement, diviser par un dénominateur minuscule peut
+                         gonfler artificiellement le score. Conservé pour comparaison.
+      - "overlap_only" : ignore complètement le relief, score = overlap_frac seul — teste
+                         isolément l'hypothèse "le contour de la fracture suffit déjà à
+                         fixer la rotation, même sans bosses/creux" (pertinent surtout à
+                         2 fragments, cf. discussion du 2026-07-20).
+      - "joint" (défaut, LE FIX) : score = relief_score * overlap_frac. Un bon score
+                         de relief à un recouvrement quasi nul est automatiquement ramené
+                         vers 0 (au lieu d'exploser par division), et un bon recouvrement
+                         sans complémentarité de relief ne suffit pas non plus à gagner.
+                         Aucun seuil arbitraire à caler : la pénalité est continue.
+
+    Retourne (best_score, best_theta_deg, best_shift_yx_pixels, best_flip, best_overlap_frac).
     best_shift est unwrappé (peut être négatif).
     """
     R_sz = dmap_i.shape[0]
@@ -168,11 +204,13 @@ def match_depthmaps(dmap_i, valid_i, dmap_j, valid_j, n_angles: int):
     c = valid_i.astype(np.float64)
     A_fft = np.fft.rfft2(a)
     C_fft = np.fft.rfft2(c)
+    n_valid_i = float(valid_i.sum())
 
     best_score = -np.inf
     best_theta = 0.0
     best_shift = (0, 0)
     best_flip  = False
+    best_overlap_frac = 0.0
 
     for flip in (False, True):
         dmap_j_use = -dmap_j if flip else dmap_j
@@ -191,11 +229,21 @@ def match_depthmaps(dmap_i, valid_i, dmap_j, valid_j, n_angles: int):
 
             # CC[sy,sx] = sum_{r,c} a[r,c] * b[r+sy, c+sx]  (circulaire)
             # Complémentarité : depth_i ≈ -depth_j_rot → CC doit être le plus NÉGATIF.
-            # score = -CC / overlap → MAXIMISER.
             CC      = np.real(np.fft.irfft2(A_fft * np.conj(B_fft), s=(R_sz, R_sz)))
             overlap = np.real(np.fft.irfft2(C_fft * np.conj(D_fft), s=(R_sz, R_sz)))
+
+            n_valid_j_rot = float(valid_j_rot.sum())
+            denom = max(min(n_valid_i, n_valid_j_rot), 1.0)
+            overlap_frac = overlap / denom   # fraction du contour qui coïncide, dans [0,1]
+
             with np.errstate(divide='ignore', invalid='ignore'):
-                score_map = np.where(overlap > 0.5, -CC / overlap, -np.inf)
+                if score_mode == "relief":
+                    score_map = np.where(overlap > 0.5, -CC / overlap, -np.inf)
+                elif score_mode == "overlap_only":
+                    score_map = overlap_frac
+                else:  # "joint" — le fix : pénalise en continu le faible recouvrement
+                    relief_score = np.where(overlap > 0.5, -CC / overlap, 0.0)
+                    score_map = relief_score * overlap_frac
 
             idx = np.argmax(score_map)
             sy, sx = np.unravel_index(idx, score_map.shape)
@@ -208,8 +256,9 @@ def match_depthmaps(dmap_i, valid_i, dmap_j, valid_j, n_angles: int):
                 sx_u = sx if sx < R_sz // 2 else sx - R_sz
                 best_shift = (sy_u, sx_u)
                 best_flip  = flip
+                best_overlap_frac = float(overlap_frac[sy, sx])
 
-    return best_score, best_theta, best_shift, best_flip
+    return best_score, best_theta, best_shift, best_flip, best_overlap_frac
 
 
 def build_correspondences(
@@ -330,8 +379,8 @@ def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, a
             results[strat] = {"skip": "sparse_dmap", "n_pix": (n_pix_i, n_pix_j)}
             continue
 
-        best_score, best_theta, best_shift, best_flip = match_depthmaps(
-            dmap_i, valid_i, dmap_j, valid_j, args.n_angles)
+        best_score, best_theta, best_shift, best_flip, best_overlap_frac = match_depthmaps(
+            dmap_i, valid_i, dmap_j, valid_j, args.n_angles, score_mode=args.score_mode)
 
         pts_i3, pts_j3 = build_correspondences(
             dmap_i, valid_i, c_i, u_i, v_i, n_i, u_min_i, v_min_i,
@@ -354,6 +403,7 @@ def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, a
             "best_score":   float(best_score),
             "best_theta":   float(best_theta),
             "best_flip":    bool(best_flip),
+            "overlap_frac": float(best_overlap_frac),
             "n_corr":       len(pts_i3),
             "planarity":    (float(plan_i), float(plan_j)),
             "n_frac_pts":   (len(frac_i), len(frac_j)),
@@ -377,6 +427,11 @@ def main():
     parser.add_argument("--seed",        type=int, default=42)
     parser.add_argument("--resolution",  type=int, default=DEFAULT_RESOLUTION)
     parser.add_argument("--n_angles",    type=int, default=DEFAULT_N_ANGLES)
+    parser.add_argument("--score_mode",  default="joint",
+                        choices=["relief", "overlap_only", "joint"],
+                        help="relief = formule d'origine (buggée, garde-fou overlap>0.5px) ; "
+                             "overlap_only = contour seul, sans relief (teste l'hypothèse "
+                             "contour-suffit) ; joint = fix, relief_score * overlap_frac.")
     parser.add_argument("--device",      default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--summary_json", default="")
     args = parser.parse_args()
@@ -492,6 +547,7 @@ def main():
                             accum[strat][f"pose_{k_ps}"].append(float(v_ps))
                         accum[strat]["n_corr"].append(res["n_corr"])
                         accum[strat]["best_score"].append(res["best_score"])
+                        accum[strat]["overlap_frac"].append(res["overlap_frac"])
 
     elapsed = time.time() - t0
     print(f"\nFini : {n_pairs_total} paires traitées ({n_2frag_seen} objets 2-frags vus)"
@@ -499,7 +555,7 @@ def main():
 
     # ── Résumé tabulaire ──────────────────────────────────────────────────────
     header = (f"{'Strategy':<12} {'N':>6} {'Skip':>6} {'RotErr°':>8} "
-              f"{'TransErr':>9} {'Pose@30/0.1':>11} {'Pose@15/0.05':>12} {'N_corr':>7}")
+              f"{'TransErr':>9} {'Pose@30/0.1':>11} {'Pose@15/0.05':>12} {'N_corr':>7} {'OvlpFrac':>8}")
     print(header)
     print("-" * len(header))
 
@@ -521,9 +577,10 @@ def main():
         p30      = 100.0 * float(np.mean(acc.get("pose_30deg_0.1", [0])))
         p15      = 100.0 * float(np.mean(acc.get("pose_15deg_0.05", [0])))
         nc_mean  = float(np.mean(acc["n_corr"]))
+        ov_mean  = float(np.mean(acc.get("overlap_frac", [0])))
 
         print(f"{strat:<12} {n_ok:>6} {n_skip:>6} {re_mean:>8.2f} "
-              f"{te_mean:>9.4f} {p30:>10.2f}% {p15:>11.2f}% {nc_mean:>7.1f}")
+              f"{te_mean:>9.4f} {p30:>10.2f}% {p15:>11.2f}% {nc_mean:>7.1f} {ov_mean:>8.3f}")
 
         summary[strat] = {
             "n_ok": n_ok, "n_skip": n_skip,
@@ -533,9 +590,12 @@ def main():
             "pose_30deg_0.1":  p30,
             "pose_15deg_0.05": p15,
             "n_corr_mean": nc_mean,
+            "overlap_frac_mean": ov_mean,
         }
 
     print(f"\nRéférence Phase 2 global : Pose@30 ≈ 1.3-3.2%  |  gt_edge oracle : Pose@30 ≈ 9.6%")
+    print(f"score_mode={args.score_mode}  "
+          f"(relief=formule d'origine buggée, overlap_only=contour seul, joint=fix)")
 
     if args.summary_json:
         Path(args.summary_json).parent.mkdir(parents=True, exist_ok=True)
