@@ -259,14 +259,14 @@
   <div class="content" style="gap: 2rem;">
     <span class="eyebrow">Fragment Reassembly Module — Internship Update</span>
     <h1>Two Paths Tested</h1>
-    <p class="lede">A walkthrough of the two experiments described in this week's email to my supervisor: a depth-map complementarity matcher, and a fragment-pair compatibility classifier — what each one tried, and what it found.</p>
+    <p class="lede">A walkthrough of the two experiments described in this week's email: a depth-map complementarity matcher and a fragment-pair compatibility classifier.</p>
     <div class="cover-meta">
-      <span><b>Prior work</b>CNN Step 15 fracture segmentation, point-to-point matching (3A/4A/4B) plateaued</span>
+      <span><b>Prior work</b>CNN Step 15 fracture segmentation, point-to-point matching (3A/4A/4B)</span>
       <span><b>Dataset</b>Breaking Bad — everyday / val</span>
       <span><b>Status</b>Path 1 closed negative · Path 2 closed positive</span>
     </div>
   </div>
-  <span class="sheet-tag"><b>SHEET</b> 01 / 07</span>
+  <span class="sheet-tag"><b>SHEET</b> 01 / 08</span>
 </section>
 
 <!-- ============================================================ -->
@@ -276,20 +276,20 @@
   <div class="content">
     <span class="eyebrow">Context</span>
     <h2>Where the diagnosis stood</h2>
-    <p class="lede">GARF regresses a global SE(3) pose per fragment directly — it never performs explicit pairwise correspondence. Earlier phases confirmed the CNN's fracture mask is reliable, but every point-to-point matcher tried on top of it plateaued near chance, regardless of descriptor or scoring refinement. Two different ways around that wall were tried next.</p>
+    <p class="lede">GARF regresses a global SE(3) pose per fragment directly, it never performs explicit pairwise correspondence. Earlier phases confirmed the CNN's fracture mask is reliable, but every point-to-point matcher was unsuccessful. Two different ways around that wall were tried next.</p>
 
     <div class="flow" style="margin-top:1rem;">
       <div class="flow-node">Fragment point cloud</div><div class="flow-arrow">→</div>
-      <div class="flow-node ok">CNN fracture mask — reliable</div><div class="flow-arrow">→</div>
-      <div class="flow-node fail">point-to-point matching — plateaued</div>
+      <div class="flow-node ok">CNN fracture mask : reliable</div><div class="flow-arrow">→</div>
+      <div class="flow-node fail">point-to-point matching : unsuccessful</div>
     </div>
 
     <div class="fork">
-      <div><b style="color:var(--ink)">Path 1</b><br>Stop matching points — match the <em>shape</em> of the whole fracture face instead (depth-map complementarity).</div>
-      <div><b style="color:var(--ink)">Path 2</b><br>Stop asking "which point" — ask a simpler question: do these two fragments belong together at all?</div>
+      <div><b style="color:var(--ink)">Path 1</b><br>Stop matching points, match the <em>shape</em> of the whole fracture face instead (depth-map complementarity).</div>
+      <div><b style="color:var(--ink)">Path 2</b><br>Stop asking "which point", ask a simpler question: do these two fragments belong together at all?</div>
     </div>
   </div>
-  <span class="sheet-tag"><b>SHEET</b> 02 / 07</span>
+  <span class="sheet-tag"><b>SHEET</b> 02 / 08</span>
 </section>
 
 <!-- ============================================================ -->
@@ -299,7 +299,7 @@
   <div class="content">
     <span class="eyebrow neg">Path 1 · Depth-map matching</span>
     <h2>Match the fracture face as a surface, not as points</h2>
-    <p class="lede">Idea: turn each fragment's fracture face into a small height field — like a terrain map — then search for the rotation and translation that make the two faces <em>complementary</em>, a bump on one side sitting opposite a hollow on the other.</p>
+    <p class="lede">Idea: turn each fragment's fracture face into a small height field, like a terrain map, then search for the rotation and translation that make the two faces <em>complementary</em>, a bump on one side sitting opposite a hollow on the other.</p>
 
     <p class="lede" style="font-size:0.96rem;">How the height field is actually built, for one fragment:</p>
 
@@ -384,7 +384,7 @@
           <text x="130" y="215" text-anchor="middle" font-size="10" fill="var(--ink-muted)">= the depth map, depth(u,v)</text>
         </g>
       </svg>
-      <p class="diagram-caption">depth(u,v) = mean height along n of the fracture points falling in cell (u,v) — same idea as a terrain height map</p>
+      <p class="diagram-caption">depth(u,v) = mean height along n of the fracture points falling in cell (u,v), same idea as a terrain height map</p>
     </div>
 
     <div class="diagram-card" style="border-top:none; padding-top:0;">
@@ -394,7 +394,7 @@
             <path d="M0,0 L10,5 L0,10 z" fill="var(--ink-muted)"></path>
           </marker>
         </defs>
-        <text x="0" y="14" font-size="10" fill="var(--ink-muted)">then, for the fragment pair —</text>
+        <text x="0" y="14" font-size="10" fill="var(--ink-muted)">then, for the fragment pair </text>
 
         <g transform="translate(0,35)">
           <g fill="var(--accent-soft)" stroke="var(--surface)" stroke-width="1.5">
@@ -427,7 +427,7 @@
       </svg>
     </div>
   </div>
-  <span class="sheet-tag"><b>SHEET</b> 03 / 07</span>
+  <span class="sheet-tag"><b>SHEET</b> 03 / 08</span>
 </section>
 
 <!-- ============================================================ -->
@@ -436,7 +436,7 @@
 <section class="sheet">
   <div class="content">
     <span class="eyebrow neg">Path 1 · Result</span>
-    <h2>The faces were too flat — and the score didn't help</h2>
+    <h2>The faces were too flat and the score didn't help</h2>
 
     <div class="stat-row">
       <div class="stat"><div class="num bad">155°</div><div class="label">mean rotation error<br>(random ≈ 90°)</div></div>
@@ -472,15 +472,65 @@
       <p class="diagram-caption">Breaking Bad fragments break along near-planar surfaces, not textured ones</p>
     </div>
 
-    <p class="lede">With near-zero relief on both sides, the complementarity score stops discriminating rotations — it ends up dominated by edge/overlap artifacts instead, and the search converges on a near-180° flip (back-to-back) rather than the true pose.</p>
 
     <div class="closing-q">
-      <p><strong>Open question, found late:</strong> the score divides by overlap area instead of rewarding it — so a poorly-overlapping hypothesis can score artificially higher than a well-fitting one. But two matching fracture faces share the same outline, by construction — that shape alone could fix the rotation even without relief, especially with only 2 fragments. Whether a score that rewards overlap/outline fit (instead of normalizing by it) would recover this signal hasn't been tested yet.</p>
+      <p><strong>Open question, found late:</strong> the score divides by overlap area instead of rewarding it. So a poorly-overlapping hypothesis can score artificially higher than a well-fitting one. But two matching fracture faces share the same outline, by construction, that shape alone could fix the rotation even without relief, especially with only 2 fragments. Whether a score that rewards overlap/outline fit (instead of normalizing by it) would recover this signal hasn't been tested yet.</p>
     </div>
 
-    <span class="verdict warn">Negative with this scoring formula — not fully conclusive</span>
+    <span class="verdict warn">Negative with this scoring formula, not fully conclusive</span>
   </div>
-  <span class="sheet-tag"><b>SHEET</b> 04 / 07</span>
+  <span class="sheet-tag"><b>SHEET</b> 04 / 08</span>
+</section>
+
+<!-- ============================================================ -->
+<!-- SHEET 04B — PATH 1 UPDATE (added 2026-07-20, after re-running on the server) -->
+<!-- ============================================================ -->
+<section class="sheet">
+  <div class="content">
+    <span class="eyebrow">Path 1 · Update </span>
+    <h2>A bigger sample changes the picture</h2>
+    <p class="lede">Re-ran on 2,415 two-fragment objects (63% of the val set, ~9.5x the first update's sample). Two findings hold up at scale: the earlier "0%, worse than random" was a statistical fluke from too few valid pairs (N=21) and fixing the score (rewarding overlap instead of dividing by it) gives a real, growing improvement.</p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Score mode</th><th>N valid</th><th>Pose@30°/0.1</th><th>Pose@15°/0.05</th><th>RotErr</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="path">relief (original)</td>
+            <td>447</td>
+            <td>4.47%</td>
+            <td>2.24%</td>
+            <td>143°</td>
+          </tr>
+          <tr>
+            <td class="path">overlap_only (outline)</td>
+            <td>522</td>
+            <td>22.03%</td>
+            <td>7.85%</td>
+            <td>102°</td>
+          </tr>
+          <tr>
+            <td class="path">joint (the fix)</td>
+            <td>511</td>
+            <td><strong>27.59%</strong></td>
+            <td><strong>13.70%</strong></td>
+            <td><strong>95°</strong></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="diagram-caption">GT mask, everyday/val, 2,415 two-fragment objects scanned · random control stays at 0% throughout</p>
+    <p class="diagram-caption">relief (old) = -CC / overlap : a division, unstable when overlap is tiny · joint (fix) = relief_score × overlap_frac : a multiplication, safely goes to 0 instead of exploding</p>
+
+    <div class="callouts">
+      <div class="callout"><span class="k">01 — sample size mattered</span><p>Same "relief" formula, bigger sample: Pose@30 goes from 0% (N=21) to 4.47% (N=447). The original "close, negative" conclusion was noise, not signal.</p></div>
+      <div class="callout"><span class="k">02 — the fix holds up, and gets clearer with scale</span><p>joint (27.59%) now beats the project's best prior geometric-matching result (Phase 2 gt_edge oracle, 9.6%) by almost 3x. relief itself got WORSE with more data (9.09%→4.47%), the signature of a noisy, unstable score, unlike joint which improved (21.15%→27.59%).</p></div>
+      <div class="callout"><span class="k">03 — still far from usable</span><p>27.59% means ~72% of pairs still fail at the loose 30° threshold, and ~86% fail at the stricter 15°/0.05. A real, robust signal, not a solved problem.</p></div>
+    </div>
+
+    <span class="verdict warn">Reopened : positive but partial, confirmed at scale</span>
+  </div>
+  <span class="sheet-tag"><b>SHEET</b> 05 / 08</span>
 </section>
 
 <!-- ============================================================ -->
@@ -490,7 +540,7 @@
   <div class="content">
     <span class="eyebrow pos">Path 2 · Compatibility classifier</span>
     <h2>Ask a simpler question: do they belong together?</h2>
-    <p class="lede">Not "which point matches which" — just "are these two fragments adjacent?" Pool the CNN's per-point features over each fragment's fracture surface into one vector per fragment, concatenate the pair, and classify.</p>
+    <p class="lede">Not "which point matches which", just "are these two fragments adjacent?" Pool the CNN's per-point features over each fragment's fracture surface into one vector per fragment, concatenate the pair, and classify.</p>
 
     <div class="diagram-card">
       <svg viewBox="0 0 900 210" width="100%" role="img" aria-label="Diagram: CNN features on each fragment's fracture points are pooled, concatenated, and passed through a small MLP to output a compatibility score.">
@@ -567,7 +617,7 @@
       <p class="diagram-caption">3 conditions compared for the fracture mask: GT (oracle) · CNN threshold 0.3 · random points</p>
     </div>
   </div>
-  <span class="sheet-tag"><b>SHEET</b> 05 / 07</span>
+  <span class="sheet-tag"><b>SHEET</b> 06 / 08</span>
 </section>
 
 <!-- ============================================================ -->
@@ -598,24 +648,18 @@
           <div class="bar-track"><div class="bar-fill base" style="width:62.7%"></div></div>
           <div class="bar-value">0.627</div>
         </div>
-        <div class="bar-row">
-          <div class="bar-label">Centroid distance<br><small>naive geometric baseline</small></div>
-          <div class="bar-track"><div class="bar-fill neg" style="width:32%"></div></div>
-          <div class="bar-value">0.320</div>
-        </div>
       </div>
-      <p class="diagram-caption">AUC — fragment-pair compatibility, everyday/val, best checkpoint epoch 83/500</p>
+      <p class="diagram-caption">AUC — fragment-pair compatibility, everyday/val, best checkpoint epoch 83/100</p>
     </div>
 
     <div class="callouts">
-      <div class="callout"><span class="k">01 — mask quality</span><p>CNN mask ≈ GT oracle (0.798 vs 0.793) — the segmentation isn't the bottleneck here.</p></div>
+      <div class="callout"><span class="k">01 — mask quality</span><p>CNN mask ≈ GT oracle (0.798 vs 0.793) : the segmentation isn't the bottleneck here.</p></div>
       <div class="callout"><span class="k">02 — signal source</span><p>Fracture points clearly beat random points on the same fragment (+17pp AUC).</p></div>
-      <div class="callout"><span class="k">03 — vs. geometry</span><p>The naive centroid-distance baseline is inverted (0.32) — nearby fragments in a shuffled pose are not usually the true neighbors.</p></div>
     </div>
 
-    <span class="verdict pos">Positive — usable as a pre-filter</span>
+    <span class="verdict pos">Positive, usable as a pre-filter</span>
   </div>
-  <span class="sheet-tag"><b>SHEET</b> 06 / 07</span>
+  <span class="sheet-tag"><b>SHEET</b> 07 / 08</span>
 </section>
 
 <!-- ============================================================ -->
@@ -624,7 +668,7 @@
 <section class="sheet">
   <div class="content">
     <span class="eyebrow">Takeaway</span>
-    <h2>One open question, one usable brick</h2>
+    <h2>One partial signal, one usable brick</h2>
 
     <div class="table-wrap">
       <table>
@@ -633,13 +677,13 @@
           <tr>
             <td class="path">1 — Depth-map</td>
             <td>Can face-level complementarity recover a relative pose?</td>
-            <td>RotErr ≈ 155° (worse than random), Pose@30° = 0% — but the score formula punishes good overlap instead of rewarding it</td>
-            <td><span class="dot warn"></span>Negative as tested, not conclusive</td>
+            <td>Fixed score (joint) → Pose@30° = 27.59% (GT), ~3x the project's best prior geometric result (9.6%), but ~72% of pairs still fail</td>
+            <td><span class="dot warn"></span>Reopened, positive but partial</td>
           </tr>
           <tr>
             <td class="path">2 — Compatibility</td>
             <td>Can the CNN's features tell if two fragments belong together?</td>
-            <td>AUC = 0.798 (CNN mask), well above the 0.627 random / 0.32 geometric baselines</td>
+            <td>AUC = 0.798 (CNN mask), well above the 0.627 random</td>
             <td><span class="dot pos"></span>Positive, usable</td>
           </tr>
         </tbody>
@@ -647,8 +691,8 @@
     </div>
 
     <div class="closing-q">
-      <p>I'd value your take on the overall progress so far — does this direction look right, or is there something you'd want to redirect?</p>
+      <p>I'd value your take on both results, is the partial depth-map signal worth pushing further, or should effort shift toward combining it with the compatibility classifier instead?</p>
     </div>
   </div>
-  <span class="sheet-tag"><b>SHEET</b> 07 / 07</span>
+  <span class="sheet-tag"><b>SHEET</b> 08 / 08</span>
 </section>

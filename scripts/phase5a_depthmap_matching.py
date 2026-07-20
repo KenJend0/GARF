@@ -54,13 +54,17 @@ Usage (sur le serveur) :
 
     # Comparer les 3 formules de score (2026-07-20, suite à la remise en cause de la
     # formule d'origine) : relancer avec --score_mode relief / overlap_only / joint
-    # sur le MEME quick run pour comparer directement :
+    # sur le MEME quick run pour comparer directement.
+    # --batch_size 1 : le forward CNN (features géométriques, KNN O(N^2) par fragment)
+    # peut OOM sur les GPU 8 Go du labo si un batch contient des fragments à beaucoup
+    # de points -- observé le 2026-07-20 avec batch_size=4 par défaut (jusqu'à 8
+    # fragments traités d'un coup). batch_size=1 limite à 2 fragments par forward.
     for MODE in relief overlap_only joint; do
         CUDA_VISIBLE_DEVICES=1 python scripts/phase5a_depthmap_matching.py \\
             --ckpt output/cnn_step15_final_model/last.ckpt \\
             --data_root /storage/student7/teyssir/data/breaking_bad_vol.hdf5 \\
             --experiment cnn_step15_final_model \\
-            --categories everyday --split val --max_batches 50 \\
+            --categories everyday --split val --max_batches 50 --batch_size 1 \\
             --score_mode $MODE \\
             --summary_json /tmp/student7/phase5a_${MODE}.json
     done
@@ -94,6 +98,14 @@ MIN_FRAC_POINTS        = 50      # moins de N pts fracture → skip (PCA bruité
 MAX_PLANARITY          = 0.15    # planéité PCA > seuil → face trop courbe → skip
 MIN_OVERLAP_PIXELS     = 20      # correspondances 3D < N → skip Kabsch
 POSE_SUCCESS_THRESH    = [(30.0, 0.1), (15.0, 0.05)]
+
+# Tranches de planéité pour la stratification post-hoc (bornes alignées sur les
+# percentiles du pré-check Phase 5A.0 : p25=0.016, p50=0.043, p75=0.098, p90=0.150).
+# Sert à vérifier si "moins plat" corrèle vraiment avec un meilleur matching parmi
+# les paires GARDÉES (pas juste à exclure les plus courbées via MAX_PLANARITY et
+# conclure "trop plat" sans jamais avoir testé le sens inverse de la corrélation).
+PLANARITY_BINS = [0.0, 0.02, 0.05, 0.10, MAX_PLANARITY + 1e-9]
+PLANARITY_LABELS = ["<0.02", "0.02-0.05", "0.05-0.10", f"0.10-{MAX_PLANARITY}"]
 
 
 # ── Géométrie ─────────────────────────────────────────────────────────────────
@@ -326,6 +338,40 @@ def build_correspondences(
 
 # ── Boucle principale ─────────────────────────────────────────────────────────
 
+def planarity_stratification(planarity, rot_err, pose30, pose15):
+    """Découpe les paires par tranche de planéité (moyenne des 2 fragments) et
+    calcule RotErr moyen / Pose@30 / Pose@15 / N par tranche.
+
+    Répond à la question : parmi les paires gardées (planéité <= MAX_PLANARITY),
+    est-ce que "moins plat" corrèle vraiment avec un meilleur matching ? Si oui,
+    ça confirme la thèse "trop plat = pas de signal". Si non (plat ou pas, même
+    résultat), la thèse doit être nuancée — le vrai facteur limitant serait
+    ailleurs (ex. le nombre de points, le bruit du masque, autre chose).
+    Retourne une liste de dicts, un par tranche (vide si aucune paire dedans).
+    """
+    planarity = np.asarray(planarity)
+    rot_err   = np.asarray(rot_err)
+    pose30    = np.asarray(pose30)
+    pose15    = np.asarray(pose15)
+    idx = np.digitize(planarity, PLANARITY_BINS[1:-1])   # 0..len(labels)-1
+
+    rows = []
+    for b, label in enumerate(PLANARITY_LABELS):
+        mask = idx == b
+        n = int(mask.sum())
+        if n == 0:
+            rows.append({"bin": label, "n": 0})
+            continue
+        rows.append({
+            "bin": label,
+            "n": n,
+            "rot_err_mean": float(rot_err[mask].mean()),
+            "pose_30deg_0.1": 100.0 * float(pose30[mask].mean()),
+            "pose_15deg_0.05": 100.0 * float(pose15[mask].mean()),
+        })
+    return rows
+
+
 def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, args, rng):
     """Traite une paire dirigée i→j. Retourne un dict de résultats par stratégie."""
     results = {}
@@ -548,6 +594,7 @@ def main():
                         accum[strat]["n_corr"].append(res["n_corr"])
                         accum[strat]["best_score"].append(res["best_score"])
                         accum[strat]["overlap_frac"].append(res["overlap_frac"])
+                        accum[strat]["planarity"].append(float(np.mean(res["planarity"])))
 
     elapsed = time.time() - t0
     print(f"\nFini : {n_pairs_total} paires traitées ({n_2frag_seen} objets 2-frags vus)"
@@ -592,6 +639,34 @@ def main():
             "n_corr_mean": nc_mean,
             "overlap_frac_mean": ov_mean,
         }
+
+    # ── Stratification par planéité : "moins plat" corrèle-t-il avec un
+    # meilleur matching PARMI les paires gardées, ou pas ? ─────────────────────
+    print(f"\nSTRATIFICATION PAR PLANÉITÉ (moyenne des 2 fragments, tranches "
+          f"alignées sur les percentiles Phase 5A.0)")
+    strat_header = f"{'Strategy':<12} {'Bin':<12} {'N':>5} {'RotErr°':>8} {'Pose@30':>9} {'Pose@15':>9}"
+    print(strat_header)
+    print("-" * len(strat_header))
+    for strat in ("gt", "thresh0.3", "random"):
+        acc = accum[strat]
+        if not acc.get("rot_err"):
+            continue
+        rows = planarity_stratification(
+            acc["planarity"], acc["rot_err"],
+            acc.get("pose_30deg_0.1", [0] * len(acc["rot_err"])),
+            acc.get("pose_15deg_0.05", [0] * len(acc["rot_err"])),
+        )
+        for row in rows:
+            if row["n"] == 0:
+                print(f"{strat:<12} {row['bin']:<12} {'—':>5}")
+            else:
+                print(f"{strat:<12} {row['bin']:<12} {row['n']:>5} "
+                      f"{row['rot_err_mean']:>8.2f} {row['pose_30deg_0.1']:>8.2f}% "
+                      f"{row['pose_15deg_0.05']:>8.2f}%")
+        summary[strat]["planarity_strata"] = rows
+    print("(Lecture : si Pose@30 monte et RotErr baisse en allant vers les tranches\n"
+          " les moins plates, la thèse 'trop plat = pas de signal' est confirmée dans\n"
+          " le détail. Si c'est plat ou pas pareil, le facteur limitant est ailleurs.)")
 
     print(f"\nRéférence Phase 2 global : Pose@30 ≈ 1.3-3.2%  |  gt_edge oracle : Pose@30 ≈ 9.6%")
     print(f"score_mode={args.score_mode}  "

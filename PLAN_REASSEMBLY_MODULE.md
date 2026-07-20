@@ -1435,18 +1435,214 @@ paramètre `--score_mode {relief, overlap_only, joint}` sur `match_depthmaps()` 
 (`results[strat]["overlap_frac"]`) et le résumé (`OvlpFrac` dans le tableau,
 `overlap_frac_mean` dans le JSON) pour diagnostiquer sans devoir tout relancer.
 
-**Pas encore relancé sur le serveur.** Commande de comparaison des 3 modes (quick
-run, 50 batches) documentée dans le docstring du script. Si `overlap_only` ou
-`joint` fait significativement mieux que `relief` sur `gt`/`gt_edge`-like conditions,
-la conclusion "Phase 5A négatif, définitif" doit être révisée en "négatif avec la
-formule d'origine seulement" — **la présentation orale du 2026-07-20 reflète déjà
-cette nuance** (verdict "not fully conclusive" plutôt que "closed").
+**Premier run rapide (2026-07-20, `--max_batches 50 --batch_size 1`, N=4-5 paires
+valides seulement) :** tendance dans le bon sens (RotErr gt : 114°→105°→83° pour
+relief→overlap_only→joint) mais `Pose@30` reste à 0% partout — échantillon bien
+trop petit pour conclure quoi que ce soit (même ordre de grandeur que le run
+original qui avait donné 0% par accident statistique, cf. ci-dessous).
+
+### Conclusion révisée Phase 5A — RÉOUVERTE, POSITIVE MAIS PARTIELLE (2026-07-20)
+
+**Run à plus grande échelle** (`batch_size=1`, ~500 batches, 255 objets 2-frags vus
+— 2.5x l'échantillon du run de clôture original) :
+
+```
+score_mode=relief (formule d'origine, MÊME algo que la conclusion "close" du 2026-07-08) :
+Strategy    N   Skip  RotErr°  TransErr Pose@30/0.1 Pose@15/0.05  N_corr OvlpFrac
+gt         44    211   129.29    0.3697       9.09%        6.82%    58.0    0.182
+thresh0.3  36    219   134.05    0.4081       5.56%        2.78%    65.8    0.167
+random     19    236   130.17    0.4706       0.00%        0.00%    43.8    0.137
+
+score_mode=overlap_only (contour seul, sans relief) :
+Strategy    N   Skip  RotErr°  TransErr Pose@30/0.1 Pose@15/0.05  N_corr OvlpFrac
+gt         51    204   105.60    0.3795      19.61%        7.84%    80.8    0.728
+thresh0.3  39    216   128.04    0.4275      10.26%        0.00%    89.3    0.702
+random     27    228   145.97    0.4992       0.00%        0.00%    51.3    0.906
+
+score_mode=joint (le fix : relief_score * overlap_frac) :
+Strategy    N   Skip  RotErr°  TransErr Pose@30/0.1 Pose@15/0.05  N_corr OvlpFrac
+gt         52    203    98.15    0.3285      21.15%       15.38%    80.5    0.666
+thresh0.3  40    215   128.62    0.4381      12.50%        7.50%    74.7    0.611
+random     22    233   143.72    0.4891       0.00%        0.00%    43.2    0.735
+```
+
+**Découverte n°1 — le "0%, pire que le hasard" du 2026-07-08 était un accident
+statistique, pas un vrai résultat.** Avec la formule `relief` STRICTEMENT
+identique (même algorithme, même bug), un échantillon 2.5x plus grand
+(N=44 vs N=21 paires valides) donne `Pose@30=9.09%`, `RotErr=129°` — plus rien à
+voir avec le "0%, RotErr=155°, pire que le hasard" documenté comme conclusion
+définitive. Le run de clôture original reposait sur N=21 paires seulement :
+échantillon trop petit, le "0%" est tombé par malchance et non par une vraie
+absence de signal. **Leçon méthodologique à retenir pour la suite du stage :**
+toujours vérifier la taille d'échantillon avant de clore une phase sur un résultat
+à 0% ou 100% — ces valeurs extrêmes sont les plus sensibles au bruit statistique.
+
+**Découverte n°2 — le fix de score (hypothèse du contour, cf. discussion du
+2026-07-20) est confirmé, et sur un échantillon solide cette fois :**
+`Pose@30` (gt) progresse proprement `relief` 9.09% → `overlap_only` 19.61% →
+`joint` 21.15% ; `Pose@15/0.05` (critère strict) 6.82% → 7.84% → 15.38% ;
+`RotErr` baisse 129°→106°→98°. `random` reste à 0% dans les trois modes (bon
+signe : le gain vient bien du signal de fracture, pas d'un artefact de mesure
+général). **`joint` (oracle GT) dépasse même la référence Phase 2 `gt_edge`
+(9.6%, meilleur résultat de tout le matching géométrique classique du projet) —
+plus du double.** Et ça tient aussi en condition réelle, pas seulement à
+l'oracle : `thresh0.3` (masque CNN, pas GT) passe de 5.56% à 12.50%, au-dessus
+de la référence Phase 2 sans connaître le masque GT.
+
+**Mais lecture calibrée, à ne pas survendre :** `Pose@30=21.15%` (meilleur cas,
+oracle GT) veut dire que **~79% des paires échouent encore**, et à un seuil plus
+réaliste (`Pose@15°/0.05`) le taux de succès tombe à 15.38% — donc plus de 8
+paires sur 10 ratent encore, même avec le fix. Ce n'est PAS "le réassemblage par
+depth-map fonctionne" — c'est "le signal existe et est mesurable, le fix double
+le meilleur résultat connu du projet sur cette tâche, mais la méthode reste très
+loin d'un taux de réussite exploitable pour un réassemblage automatique fiable"
+(cf. aussi la mise en garde déjà actée en Phase 6 sur l'accumulation d'erreurs à
+un taux de succès partiel par paire, sur des objets à plusieurs fragments).
+
+**Verdict : Phase 5A rouverte, résultat POSITIF MAIS PARTIEL** (pas "close
+négatif" comme au 2026-07-08, pas "ça marche" non plus). À rapporter dans le
+stage comme : diagnostic initial correct (le relief seul est insuffisant, faces
+trop plates), mais la conclusion "donc la depth-map ne marche pas du tout" était
+prématurée — un score qui exploite aussi la forme du contour (pas seulement le
+relief) double le meilleur résultat de matching géométrique du projet, sans
+toutefois le rendre exploitable en l'état.
+
+### Run définitif à grande échelle (2026-07-20, `--max_batches 5000 --batch_size 1`)
+
+**2415 objets 2-frags traités** (63% du val complet, ~9.5x l'échantillon du run
+précédent) — chiffre à citer dans le rapport :
+
+```
+score_mode=relief (formule d'origine buggée) :
+Strategy    N    Skip  RotErr°  TransErr Pose@30/0.1 Pose@15/0.05  N_corr OvlpFrac
+gt         447   1968   142.96    0.4412       4.47%        2.24%    55.4    0.167
+thresh0.3  339   2076   138.25    0.4437       3.83%        1.18%    60.7    0.161
+random     162   2253   131.19    0.4709       0.00%        0.00%    46.7    0.096
+
+score_mode=overlap_only (contour seul) :
+Strategy    N    Skip  RotErr°  TransErr Pose@30/0.1 Pose@15/0.05  N_corr OvlpFrac
+gt         522   1893   101.97    0.3466      22.03%        7.85%    80.5    0.738
+thresh0.3  400   2015   114.98    0.3926      13.50%        5.00%    89.3    0.726
+random     196   2219   131.93    0.4921       0.00%        0.00%    50.5    0.951
+
+score_mode=joint (le fix) :
+Strategy    N    Skip  RotErr°  TransErr Pose@30/0.1 Pose@15/0.05  N_corr OvlpFrac
+gt         511   1904    94.95    0.3288      27.59%       13.70%    80.6    0.659
+thresh0.3  399   2016   106.28    0.3745      21.05%        8.52%    82.5    0.624
+random     175   2240   132.73    0.4784       0.00%        0.00%    47.9    0.764
+```
+
+**Découverte n°3 — la formule `relief` d'origine n'est pas juste moins bonne,
+elle est INSTABLE.** Sur le run à N=255, `relief` donnait `Pose@30=9.09%` ; sur
+ce run 9.5x plus grand (N=447), elle tombe à **4.47%** — une formule fiable ne
+devrait pas autant bouger avec plus de données, elle devrait converger. C'est la
+signature attendue d'un score dominé par du bruit numérique (division par un
+recouvrement quasi nul), cohérent avec le bug identifié : `relief` ne mesure pas
+un vrai signal stable, ses résultats sont eux-mêmes peu fiables d'un run à
+l'autre. À l'inverse, `joint` **s'améliore** avec plus de données (21.15%→27.59%)
+— signe d'un score qui converge vers un vrai signal plutôt que de fluctuer.
+
+**Chiffres définitifs à retenir pour le rapport (oracle GT, `joint`) :**
+`Pose@30°/0.1 = 27.59%` (contre 9.6% pour l'oracle `gt_edge` de la Phase 2 —
+**quasi 3x mieux**), `Pose@15°/0.05 = 13.70%`. En condition réelle (`thresh0.3`,
+pas d'oracle) : `Pose@30 = 21.05%`, toujours largement au-dessus des références
+Phase 2. `random` reste à 0% partout, à cette échelle aussi — le gain est bien
+spécifique au signal de fracture.
+
+**Lecture calibrée inchangée :** même au meilleur cas (27.59%), **~72% des
+paires échouent encore** à Pose@30, ~86% à Pose@15/0.05. Le fix est confirmé,
+robuste, et significatif — mais la méthode reste loin d'un taux de réussite
+exploitable pour un réassemblage automatique fiable.
 
 ---
 
-### Phase 5B (si 5A marche) — Extension 3–5 fragments
+### Phase 5B (si 5A marche bien) — Extension 3–5 fragments
 
-**Annulée.** Phase 5A négative — voir conclusion ci-dessus.
+**Toujours en attente, pas relancée.** La Phase 5A est repassée positive et
+confirmée sur un échantillon large (27.59% de réussite au mieux, sur des objets
+à 2 fragments seulement — le cas le plus simple). Le confond multi-voisins
+(Phase 2D/2B) que la restriction à 2 fragments supprime spécifiquement
+reviendrait dès 3+ fragments : pas de raison de penser que 5B ferait mieux tant
+que 5A n'est pas nettement plus solide sur son propre cas simplifié.
+
+---
+
+## Phase 7 — Depth-map pose refinement + validation dataset réel (direction validée avec le tuteur, 2026-07-20)
+
+**Conclusions de la présentation orale du 2026-07-20** (à partir des résultats
+Phase 5A réouverte, confirmés à N=2415), notées ici dans l'ordre où elles ont
+été formulées avec le tuteur, pas nécessairement l'ordre d'exécution :
+
+**1. Recentrage du périmètre : pose entre deux fragments déjà connus comme
+adjacents.** On continue sur le cadrage Phase 5A (comme le Protocole A de tout
+le projet) — pas sur la détection de paires. **Le classifieur de compatibilité
+(Phase 4D) est mis de côté pour plus tard, pas abandonné** — cohérent avec la
+clôture NO-GO de la Phase 6.0 (2026-07-19) qui avait déjà écarté un pipeline
+combiné 4D+pose pour l'instant.
+
+**2. Conviction du tuteur : le matching par depth-map est la bonne direction,
+sous-exploité, à améliorer.** Cinq pistes identifiées, aucune encore cadrée en
+détail — à spécifier une par une avant implémentation (esprit diagnostic-avant-
+code du reste du projet, cf. Phase 0-2) :
+- **Sliding de fenêtre** : matcher des fenêtres locales plutôt que la depth map
+  entière en un bloc. À préciser : fenêtre sur la depth map rasterisée ou sur
+  le nuage de points avant rasterisation ? Quelle taille ? Comment agréger les
+  scores de plusieurs fenêtres en une seule pose ?
+- **Extrapolation si trop plat (?)** — le tuteur lui-même marque une incertitude
+  sur le mécanisme. Piste à creuser : densifier/interpoler les cases `valid=False`
+  de la depth map plutôt que les laisser vides, ou amplifier un relief faible
+  mais réel. Risque à surveiller : fabriquer un faux signal si mal fait — donc
+  diagnostic avant tout code, comme d'habitude sur ce projet.
+- **Plus de résolution(s)** : `RESOLUTION=64` actuellement (grille fixe). Tester
+  plus fin, et/ou une approche multi-échelle (grossier → fin) plutôt qu'une
+  résolution unique.
+- **Plus de features** : seule la hauteur (`depth`) est utilisée par pixel
+  aujourd'hui. Ajouter d'autres canaux : normales locales, courbure, ou les
+  features CNN du Step 15 (`point_features`, comme en Phase 3A/4D) — combinerait
+  le signal de fracture appris avec la structure géométrique 2D.
+- **Modèle appris** : remplacer le score géométrique fixe (`joint`) par un
+  matcher appris sur les depth maps (ex. petit CNN 2D sur cartes multi-canal),
+  dans l'esprit de la Phase 3 mais appliqué à la représentation depth-map
+  plutôt qu'aux points bruts.
+
+**3. Validation sur un dataset réel (pas seulement Breaking Bad, synthétique).**
+Dataset proposé : [3D Puzzles, TU Wien](https://www.geometrie.tuwien.ac.at/ig/3dpuzzles.html).
+Motivation explicite : la platitude anormale des faces de fracture Breaking Bad
+(médiane planéité=0.043, Phase 5A.0) vient de la simulation de cassure — un
+dataset de vrais objets physiquement cassés devrait avoir des surfaces plus
+irrégulières/texturées, exactement la condition qui manquait pour que le
+matching par relief fonctionne bien.
+
+**Vérifié le 2026-07-20 (page du dataset) — deux points importants avant de s'engager :**
+- **7 objets réels scannés au laser** (pierre/argile/mortier — gargouilles,
+  sculptures, pièces architecturales) : Gargoyle=30 fragments, Cake=11,
+  Brick=6, Venus=7, Sculpture=15, Head=12, **Forma Urbis Romae=1186**. Format
+  PCD (nuage de points **+ normales**, pas de mesh) ou CDM (scan brut Minolta).
+- **Aucune pose GT / label de réassemblage mentionné sur la page.** Contrairement
+  à Breaking Bad, on ne pourra probablement pas calculer `RotErr`/`Pose@30`
+  directement — toute l'évaluation quantitative du projet en dépend. À vérifier
+  en premier (peut-être disponible via une publication associée, ou à construire
+  manuellement sur un sous-ensemble de paires pour une évaluation qualitative
+  limitée) avant d'investir du temps d'implémentation dessus.
+- Aucun objet n'a exactement 2 fragments (le cas simple de la Phase 5A) — les
+  plus petits sont à 6-7 fragments (Brick, Venus). Le confond multi-voisins
+  (Phase 2D/2B) reviendrait donc immédiatement sur ce dataset, contrairement à
+  Breaking Bad filtré à 2 fragments.
+
+**Prochaine action concrète, dans l'ordre (diagnostic avant grosse implémentation) :**
+1. Télécharger un objet simple du dataset TU Wien (Brick ou Venus, peu de
+   fragments) et vérifier concrètement s'il existe une pose GT exploitable
+   (dans les fichiers, une éventuelle publication associée, ou à défaut aucune
+   — auquel cas définir un protocole d'évaluation qualitatif/manuel).
+2. Mesurer la planéité des faces de fracture sur ce dataset (réutiliser le
+   script de la Phase 5A.0) — vérifie l'hypothèse du tuteur (surfaces plus
+   irrégulières) avant d'investir dans les 5 pistes d'amélioration ci-dessus.
+3. Tester le CNN Step 15 en zero-shot sur ce dataset (comme le split `artifact`
+   du projet) — pas de garantie de transfert, format de points/normales
+   probablement différent de Breaking Bad.
+4. Cadrer et prioriser les 5 pistes d'amélioration une par une — probablement
+   résolution + features en premier (moins ambigu que sliding window et
+   extrapolation, qui ont encore un `(?)` dans leur définition même).
 
 ## Métriques d'évaluation déjà disponibles (ne pas réécrire)
 
@@ -1473,10 +1669,20 @@ corrigés, conclusion : confirme le diagnostic sans le résoudre — `top8_gap` 
 pas d'amélioration). **4B fait et clos** (cross-attention, run initial + run prolongé
 avec `--grad_clip 1.0`, conclusion : ne dépasse pas C1/4A, instabilité/collapse
 dustbin pas résolu par le clipping — voir conclusion ci-dessus). **4D cadré (2026-06-28, fallback, ci-dessus), aucun code écrit.** **5A.0 PASSÉ (2026-06-28, everyday/val, n=3803 objets 2-frags, médiane planéité=0.043).**
-**Phase 5A CLOSE — NÉGATIF (2026-07-08)** : Pose@30=0% (GT et CNN), RotErr≈155°
-pire que le hasard, 80% de paires filtrées. Cause : faces Breaking Bad trop plates
-(médiane planéité=0.043) → signal depth-map quasi-nul → pas de complémentarité
-discriminante. Phase 5B annulée (conditionnait à 5A).
+**Phase 5A RÉOUVERTE — POSITIF MAIS PARTIEL, CONFIRMÉ À GRANDE ÉCHELLE
+(révisé 2026-07-20, run initial du 2026-07-08 invalidé pour cause d'échantillon
+trop petit N=21).** Bug trouvé dans le score (`-CC/overlap` divisait par le
+recouvrement au lieu de le récompenser) ; fix `--score_mode joint` (relief ×
+recouvrement du contour). Run définitif (N=2415 objets 2-frags, 63% du val,
+N=447-522 paires valides) : `Pose@30` (gt) **4.47%→22.03%→27.59%** en
+relief→overlap_only→joint — dépasse la référence Phase 2 `gt_edge` (9.6%),
+quasi 3x mieux. `relief` s'est révélée INSTABLE (9.09% sur N=44 → 4.47% sur
+N=447, signature d'un score bruité), `joint` au contraire s'améliore avec plus
+de données (21.15%→27.59%), signe d'un vrai signal qui converge. Mais reste
+partiel : ~72% des paires échouent encore à Pose@30, ~86% à Pose@15/0.05. Pas
+une solution, un signal réel et robuste qui triple quasiment le meilleur
+résultat géométrique du projet. Phase 5B toujours en attente (pas relancée, 5A
+trop partielle pour justifier l'extension à 3+ fragments pour l'instant).
 
 **Phase 4D CLOSE — POSITIF (2026-07-16).** AUC=0.798 (thresh0.3), AP=0.749,
 P@k=0.733 — best @ epoch 83/500. thresh0.3 > random (+17pp AUC à convergence).
@@ -1576,10 +1782,26 @@ recall pour guider un refinement de pose sur les objets complexes** — décisio
 prise pour éviter d'empiler les erreurs (voir mise en garde du tuteur, Phase 6
 cadrage). **Phase 6.0 close. Phase 6A/6B non lancées, branche fermée.**
 
-## Prochaine action concrète (mise à jour 2026-07-16)
+## Prochaine action concrète (mise à jour 2026-07-20, post-présentation tuteur)
 
-Toutes les phases de matching/filtrage sont closes (0/1/2/3A/4A/4B/4D/5A/6.0).
-4D (compatibilité fragment-fragment, AUC≈0.80) reste le résultat positif principal
-du volet réassemblage. Rédaction du rapport de stage sur cette base — synthèse des
-conclusions par phase déjà écrite dans ce fichier, pas besoin de code supplémentaire
-sauf nouvelle direction explicitement décidée avec le tuteur.
+**Périmé, ne pas suivre :** le paragraphe précédent (2026-07-16) disait "toutes
+les phases closes, rédaction du rapport" — dépassé depuis par la réouverture de
+la Phase 5A (2026-07-20) et la nouvelle direction validée avec le tuteur le
+même jour (voir **Phase 7** ci-dessus, section complète).
+
+**État réel au 2026-07-20 :**
+- Phase 4D (compatibilité fragment-fragment, AUC≈0.80) : close, positive, mise
+  de côté pour plus tard (pas abandonnée) — le tuteur a explicitement recentré
+  sur la pose entre paires déjà connues comme adjacentes.
+- Phase 5A (depth-map matching) : rouverte, positive mais partielle, confirmée
+  à grande échelle (`Pose@30`=27.59% GT / `joint`, N=2415 objets). **C'est la
+  direction active.**
+- Phase 6.0 (recall@k du classifieur 4D) : close NO-GO — non concernée par la
+  réouverture 5A (échantillon déjà large à l'époque, pas un problème de
+  taille d'échantillon comme 5A).
+
+**Prochaine action concrète (détail complet dans la section Phase 7) :** explorer
+le dataset réel TU Wien 3D Puzzles (poses GT à vérifier — probablement absentes),
+mesurer sa planéité, tester le CNN Step 15 en zero-shot dessus, puis cadrer les
+5 pistes d'amélioration du matching depth-map (sliding window, extrapolation,
+résolution, features, modèle appris) une par une avant tout code.
