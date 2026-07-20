@@ -1702,12 +1702,64 @@ attaquent directement le goulot identifié), **puis 3-6** (plus de travail
 d'implémentation, gain potentiellement plafonné par le même problème amont
 sinon).
 
+### Piste 1, tentative 1 — dilatation binaire : NÉGATIF, confirmé (2026-07-20)
+
+**Test en 2 temps, esprit diagnostic avant implémentation :**
+
+**Étape A — sweep de dilatation sur `oracle_overlap_frac` seul** (`--dilate_sweep`,
+diagnostic pur, ne touche pas la recherche) : dilater le masque de fracture de
+1 pixel fait remonter le plafond théorique `gt` de 0.757 à **0.992** — semblait
+confirmer que l'écart au plafond 1.0 est surtout du bruit de discrétisation/
+échantillonnage. **Mais signal d'alerte immédiat** : `random` en profite presque
+autant (0.430→0.830) — l'écart discriminant `gt` vs `random` s'effondre avec la
+dilatation (0.327→0.162 à d=1, →0.027 à d=4). Suspicion soulevée avant même de
+tester en conditions réelles : la dilatation élargit la tolérance pour tout le
+monde, elle ne récupère pas spécifiquement une vraie correspondance.
+
+**Étape B — dilatation branchée dans le pipeline réel** (`--dilate_px 1`,
+appliquée à `rasterize()` avant la recherche/le score, pas seulement au
+diagnostic) — verdict : **la suspicion était fondée.**
+
+```
+                    d=0        d=1 (pipeline)
+OracleOvlp (gt)     0.757  →   0.974   ↑↑ (comme prévu)
+OvlpFrac trouvé     0.648  →   0.838   ↑
+Pose@30 (gt)       20.87%  →  18.28%   ↓ (n'améliore pas, empire même légèrement)
+Pose@15 (gt)       10.43%  →   9.68%   ↓
+RotErr (gt)        105.90° → 110.72°   ↑ (pire)
+```
+
+**Le plafond de recouvrement explose, mais la métrique qui compte
+(`Pose@30`/`Pose@15`) ne s'améliore pas — elle baisse légèrement.** La
+dilatation binaire élargit la tolérance sans ajouter de vraie information :
+elle donne à la recherche plus de positions "à peu près plausibles" à
+départager, ce qui la rend moins précise plutôt que plus précise.
+
+**Conclusion : la dilatation binaire (piste 1, tentative 1) est un pansement,
+pas une solution — confirmé empiriquement, pas juste par intuition.** Rejetée
+comme approche. Code conservé (`--dilate_px`, `--dilate_sweep`) pour
+comparaison/diagnostic futur, mais pas comme réglage par défaut recommandé.
+
+**Piste ouverte pour une "vraie" densification** (discussion en cours,
+2026-07-20) : au lieu d'élargir aveuglément le masque existant (dilatation),
+ajouter de l'information positionnelle — ex. **splat gaussien** (chaque point
+contribue à plusieurs cases voisines pondéré par sa distance réelle, au lieu
+d'un remplissage binaire tout-ou-rien) ou interpolation pondérée par distance
+dans les trous entourés de cases valides. Contrairement à la dilatation, ces
+approches utilisent la position réelle des points plutôt que de simplement
+étendre un masque déjà là — reste à cadrer et tester avec le même protocole
+(sweep diagnostic sur `OracleOvlp` d'abord, avec vérification systématique
+que `random` n'en profite pas autant que `gt`, AVANT de brancher dans le
+pipeline réel comme pour la dilatation).
+
 **Prochaine action concrète, dans l'ordre (diagnostic avant grosse implémentation) :**
-1. Stratifier par `n_frac_pts` (piste 2 ci-dessus) — même logique que la
+1. Cadrer et prototyper une vraie densification (splat gaussien ou
+   interpolation pondérée) — voir discussion ci-dessus. Tester d'abord en
+   diagnostic isolé (comme le sweep de dilatation), avec le même garde-fou
+   (vérifier que `random` ne profite pas autant que `gt`) avant de brancher
+   dans le pipeline réel.
+2. Stratifier par `n_frac_pts` (piste 2 de la roadmap) — même logique que la
    stratification planéité, données déjà loggées.
-2. Prototyper une densification/interpolation légère des masques de fracture
-   (piste 1) et remesurer `OracleOvlp` — objectif : voir si le plafond 0.758
-   peut monter avant de toucher à quoi que ce soit d'autre.
 3. Télécharger un objet simple du dataset TU Wien (Brick ou Venus, peu de
    fragments) et vérifier concrètement s'il existe une pose GT exploitable
    (dans les fichiers, une éventuelle publication associée, ou à défaut aucune
