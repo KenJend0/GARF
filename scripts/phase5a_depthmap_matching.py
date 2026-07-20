@@ -112,6 +112,18 @@ POSE_SUCCESS_THRESH    = [(30.0, 0.1), (15.0, 0.05)]
 PLANARITY_BINS = [0.0, 0.02, 0.05, 0.10, 0.15, 0.20, 0.334]
 PLANARITY_LABELS = ["<0.02", "0.02-0.05", "0.05-0.10", "0.10-0.15", "0.15-0.20", "0.20+"]
 
+# Tranches de nombre de points de fracture (moyenne des 2 fragments) pour la
+# stratification post-hoc (bornes alignées sur les percentiles du pré-check
+# Phase 5A.0 : p25=56, p50=340, p75=1805, p90=3052). Teste l'hypothèse de
+# sparsité derrière le plafond OracleOvlp=0.758 (2026-07-20) : si le plafond
+# est nettement plus bas sur les paires éparses que sur les paires denses,
+# la sparsité d'échantillonnage explique une vraie part du plafond, et une
+# densification (splat gaussien) a de bonnes chances d'aider spécifiquement
+# ces cas. Si le plafond est stable quel que soit le nombre de points, le
+# problème est ailleurs (asymétrie géométrique entre les deux masques).
+N_FRAC_PTS_BINS = [0, 100, 300, 1000, 3000, 10**9]
+N_FRAC_PTS_LABELS = ["<100", "100-300", "300-1000", "1000-3000", "3000+"]
+
 
 # ── Géométrie ─────────────────────────────────────────────────────────────────
 
@@ -389,6 +401,44 @@ def planarity_stratification(planarity, rot_err, pose30, pose15):
         rows.append({
             "bin": label,
             "n": n,
+            "rot_err_mean": float(rot_err[mask].mean()),
+            "pose_30deg_0.1": 100.0 * float(pose30[mask].mean()),
+            "pose_15deg_0.05": 100.0 * float(pose15[mask].mean()),
+        })
+    return rows
+
+
+def frac_pts_stratification(n_frac_pts, oracle_ovlp, rot_err, pose30, pose15):
+    """Découpe les paires par tranche de nombre de points de fracture (moyenne
+    des 2 fragments) et calcule OracleOvlp / RotErr / Pose@30 / Pose@15 par tranche.
+
+    Teste l'hypothèse de sparsité derrière le plafond OracleOvlp=0.758
+    (2026-07-20, cf. PLAN_REASSEMBLY_MODULE.md) : si OracleOvlp est nettement
+    plus bas sur les paires éparses (peu de points) et proche de 1.0 sur les
+    paires denses, la sparsité d'échantillonnage explique le plafond — une
+    densification (splat gaussien) devrait aider spécifiquement les cas
+    épars. Si OracleOvlp est stable quel que soit le nombre de points, la
+    sparsité n'est pas la vraie cause, il faut chercher ailleurs.
+    Retourne une liste de dicts, un par tranche (vide si aucune paire dedans).
+    """
+    n_frac_pts  = np.asarray(n_frac_pts)
+    oracle_ovlp = np.asarray(oracle_ovlp)
+    rot_err     = np.asarray(rot_err)
+    pose30      = np.asarray(pose30)
+    pose15      = np.asarray(pose15)
+    idx = np.digitize(n_frac_pts, N_FRAC_PTS_BINS[1:-1])   # 0..len(labels)-1
+
+    rows = []
+    for b, label in enumerate(N_FRAC_PTS_LABELS):
+        mask = idx == b
+        n = int(mask.sum())
+        if n == 0:
+            rows.append({"bin": label, "n": 0})
+            continue
+        rows.append({
+            "bin": label,
+            "n": n,
+            "oracle_overlap_frac_mean": float(oracle_ovlp[mask].mean()),
             "rot_err_mean": float(rot_err[mask].mean()),
             "pose_30deg_0.1": 100.0 * float(pose30[mask].mean()),
             "pose_15deg_0.05": 100.0 * float(pose15[mask].mean()),
@@ -705,6 +755,7 @@ def main():
                         for d_str, v in res["oracle_overlap_frac_sweep"].items():
                             accum[strat][f"oracle_ovlp_d{d_str}"].append(v)
                         accum[strat]["planarity"].append(float(np.mean(res["planarity"])))
+                        accum[strat]["n_frac_pts"].append(float(np.mean(res["n_frac_pts"])))
 
     elapsed = time.time() - t0
     print(f"\nFini : {n_pairs_total} paires traitées ({n_2frag_seen} objets 2-frags vus)"
@@ -779,6 +830,38 @@ def main():
     print("(Lecture : si Pose@30 monte et RotErr baisse en allant vers les tranches\n"
           " les moins plates, la thèse 'trop plat = pas de signal' est confirmée dans\n"
           " le détail. Si c'est plat ou pas pareil, le facteur limitant est ailleurs.)")
+
+    # ── Stratification par nombre de points : la sparsité explique-t-elle le
+    # plafond OracleOvlp=0.758 (2026-07-20) ? ───────────────────────────────────
+    print(f"\nSTRATIFICATION PAR NOMBRE DE POINTS (moyenne des 2 fragments, tranches "
+          f"alignées sur les percentiles Phase 5A.0)")
+    npts_header = (f"{'Strategy':<12} {'Bin':<12} {'N':>5} {'OracleOvlp':>10} "
+                   f"{'RotErr°':>8} {'Pose@30':>9} {'Pose@15':>9}")
+    print(npts_header)
+    print("-" * len(npts_header))
+    for strat in ("gt", "thresh0.3", "random"):
+        acc = accum[strat]
+        if not acc.get("rot_err"):
+            continue
+        rows_n = frac_pts_stratification(
+            acc["n_frac_pts"], acc.get("oracle_overlap_frac", [0] * len(acc["rot_err"])),
+            acc["rot_err"],
+            acc.get("pose_30deg_0.1", [0] * len(acc["rot_err"])),
+            acc.get("pose_15deg_0.05", [0] * len(acc["rot_err"])),
+        )
+        for row in rows_n:
+            if row["n"] == 0:
+                print(f"{strat:<12} {row['bin']:<12} {'—':>5}")
+            else:
+                print(f"{strat:<12} {row['bin']:<12} {row['n']:>5} "
+                      f"{row['oracle_overlap_frac_mean']:>10.3f} {row['rot_err_mean']:>8.2f} "
+                      f"{row['pose_30deg_0.1']:>8.2f}% {row['pose_15deg_0.05']:>8.2f}%")
+        summary[strat]["n_frac_pts_strata"] = rows_n
+    print("(Lecture : si OracleOvlp monte nettement des tranches éparses vers les\n"
+          " tranches denses, la sparsité d'échantillonnage explique le plafond -- une\n"
+          " densification (splat gaussien) devrait aider spécifiquement les cas épars.\n"
+          " Si OracleOvlp est stable quel que soit le nombre de points, la sparsité\n"
+          " n'est pas la vraie cause, il faut chercher ailleurs.)")
 
     print(f"\nRéférence Phase 2 global : Pose@30 ≈ 1.3-3.2%  |  gt_edge oracle : Pose@30 ≈ 9.6%")
     print(f"score_mode={args.score_mode}  "
