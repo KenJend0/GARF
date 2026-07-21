@@ -671,6 +671,25 @@ def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, a
                 frac_i, frac_j, c_j, u_j, v_j, u_min_j, v_min_j,
                 args.resolution, pixel_size, R_ij_gt, t_ij_gt, gaussian_sigma_px=g,
             )
+        # Sweep de résolution (piste 3 Phase 7, 2026-07-21) : diagnostic PUR, comme
+        # dilate_sweep/gaussian_sweep ci-dessus -- ne touche pas au pipeline réel de
+        # recherche, seulement à oracle_overlap_frac. Pour chaque résolution candidate,
+        # pixel_size ET u_min_j/v_min_j sont recalculés (u_min/v_min dépendent de
+        # pixel_size -- cf. rasterize()) pour garder la même étendue physique, seule
+        # la finesse de la grille change. Teste si le plafond 0.758 (résolution 64
+        # fixe) remonte à résolution plus fine ou plus grossière, et surtout si
+        # l'écart gt/random se maintient (sinon même défaut que la dilatation : un
+        # gain mécanique qui profite à tout le monde, pas un vrai signal).
+        cj_coords_u = cj @ u_j
+        cj_coords_v = cj @ v_j
+        for r in args.resolution_sweep:
+            pixel_size_r = max(span_i, span_j) * 1.1 / r
+            u_min_j_r = float(cj_coords_u.min()) - 0.5 * pixel_size_r
+            v_min_j_r = float(cj_coords_v.min()) - 0.5 * pixel_size_r
+            oracle_ovlp_sweep[f"res{r}"] = oracle_overlap_frac(
+                frac_i, frac_j, c_j, u_j, v_j, u_min_j_r, v_min_j_r,
+                r, pixel_size_r, R_ij_gt, t_ij_gt,
+            )
 
         best_score, best_theta, best_shift, best_flip, best_overlap_frac = match_depthmaps(
             dmap_i, valid_i, dmap_j, valid_j, args.n_angles, score_mode=args.score_mode)
@@ -763,6 +782,14 @@ def main():
                              "à comparer à --dilate_sweep : vérifier que l'écart gt vs "
                              "random se maintient (contrairement à la dilatation, où "
                              "il s'effondrait de 0.327 à 0.027 entre d=0 et d=4).")
+    parser.add_argument("--resolution_sweep", type=int, nargs="+",
+                        default=[24, 32, 48, 64, 96, 128],
+                        help="Résolutions (RxR px) testées pour oracle_overlap_frac "
+                             "(piste 3 Phase 7, 2026-07-21) -- diagnostic pur, ne "
+                             "touche pas au pipeline réel de recherche. Mesure si le "
+                             "plafond 0.758 (résolution 64 fixe) remonte à une autre "
+                             "résolution, et si l'écart gt/random se maintient (sinon "
+                             "même défaut que la dilatation/le splat, déjà rejetés).")
     parser.add_argument("--device",      default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--summary_json", default="")
     args = parser.parse_args()
@@ -1080,6 +1107,31 @@ def main():
           " par la distance réelle aux points -- garde-fou à vérifier : l'écart gt vs\n"
           " random doit se maintenir ou grandir avec sigma, pas s'effondrer comme avec\n"
           " la dilatation. S'il s'effondre pareil, le splat a le même défaut.)")
+
+    # ── Sweep de résolution : piste 3 Phase 7 (2026-07-21), diagnostic pur avant
+    # toute modification du pipeline réel ──────────────────────────────────────
+    print(f"\nSWEEP RÉSOLUTION (OracleOvlp moyen par résolution RxR, piste 3 Phase 7)")
+    rsweep_header = f"{'Strategy':<12}" + "".join(f"{'R='+str(r):>8}" for r in args.resolution_sweep)
+    print(rsweep_header)
+    print("-" * len(rsweep_header))
+    for strat in ("gt", "thresh0.3", "random"):
+        acc = accum[strat]
+        if not acc.get("rot_err"):
+            continue
+        row_vals = {}
+        row = f"{strat:<12}"
+        for r in args.resolution_sweep:
+            vals = acc.get(f"oracle_ovlp_res{r}", [])
+            m = float(np.mean(vals)) if vals else 0.0
+            row_vals[str(r)] = m
+            row += f"{m:>8.3f}"
+        print(row)
+        summary[strat]["oracle_ovlp_resolution_sweep"] = row_vals
+    print("(Lecture : si OracleOvlp gt monte nettement en changeant R SANS que random\n"
+          " suive au même rythme, la résolution actuelle (64, fixe pour tous) est mal\n"
+          " calibrée et une résolution adaptative (liée à la densité de points) a de\n"
+          " bonnes chances d'aider réellement. Si gt et random bougent pareil (comme la\n"
+          " dilatation/le splat), c'est un gain mécanique, pas un vrai signal -- rejeter.)")
 
     if args.summary_json:
         Path(args.summary_json).parent.mkdir(parents=True, exist_ok=True)

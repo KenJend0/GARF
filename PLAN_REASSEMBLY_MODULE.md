@@ -2286,3 +2286,28 @@ après stabilisation du depth-map matching, pas avant.
 4. Dataset réel TU Wien 3D Puzzles — reporté, moins prioritaire vu ces
    résultats (poses GT à vérifier, planéité à mesurer, CNN Step 15 en
    zero-shot).
+
+## Piste 3 — Résolution adaptative (2026-07-21, en cours)
+
+**Diagnostic ajouté (pas encore de résultat, pas encore branché dans le pipeline
+réel) : `--resolution_sweep`** dans `phase5a_depthmap_matching.py`, même principe
+que `--dilate_sweep`/`--gaussian_sweep` (tous deux rejetés le 2026-07-20) — pour
+chaque paire, calcule `oracle_overlap_frac` à plusieurs résolutions de grille
+(défaut `24 32 48 64 96 128`, `RESOLUTION=64` actuel étant fixe pour tous), en
+recalculant `pixel_size` et `u_min/v_min` à chaque résolution (ils en dépendent).
+Ne touche pas au pipeline réel de recherche/scoring — diagnostic pur avant
+implémentation, discipline établie par les deux tentatives de densification
+précédentes.
+
+**Critère de lecture (identique à dilatation/splat) :** si `OracleOvlp` sur `gt`
+remonte nettement plus vite que sur `random` à une résolution donnée, la
+résolution actuelle est mal calibrée et une résolution adaptative (liée à la
+densité de points, cf. cible chiffrée de l'audit des rejets : fill-rate ~2%
+paires en échec vs ~9% paires en succès) a de bonnes chances d'aider
+réellement. Si `gt` et `random` bougent pareil, c'est un gain mécanique à
+rejeter, comme pour la dilatation.
+
+**Prochaine étape :** lancer le sweep sur le serveur, lire le résultat, puis
+seulement si positif implémenter une résolution adaptative par paire (liée à
+`min(n_i, n_j)`, cf. hypothèse du maillon faible objet#21) dans `rasterize()`/
+`oracle_overlap_frac()`/`match_depthmaps()`.
