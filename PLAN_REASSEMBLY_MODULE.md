@@ -2343,5 +2343,36 @@ Pour chaque résolution candidate testée (coût contrôlé : restreint par déf
 comme toujours), mesure `Pose@30`/`Pose@15`/`RotErr` réels ET `min(n_i,n_j)`,
 stratifiés après-coup par tranche de densité (`density_pose_stratification()`,
 même tranches que `frac_pts_min_stratification`). Nouvelle table de sortie
-**SWEEP DENSITÉ x RÉSOLUTION**. Résultat pas encore lancé — prochaine action :
-`--pose_resolution_sweep 24 32 48 64 96 128` sur le run définitif (N≈2415).
+**SWEEP DENSITÉ x RÉSOLUTION**.
+
+**Résultat (2026-07-21, N=2415, `gt`, R=24/32/48/64/96/128) — hypothèse
+INFIRMÉE dans le sens attendu, mais un signal réel dans l'autre sens.** Par
+tranche de densité : les tranches DENSES (200-500, 500-1000) sont quasi
+plates quelle que soit R (Pose@30 ~28-30%, N stable) — la résolution ne les
+affecte pas, assez de points pour remplir la grille à toute résolution
+testée. Les tranches ÉPARSES (50-100, 100-200) montent en Pose@30 avec R
+(100-200 : 23.68%→35.86% de R=24 à R=128) MAIS perdent énormément de paires
+en route (50-100 : N=97→10). **Métrique qui compte réellement — succès nets
+sur la population totale (N×Pose@30 / 2415)** : R=24 → 6.25%, R=32 → 6.09%,
+R=48 → 6.00%, R=64 (actuel) → 5.84%, R=96 → 5.47%, R=128 → 4.64% — **décroît
+continûment avec R**. Donc la résolution actuelle (64) n'est pas optimale,
+mais dans le sens inverse de l'hypothèse "adaptative fin/grossier selon
+densité" : une grille plus GROSSIÈRE partout donne plus de succès nets, pas
+une résolution variable par paire. Gain modeste (+7% relatif R=24 vs R=64),
+loin du saut ciblé par l'audit (fill-rate 2%→9%).
+
+**Investigation demandée par l'utilisateur (2026-07-21) : POURQUOI l'attrition
+grandit avec R, pas seulement CONSTATER le compromis.** Ajout du tracking des
+deux raisons d'échec possibles de `run_match_at_resolution` (`sparse_dmap` :
+pas assez de cases occupées après rasterisation ; `no_overlap_3d` :
+alignement trouvé mais <3 correspondances 3D reconstruites après rotation/
+arrondi pixel), stratifié par densité, dans une nouvelle table **ATTRITION
+PAR RÉSOLUTION x DENSITÉ**. Hypothèse de travail avant le run : `no_overlap_3d`
+devrait grandir avec R (pas `sparse_dmap`) car `n_angles=36` (pas angulaire
+fixe, 10°/pas) ne s'affine pas avec la grille — l'erreur de quantification
+angulaire (jusqu'à 5° d'écart, déplacement tangentiel ≈ r·sin(5°) pour un
+point à distance r du centre) devient proportionnellement plus grosse en
+pixels quand le pixel physique rétrécit, ce qui ferait rater la case de
+correspondance après arrondi. Résultat pas encore lancé — prochaine action :
+relancer `--pose_resolution_sweep` (code déjà en place) et lire la nouvelle
+table.

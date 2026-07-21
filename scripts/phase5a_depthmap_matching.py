@@ -685,6 +685,43 @@ def density_pose_stratification(n_frac_pts_min, rot_err, pose30, pose15):
     return rows
 
 
+def attrition_by_density_stratification(nmin_ok, nmin_skip_sparse, nmin_skip_nooverlap):
+    """Répartit succès et les DEUX raisons d'échec possibles dans
+    `run_match_at_resolution` (`sparse_dmap` : pas assez de cases occupées
+    après rasterisation ; `no_overlap_3d` : alignement trouvé mais < 3
+    correspondances 3D reconstruites après rotation/arrondi pixel) par tranche
+    de densité `min(n_i,n_j)`, pour UNE résolution donnée.
+
+    Ajouté le 2026-07-21 suite à la demande explicite de l'utilisateur
+    d'investiguer directement POURQUOI une résolution plus fine perd des
+    paires (le sweep précédent montrait juste que ça arrivait, sans dire
+    laquelle des deux raisons domine ni si c'est uniforme ou concentré sur
+    les paires éparses). Retourne une liste de dicts, un par tranche.
+    """
+    nmin_ok = np.asarray(nmin_ok)
+    nmin_sp = np.asarray(nmin_skip_sparse)
+    nmin_no = np.asarray(nmin_skip_nooverlap)
+    idx_ok = np.digitize(nmin_ok, N_FRAC_PTS_MIN_BINS[1:-1]) if len(nmin_ok) else np.array([], dtype=int)
+    idx_sp = np.digitize(nmin_sp, N_FRAC_PTS_MIN_BINS[1:-1]) if len(nmin_sp) else np.array([], dtype=int)
+    idx_no = np.digitize(nmin_no, N_FRAC_PTS_MIN_BINS[1:-1]) if len(nmin_no) else np.array([], dtype=int)
+
+    rows = []
+    for b, label in enumerate(N_FRAC_PTS_MIN_LABELS):
+        n_ok = int((idx_ok == b).sum())
+        n_sp = int((idx_sp == b).sum())
+        n_no = int((idx_no == b).sum())
+        n_tot = n_ok + n_sp + n_no
+        rows.append({
+            "bin": label,
+            "n_ok": n_ok,
+            "n_skip_sparse_dmap": n_sp,
+            "n_skip_no_overlap_3d": n_no,
+            "n_total": n_tot,
+            "skip_rate": 100.0 * (n_sp + n_no) / n_tot if n_tot else 0.0,
+        })
+    return rows
+
+
 def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, args, rng):
     """Traite une paire dirigée i→j. Retourne un dict de résultats par stratégie."""
     results = {}
@@ -1045,6 +1082,17 @@ def main():
                     if dsweep:
                         for r_key, r_res in dsweep.items():
                             if "skip" in r_res:
+                                # Attrition (piste 3 Phase 7, 2026-07-21) : POURQUOI une
+                                # résolution plus fine perd des paires -- garder la raison
+                                # (sparse_dmap = pas assez de cases occupées après
+                                # rasterisation ; no_overlap_3d = alignement trouvé mais
+                                # < 3 correspondances 3D reconstruites après rotation/
+                                # arrondi pixel) ET la densité, pour voir si l'attrition
+                                # est uniforme ou concentrée sur les paires éparses.
+                                reason = r_res["skip"]
+                                accum[strat][f"dsweep_res{r_key}_skip_{reason}"].append(1)
+                                accum[strat][f"dsweep_res{r_key}_skip_{reason}_nmin"].append(
+                                    r_res["n_frac_pts_min"])
                                 continue
                             accum[strat][f"dsweep_res{r_key}_rot_err"].append(r_res["rot_err"])
                             accum[strat][f"dsweep_res{r_key}_n_frac_pts_min"].append(
@@ -1314,6 +1362,43 @@ def main():
               " l'hypothèse d'une résolution ADAPTATIVE liée à la densité. Si aucune\n"
               " résolution ne change Pose@30 dans aucune tranche, la résolution n'est pas\n"
               " le facteur limitant -- chercher ailleurs.)")
+
+        # ── Attrition par résolution x densité : POURQUOI une résolution plus fine
+        # perd des paires (2026-07-21, suite à la demande explicite de l'utilisateur
+        # d'investiguer directement le mécanisme, pas juste le compromis observé) ──
+        print(f"\nATTRITION PAR RÉSOLUTION x DENSITÉ (répartition succès / sparse_dmap / "
+              f"no_overlap_3d par tranche min(n_i,n_j), pour chaque R -- piste 3 Phase 7)")
+        for strat in args.pose_resolution_sweep_strategies:
+            acc = accum[strat]
+            for r in args.pose_resolution_sweep:
+                nmin_ok = acc.get(f"dsweep_res{r}_n_frac_pts_min", [])
+                nmin_sp = acc.get(f"dsweep_res{r}_skip_sparse_dmap_nmin", [])
+                nmin_no = acc.get(f"dsweep_res{r}_skip_no_overlap_3d_nmin", [])
+                if not (nmin_ok or nmin_sp or nmin_no):
+                    continue
+                rows_a = attrition_by_density_stratification(nmin_ok, nmin_sp, nmin_no)
+                n_ok_tot  = len(nmin_ok)
+                n_sp_tot  = len(nmin_sp)
+                n_no_tot  = len(nmin_no)
+                n_all_tot = n_ok_tot + n_sp_tot + n_no_tot
+                print(f"\n{strat} @ R={r} (N_total={n_all_tot} : "
+                      f"ok={n_ok_tot}, sparse_dmap={n_sp_tot}, no_overlap_3d={n_no_tot})")
+                at_header = (f"  {'Bin':<12} {'N_ok':>6} {'Sparse':>7} "
+                             f"{'NoOvlp3D':>9} {'Total':>7} {'SkipRate':>9}")
+                print(at_header)
+                for row in rows_a:
+                    if row["n_total"] == 0:
+                        print(f"  {row['bin']:<12} {'—':>6}")
+                    else:
+                        print(f"  {row['bin']:<12} {row['n_ok']:>6} "
+                              f"{row['n_skip_sparse_dmap']:>7} {row['n_skip_no_overlap_3d']:>9} "
+                              f"{row['n_total']:>7} {row['skip_rate']:>8.1f}%")
+        print("\n(Lecture : si `no_overlap_3d` grandit avec R alors que `sparse_dmap` reste\n"
+              " stable, l'attrition vient de la tolérance de correspondance après rotation\n"
+              " (la grille se resserre mais n_angles=36 -- pas de step angulaire fin -- reste\n"
+              " fixe, l'erreur de quantification angulaire devient relativement plus grosse\n"
+              " en pixels à résolution fine). Si c'est concentré sur les tranches éparses,\n"
+              " le problème est spécifique à la densité, pas à la résolution en général.)")
 
     if args.summary_json:
         Path(args.summary_json).parent.mkdir(parents=True, exist_ok=True)
