@@ -261,6 +261,9 @@ def main():
                 break
             if args.max_batches > 0 and batch_idx >= args.max_batches:
                 break
+            if batch_idx % 200 == 0:
+                print(f"  batch {batch_idx} | objets 2-frags vus={n_seen_2frag} | "
+                      f"sauvegardées={n_saved}/{args.n_vis}")
 
             batch_gpu = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                          for k, v in batch.items()}
@@ -292,16 +295,22 @@ def main():
             score_per_k = [pred_flat[offsets[k]:offsets[k+1]] for k in range(K)]
             pc_per_k    = [frag_list[k].cpu().numpy()          for k in range(K)]
 
-            (k0, p0), (k1, p1) = bp_pairs
-            raw_i = pc_per_k[k0] * scale_np[0, p0]
-            raw_j = pc_per_k[k1] * scale_np[0, p1]
+            # bp_pairs contient des tuples (b, p) -- PAS (k, p). k (l'indice de
+            # fragment dans frag_list/pc_per_k) est la position dans bp_pairs,
+            # pas b (toujours 0 ici puisque batch_size=1). Bug corrigé le
+            # 2026-07-20 : avant ce fix, k0=k1=0 pour toute paire (b valait
+            # toujours 0), donc raw_i et raw_j pointaient sur LE MÊME fragment
+            # (pc_per_k[0]) -- d'où 0 succès trouvés, peu importe la paire.
+            (k0, (b0, p0)), (k1, (b1, p1)) = list(enumerate(bp_pairs))
+            raw_i = pc_per_k[k0] * scale_np[b0, p0]
+            raw_j = pc_per_k[k1] * scale_np[b1, p1]
             gt_i, gt_j = gt_per_k[k0], gt_per_k[k1]
             sc_i, sc_j = score_per_k[k0], score_per_k[k1]
 
-            R0 = quat_wxyz_to_rotmat(quats_np[0, p0])
-            R1 = quat_wxyz_to_rotmat(quats_np[0, p1])
+            R0 = quat_wxyz_to_rotmat(quats_np[b0, p0])
+            R1 = quat_wxyz_to_rotmat(quats_np[b1, p1])
             R_ij = R1.T @ R0
-            t_ij = R1.T @ (trans_np[0, p0] - trans_np[0, p1])
+            t_ij = R1.T @ (trans_np[b0, p0] - trans_np[b1, p1])
 
             frac_i, frac_j = make_masks(raw_i, raw_j, gt_i, gt_j, sc_i, sc_j, args.strategy, rng)
             if len(frac_i) < MIN_FRAC_POINTS or len(frac_j) < MIN_FRAC_POINTS:
