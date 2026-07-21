@@ -2373,6 +2373,52 @@ fixe, 10°/pas) ne s'affine pas avec la grille — l'erreur de quantification
 angulaire (jusqu'à 5° d'écart, déplacement tangentiel ≈ r·sin(5°) pour un
 point à distance r du centre) devient proportionnellement plus grosse en
 pixels quand le pixel physique rétrécit, ce qui ferait rater la case de
-correspondance après arrondi. Résultat pas encore lancé — prochaine action :
-relancer `--pose_resolution_sweep` (code déjà en place) et lire la nouvelle
-table.
+correspondance après arrondi.
+
+**Résultat (2026-07-21, N=2415, `gt` + `random`) — hypothèse CONFIRMÉE pour le
+mécanisme, et surtout : la piste résolution est un VRAI signal, pas un piège
+type dilatation.** `no_overlap_3d` grandit bien avec R pour `gt` (430→669 de
+R=24 à R=128), `sparse_dmap` reste à 0 sur toute la plage (les points GT sont
+assez répartis spatialement pour toujours passer le plancher de 20 cases,
+même à R=24) — confirme le mécanisme du plancher mathématique à 3
+correspondances minimum pour Kabsch, expliqué par l'utilisateur : avec peu de
+cases remplies des deux côtés, même la meilleure position possible a de
+fortes chances de ne jamais faire coïncider 3 cases, indépendamment de la
+qualité de la recherche.
+
+**Test décisif demandé par l'utilisateur — `random` dans CE sweep précis
+(pas l'ancien sweep OracleOvlp isolé) : `Pose@30(random)` reste à ~0% à
+TOUTES les résolutions** (46/0%, 104/0.96% — 1 seul cas sur 104, bruit de
+tirage —, 160/0%, 175/0%, 182/0%, 166/0%), alors que son nombre de tentatives
+qui passent le plancher des 3 correspondances augmente lui aussi avec R
+grossier (comme `gt`). **Différence structurelle avec la dilatation/le
+splat** : ces derniers fabriquaient de la tolérance (marquaient "remplies"
+des cases sans vrais points, `random` en profitait presque autant que `gt`) ;
+grossir la résolution ne fabrique rien, ça regroupe seulement de vrais
+points en paquets plus gros — donc `random` obtient plus de TENTATIVES mais
+aucun gain de VALIDITÉ (il n'y a aucune vraie relation géométrique entre deux
+nuages aléatoires, quelle que soit la grille). **Conclusion validée : le gain
+de succès nets R=24 vs R=64 (6.25% vs 5.84%, calcul précédent) est un vrai
+signal.**
+
+**Suite demandée par l'utilisateur (2026-07-21) : isoler la confusion
+résolution/pas-angulaire avant de conclure sur l'optimum.** Remarque
+pertinente : `n_angles=36` (10°/pas) est resté FIXE pendant tout le sweep
+précédent — à résolution fine, la même imprécision angulaire se traduit par
+un déplacement en pixels plus grand (proportionnel), ce qui peut expliquer
+une partie de l'attrition `no_overlap_3d` à haute résolution sans que ce
+soit un vrai défaut de la finesse de grille elle-même.
+
+**Implémenté (2026-07-21) : `--pose_angle_sweep` + refactor `n_angles`
+explicite.** `run_match_at_resolution()` prend maintenant `n_angles` en
+paramètre explicite (plus lu depuis `args.n_angles`), et une nouvelle
+fonction `build_resolution_angle_combos(args)` construit la liste des
+combinaisons (résolution, n_angles) à tester : chaque R de
+`--pose_resolution_sweep` avec le `n_angles` global (comportement identique
+au run précédent), PLUS des combinaisons explicites `"R:NA"` via
+`--pose_angle_sweep` (ex. `128:72 128:144`) pour tester une résolution fine
+avec une recherche angulaire plus fine, isolément. Tables de sortie mises à
+jour (clé `R,n_angles` au lieu de `R` seul). Résultat pas encore lancé —
+prochaine action : sweep étendu vers R plus bas (12/16/20) ET
+`--pose_angle_sweep 128:72 128:144` pour trancher si R=128 mal desservi
+par un `n_angles` trop grossier rattrape R=24 une fois affiné.

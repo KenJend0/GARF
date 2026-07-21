@@ -603,17 +603,29 @@ def oracle_overlap_frac(frac_i, frac_j, c_j, u_j, v_j, u_min_j, v_min_j,
 
 def run_match_at_resolution(frac_i, c_i, u_i, v_i, n_i,
                              frac_j, c_j, u_j, v_j, n_j,
-                             span_i, span_j, resolution, args, R_ij_gt, t_ij_gt):
+                             span_i, span_j, resolution, n_angles, args, R_ij_gt, t_ij_gt):
     """Exécute le pipeline complet (rasterize -> match_depthmaps -> Kabsch) à UNE
-    résolution donnée. Factorisé pour être appelé à la fois pour le run principal
-    (args.resolution) et pour le sweep densité x résolution (piste 3 Phase 7,
-    2026-07-21) -- CONTRAIREMENT à oracle_overlap_frac (diagnostic pur sur le
-    recouvrement de footprint), mesure la métrique qui compte réellement :
-    Pose@30/Pose@15 sur le pipeline réel. Nécessaire car le sweep purement
-    OracleOvlp (2026-07-21) s'est révélé biaisé de la même façon que la
-    dilatation/le splat gaussien avant lui : un bon recouvrement mécanique ne
-    garantit pas une bonne pose, cf. plan Phase 7. Retourne un dict avec soit
-    {"skip": ...} soit les métriques de pose.
+    résolution ET UN n_angles donnés. Factorisé pour être appelé pour le sweep
+    densité x résolution (piste 3 Phase 7, 2026-07-21) -- CONTRAIREMENT à
+    oracle_overlap_frac (diagnostic pur sur le recouvrement de footprint),
+    mesure la métrique qui compte réellement : Pose@30/Pose@15 sur le pipeline
+    réel. Nécessaire car le sweep purement OracleOvlp (2026-07-21) s'est
+    révélé biaisé de la même façon que la dilatation/le splat gaussien avant
+    lui : un bon recouvrement mécanique ne garantit pas une bonne pose, cf.
+    plan Phase 7.
+
+    `n_angles` est un paramètre EXPLICITE (pas lu depuis `args.n_angles`)
+    depuis le 2026-07-21, suite à la remarque de l'utilisateur : à résolution
+    fine, le pas angulaire fixe (`args.n_angles`, historiquement 36 = 10°/pas)
+    induit un déplacement en PIXELS proportionnellement plus grand qu'à
+    résolution grossière (un même écart angulaire déplace un point à distance
+    r du centre de r·sin(erreur) en unités physiques, donc de PLUS de pixels
+    quand le pixel physique rétrécit) -- ce qui peut expliquer une partie de
+    l'attrition `no_overlap_3d` à haute résolution SANS que ce soit un vrai
+    défaut de la résolution fine elle-même. Permet de tester résolution et
+    finesse angulaire indépendamment (cf. `--pose_angle_sweep`).
+
+    Retourne un dict avec soit {"skip": ...} soit les métriques de pose.
     """
     pixel_size = max(span_i, span_j) * 1.1 / resolution
     dmap_i, valid_i, u_min_i, v_min_i = rasterize(
@@ -628,7 +640,7 @@ def run_match_at_resolution(frac_i, c_i, u_i, v_i, n_i,
         return {"skip": "sparse_dmap", "n_pix": (n_pix_i, n_pix_j)}
 
     best_score, best_theta, best_shift, best_flip, best_overlap_frac = match_depthmaps(
-        dmap_i, valid_i, dmap_j, valid_j, args.n_angles, score_mode=args.score_mode)
+        dmap_i, valid_i, dmap_j, valid_j, n_angles, score_mode=args.score_mode)
 
     pts_i3, pts_j3 = build_correspondences(
         dmap_i, valid_i, c_i, u_i, v_i, n_i, u_min_i, v_min_i,
@@ -683,6 +695,24 @@ def density_pose_stratification(n_frac_pts_min, rot_err, pose30, pose15):
             "pose_15deg_0.05": 100.0 * float(pose15[mask].mean()),
         })
     return rows
+
+
+def build_resolution_angle_combos(args):
+    """Construit la liste des combinaisons (résolution, n_angles) à tester dans
+    le sweep densité x résolution (piste 3 Phase 7). Chaque résolution de
+    `--pose_resolution_sweep` est testée avec le `n_angles` global
+    (`--n_angles`, comportement historique du 2026-07-21) ; `--pose_angle_sweep`
+    ajoute des combinaisons EXPLICITES "R:NA" pour isoler l'effet du pas
+    angulaire de celui de la résolution -- ajouté suite à la remarque de
+    l'utilisateur (2026-07-21) : l'attrition `no_overlap_3d` à haute résolution
+    pourrait venir d'un pas angulaire trop grossier resté fixe, pas d'un vrai
+    défaut de la résolution fine. Retourne une liste de tuples (r, n_angles).
+    """
+    combos = [(r, args.n_angles) for r in args.pose_resolution_sweep]
+    for spec in args.pose_angle_sweep:
+        r_str, na_str = spec.split(":")
+        combos.append((int(r_str), int(na_str)))
+    return combos
 
 
 def attrition_by_density_stratification(nmin_ok, nmin_skip_sparse, nmin_skip_nooverlap):
@@ -774,15 +804,16 @@ def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, a
         # même discipline "diagnostiquer sur l'oracle d'abord" que tout le
         # projet) via --pose_resolution_sweep_strategies.
         density_sweep_result = None
-        if args.pose_resolution_sweep and strat in args.pose_resolution_sweep_strategies:
+        if (args.pose_resolution_sweep or args.pose_angle_sweep) and \
+                strat in args.pose_resolution_sweep_strategies:
             n_frac_min_pair = min(len(frac_i), len(frac_j))
             density_sweep_result = {}
-            for r in args.pose_resolution_sweep:
+            for r, na in build_resolution_angle_combos(args):
                 res_r = run_match_at_resolution(
                     frac_i, c_i, u_i, v_i, n_i, frac_j, c_j, u_j, v_j, n_j,
-                    span_i, span_j, r, args, R_ij_gt, t_ij_gt)
+                    span_i, span_j, r, na, args, R_ij_gt, t_ij_gt)
                 res_r["n_frac_pts_min"] = n_frac_min_pair
-                density_sweep_result[str(r)] = res_r
+                density_sweep_result[f"{r}_na{na}"] = res_r
 
         dmap_i, valid_i, u_min_i, v_min_i = rasterize(
             frac_i, c_i, u_i, v_i, n_i, args.resolution, pixel_size,
@@ -951,6 +982,14 @@ def main():
                              "même discipline que le reste du projet -- diagnostiquer "
                              "sur l'oracle avant de dépenser le budget de calcul sur "
                              "thresh0.3/random).")
+    parser.add_argument("--pose_angle_sweep", nargs="+", default=[],
+                        help="Combinaisons EXPLICITES 'R:NA' (résolution:n_angles) "
+                             "testées EN PLUS de --pose_resolution_sweep, ex. "
+                             "'128:72 128:144' (2026-07-21, isole l'effet du pas "
+                             "angulaire de celui de la résolution -- l'attrition "
+                             "no_overlap_3d à haute résolution pourrait venir d'un "
+                             "n_angles resté fixe, trop grossier pour la grille fine, "
+                             "pas d'un vrai défaut de la résolution fine elle-même).")
     parser.add_argument("--device",      default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--summary_json", default="")
     args = parser.parse_args()
@@ -1323,24 +1362,27 @@ def main():
     # ── Sweep densité x résolution : Pose@30 RÉEL (pipeline complet), stratifié
     # par min(n_i, n_j) -- réponse à la critique du 2026-07-21 sur le sweep
     # OracleOvlp seul (biaisé, moyenne globale, overlap != pose) ────────────────
-    if args.pose_resolution_sweep:
+    if args.pose_resolution_sweep or args.pose_angle_sweep:
+        combos = build_resolution_angle_combos(args)
         print(f"\nSWEEP DENSITÉ x RÉSOLUTION (Pose@30/Pose@15 RÉELS, pipeline complet, "
               f"stratifié par min(n_i,n_j) -- piste 3 Phase 7)")
         for strat in args.pose_resolution_sweep_strategies:
             acc = accum[strat]
-            for r in args.pose_resolution_sweep:
-                re_key   = f"dsweep_res{r}_rot_err"
-                nmin_key = f"dsweep_res{r}_n_frac_pts_min"
-                p30_key  = f"dsweep_res{r}_pose_30deg_0.1"
-                p15_key  = f"dsweep_res{r}_pose_15deg_0.05"
+            for r, na in combos:
+                combo_key = f"{r}_na{na}"
+                re_key   = f"dsweep_res{combo_key}_rot_err"
+                nmin_key = f"dsweep_res{combo_key}_n_frac_pts_min"
+                p30_key  = f"dsweep_res{combo_key}_pose_30deg_0.1"
+                p15_key  = f"dsweep_res{combo_key}_pose_15deg_0.05"
                 if not acc.get(re_key):
-                    print(f"\n{strat} @ R={r} : aucune paire (tout skip)")
+                    print(f"\n{strat} @ R={r},n_angles={na} : aucune paire (tout skip)")
                     continue
                 rows_r = density_pose_stratification(
                     acc[nmin_key], acc[re_key], acc[p30_key], acc[p15_key])
                 n_total = len(acc[re_key])
                 p30_overall = 100.0 * float(np.mean(acc[p30_key]))
-                print(f"\n{strat} @ R={r} (N={n_total}, Pose@30 global={p30_overall:.2f}%)")
+                print(f"\n{strat} @ R={r},n_angles={na} "
+                      f"(N={n_total}, Pose@30 global={p30_overall:.2f}%)")
                 dr_header = f"  {'Bin':<12} {'N':>5} {'RotErr°':>8} {'Pose@30':>9} {'Pose@15':>9}"
                 print(dr_header)
                 for row in rows_r:
@@ -1351,29 +1393,32 @@ def main():
                               f"{row['rot_err_mean']:>8.2f} {row['pose_30deg_0.1']:>8.2f}% "
                               f"{row['pose_15deg_0.05']:>8.2f}%")
                 summary.setdefault(strat, {}).setdefault(
-                    "density_resolution_sweep", {})[str(r)] = {
+                    "density_resolution_sweep", {})[combo_key] = {
                         "n": n_total, "pose_30deg_0.1_overall": p30_overall,
                         "strata": rows_r,
                     }
         print("\n(Lecture : pour chaque tranche de densité (côté le plus PAUVRE de la\n"
-              " paire), quelle résolution donne le meilleur Pose@30 réel -- pas juste le\n"
-              " meilleur OracleOvlp ? Si une résolution plus fine aide les tranches denses\n"
-              " et une résolution plus grossière aide les tranches éparses, ça confirme\n"
-              " l'hypothèse d'une résolution ADAPTATIVE liée à la densité. Si aucune\n"
-              " résolution ne change Pose@30 dans aucune tranche, la résolution n'est pas\n"
-              " le facteur limitant -- chercher ailleurs.)")
+              " paire), quelle combinaison résolution/n_angles donne le meilleur Pose@30\n"
+              " réel -- pas juste le meilleur OracleOvlp ? Si une résolution plus fine AVEC\n"
+              " un n_angles proportionnellement plus fin rattrape ou dépasse la résolution\n"
+              " grossière, l'attrition à haute résolution venait du pas angulaire resté\n"
+              " fixe, pas d'un vrai défaut de la finesse de grille. Si aucune combinaison\n"
+              " ne change Pose@30 dans aucune tranche, la résolution n'est pas le facteur\n"
+              " limitant -- chercher ailleurs.)")
 
         # ── Attrition par résolution x densité : POURQUOI une résolution plus fine
         # perd des paires (2026-07-21, suite à la demande explicite de l'utilisateur
         # d'investiguer directement le mécanisme, pas juste le compromis observé) ──
         print(f"\nATTRITION PAR RÉSOLUTION x DENSITÉ (répartition succès / sparse_dmap / "
-              f"no_overlap_3d par tranche min(n_i,n_j), pour chaque R -- piste 3 Phase 7)")
+              f"no_overlap_3d par tranche min(n_i,n_j), pour chaque combo R/n_angles -- "
+              f"piste 3 Phase 7)")
         for strat in args.pose_resolution_sweep_strategies:
             acc = accum[strat]
-            for r in args.pose_resolution_sweep:
-                nmin_ok = acc.get(f"dsweep_res{r}_n_frac_pts_min", [])
-                nmin_sp = acc.get(f"dsweep_res{r}_skip_sparse_dmap_nmin", [])
-                nmin_no = acc.get(f"dsweep_res{r}_skip_no_overlap_3d_nmin", [])
+            for r, na in combos:
+                combo_key = f"{r}_na{na}"
+                nmin_ok = acc.get(f"dsweep_res{combo_key}_n_frac_pts_min", [])
+                nmin_sp = acc.get(f"dsweep_res{combo_key}_skip_sparse_dmap_nmin", [])
+                nmin_no = acc.get(f"dsweep_res{combo_key}_skip_no_overlap_3d_nmin", [])
                 if not (nmin_ok or nmin_sp or nmin_no):
                     continue
                 rows_a = attrition_by_density_stratification(nmin_ok, nmin_sp, nmin_no)
@@ -1381,7 +1426,7 @@ def main():
                 n_sp_tot  = len(nmin_sp)
                 n_no_tot  = len(nmin_no)
                 n_all_tot = n_ok_tot + n_sp_tot + n_no_tot
-                print(f"\n{strat} @ R={r} (N_total={n_all_tot} : "
+                print(f"\n{strat} @ R={r},n_angles={na} (N_total={n_all_tot} : "
                       f"ok={n_ok_tot}, sparse_dmap={n_sp_tot}, no_overlap_3d={n_no_tot})")
                 at_header = (f"  {'Bin':<12} {'N_ok':>6} {'Sparse':>7} "
                              f"{'NoOvlp3D':>9} {'Total':>7} {'SkipRate':>9}")
@@ -1393,12 +1438,14 @@ def main():
                         print(f"  {row['bin']:<12} {row['n_ok']:>6} "
                               f"{row['n_skip_sparse_dmap']:>7} {row['n_skip_no_overlap_3d']:>9} "
                               f"{row['n_total']:>7} {row['skip_rate']:>8.1f}%")
-        print("\n(Lecture : si `no_overlap_3d` grandit avec R alors que `sparse_dmap` reste\n"
-              " stable, l'attrition vient de la tolérance de correspondance après rotation\n"
-              " (la grille se resserre mais n_angles=36 -- pas de step angulaire fin -- reste\n"
-              " fixe, l'erreur de quantification angulaire devient relativement plus grosse\n"
-              " en pixels à résolution fine). Si c'est concentré sur les tranches éparses,\n"
-              " le problème est spécifique à la densité, pas à la résolution en général.)")
+        print("\n(Lecture : si `no_overlap_3d` grandit avec R à n_angles FIXE mais redescend\n"
+              " en augmentant n_angles au même R, l'attrition vient bien de la tolérance de\n"
+              " correspondance après rotation avec un pas angulaire trop grossier pour la\n"
+              " grille fine -- pas d'un vrai défaut de la résolution fine elle-même. Si\n"
+              " `no_overlap_3d` reste haut même avec n_angles fin, la résolution fine a un\n"
+              " défaut intrinsèque (perte de détail réelle, pas juste un souci de recherche).\n"
+              " Si c'est concentré sur les tranches éparses, le problème est spécifique à la\n"
+              " densité, pas à la résolution en général.)")
 
     if args.summary_json:
         Path(args.summary_json).parent.mkdir(parents=True, exist_ok=True)
