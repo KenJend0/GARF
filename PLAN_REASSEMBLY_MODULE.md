@@ -2311,3 +2311,37 @@ rejeter, comme pour la dilatation.
 seulement si positif implémenter une résolution adaptative par paire (liée à
 `min(n_i, n_j)`, cf. hypothèse du maillon faible objet#21) dans `rasterize()`/
 `oracle_overlap_frac()`/`match_depthmaps()`.
+
+**Résultat du sweep OracleOvlp (2026-07-21, N=2415, `joint`) :**
+```
+Strategy        R=24    R=32    R=48    R=64    R=96   R=128
+gt             0.989   0.971   0.882   0.758   0.544   0.404
+thresh0.3      0.939   0.915   0.831   0.722   0.530   0.394
+random         0.803   0.732   0.601   0.493   0.344   0.248
+```
+Résolution plus grossière (R plus petit) fait mécaniquement remonter
+`OracleOvlp` pour TOUT LE MONDE, `gt` comme `random` — même défaut identifié
+que la dilatation/le splat gaussien : une case plus grosse est plus facile à
+faire coïncider, indépendamment d'une vraie correspondance. Rapport gt/random
+progresse légèrement avec R (1.23 à R=24 → 1.63 à R=128) mais c'est un
+effet-recouvrement pur, pas la métrique qui compte.
+
+**Critique de l'utilisateur (2026-07-21, juste) : ce sweep est biaisé sur deux
+points** — (1) il ne mesure que `OracleOvlp` (recouvrement de footprint), pas
+`Pose@30` réel, exactement l'écart qui a fait échouer la dilatation/le splat
+(bon recouvrement ≠ bonne pose) ; (2) c'est une moyenne globale sur toutes les
+paires, alors que l'hypothèse à tester est que la résolution optimale dépend
+de la densité de points (côté le plus pauvre, cf. objet#21) — un chiffre
+unique masque cette dépendance.
+
+**Fix implémenté (2026-07-21) : `--pose_resolution_sweep` + `run_match_at_resolution()`.**
+Nouvelle fonction factorisée qui exécute le pipeline COMPLET (rasterize →
+match_depthmaps → Kabsch) à une résolution donnée (utilisée pour le sweep, le
+run principal reste inchangé pour ne pas risquer de casser le pipeline validé).
+Pour chaque résolution candidate testée (coût contrôlé : restreint par défaut
+à la stratégie `gt` via `--pose_resolution_sweep_strategies`, oracle-first
+comme toujours), mesure `Pose@30`/`Pose@15`/`RotErr` réels ET `min(n_i,n_j)`,
+stratifiés après-coup par tranche de densité (`density_pose_stratification()`,
+même tranches que `frac_pts_min_stratification`). Nouvelle table de sortie
+**SWEEP DENSITÉ x RÉSOLUTION**. Résultat pas encore lancé — prochaine action :
+`--pose_resolution_sweep 24 32 48 64 96 128` sur le run définitif (N≈2415).

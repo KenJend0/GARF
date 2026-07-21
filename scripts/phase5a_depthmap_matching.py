@@ -601,6 +601,90 @@ def oracle_overlap_frac(frac_i, frac_j, c_j, u_j, v_j, u_min_j, v_min_j,
     return float(overlap / denom)
 
 
+def run_match_at_resolution(frac_i, c_i, u_i, v_i, n_i,
+                             frac_j, c_j, u_j, v_j, n_j,
+                             span_i, span_j, resolution, args, R_ij_gt, t_ij_gt):
+    """Exécute le pipeline complet (rasterize -> match_depthmaps -> Kabsch) à UNE
+    résolution donnée. Factorisé pour être appelé à la fois pour le run principal
+    (args.resolution) et pour le sweep densité x résolution (piste 3 Phase 7,
+    2026-07-21) -- CONTRAIREMENT à oracle_overlap_frac (diagnostic pur sur le
+    recouvrement de footprint), mesure la métrique qui compte réellement :
+    Pose@30/Pose@15 sur le pipeline réel. Nécessaire car le sweep purement
+    OracleOvlp (2026-07-21) s'est révélé biaisé de la même façon que la
+    dilatation/le splat gaussien avant lui : un bon recouvrement mécanique ne
+    garantit pas une bonne pose, cf. plan Phase 7. Retourne un dict avec soit
+    {"skip": ...} soit les métriques de pose.
+    """
+    pixel_size = max(span_i, span_j) * 1.1 / resolution
+    dmap_i, valid_i, u_min_i, v_min_i = rasterize(
+        frac_i, c_i, u_i, v_i, n_i, resolution, pixel_size,
+        dilate_px=args.dilate_px, gaussian_sigma_px=args.gaussian_sigma_px)
+    dmap_j, valid_j, u_min_j, v_min_j = rasterize(
+        frac_j, c_j, u_j, v_j, n_j, resolution, pixel_size,
+        dilate_px=args.dilate_px, gaussian_sigma_px=args.gaussian_sigma_px)
+
+    n_pix_i, n_pix_j = int(valid_i.sum()), int(valid_j.sum())
+    if n_pix_i < MIN_OVERLAP_PIXELS or n_pix_j < MIN_OVERLAP_PIXELS:
+        return {"skip": "sparse_dmap", "n_pix": (n_pix_i, n_pix_j)}
+
+    best_score, best_theta, best_shift, best_flip, best_overlap_frac = match_depthmaps(
+        dmap_i, valid_i, dmap_j, valid_j, args.n_angles, score_mode=args.score_mode)
+
+    pts_i3, pts_j3 = build_correspondences(
+        dmap_i, valid_i, c_i, u_i, v_i, n_i, u_min_i, v_min_i,
+        dmap_j, valid_j, c_j, u_j, v_j, n_j, u_min_j, v_min_j,
+        pixel_size, best_theta, best_shift, best_flip,
+    )
+    if pts_i3 is None or len(pts_i3) < 3:
+        return {"skip": "no_overlap_3d"}
+
+    R_est, t_est = kabsch(pts_i3, pts_j3)
+    re = rot_err_deg(R_est, R_ij_gt)
+    te = trans_err(t_est, t_ij_gt)
+    return {
+        "rot_err":      float(re),
+        "trans_err":    float(te),
+        "pose_success": {f"{int(r)}deg_{t}": bool(re < r and te < t)
+                          for r, t in POSE_SUCCESS_THRESH},
+        "best_overlap_frac": float(best_overlap_frac),
+        "n_corr":       len(pts_i3),
+        "n_dmap_pix":   (n_pix_i, n_pix_j),
+    }
+
+
+def density_pose_stratification(n_frac_pts_min, rot_err, pose30, pose15):
+    """Comme `frac_pts_min_stratification`, mais sans `OracleOvlp` -- utilisée
+    pour le sweep densité x résolution (piste 3 Phase 7, 2026-07-21) : mesure
+    Pose@30/Pose@15 RÉELS (pipeline complet, pas juste le recouvrement de
+    footprint) par tranche de densité `min(n_i,n_j)`, séparément pour CHAQUE
+    résolution testée -- répond directement à la critique du 2026-07-21 ("on ne
+    sait pas sur quel type de fragments telle résolution fonctionne, et
+    l'overlap seul ne suffit pas"). Retourne une liste de dicts (vide si tranche
+    non peuplée).
+    """
+    n_frac_pts_min = np.asarray(n_frac_pts_min)
+    rot_err = np.asarray(rot_err)
+    pose30  = np.asarray(pose30)
+    pose15  = np.asarray(pose15)
+    idx = np.digitize(n_frac_pts_min, N_FRAC_PTS_MIN_BINS[1:-1])
+
+    rows = []
+    for b, label in enumerate(N_FRAC_PTS_MIN_LABELS):
+        mask = idx == b
+        n = int(mask.sum())
+        if n == 0:
+            rows.append({"bin": label, "n": 0})
+            continue
+        rows.append({
+            "bin": label,
+            "n": n,
+            "rot_err_mean": float(rot_err[mask].mean()),
+            "pose_30deg_0.1": 100.0 * float(pose30[mask].mean()),
+            "pose_15deg_0.05": 100.0 * float(pose15[mask].mean()),
+        })
+    return rows
+
+
 def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, args, rng):
     """Traite une paire dirigée i→j. Retourne un dict de résultats par stratégie."""
     results = {}
@@ -644,6 +728,25 @@ def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, a
         )
         pixel_size = max(span_i, span_j) * 1.1 / args.resolution
 
+        # Sweep densité x résolution (piste 3 Phase 7, 2026-07-21) : contrairement
+        # au sweep OracleOvlp seul (biaisé -- moyenne globale, overlap pas pose),
+        # exécute le pipeline COMPLET à chaque résolution candidate et garde
+        # min(n_i, n_j) pour stratifier après-coup par densité (voir
+        # `density_pose_stratification`). Coût : len(pose_resolution_sweep) runs
+        # complets en plus, restreint par défaut à la stratégie `gt` (oracle,
+        # même discipline "diagnostiquer sur l'oracle d'abord" que tout le
+        # projet) via --pose_resolution_sweep_strategies.
+        density_sweep_result = None
+        if args.pose_resolution_sweep and strat in args.pose_resolution_sweep_strategies:
+            n_frac_min_pair = min(len(frac_i), len(frac_j))
+            density_sweep_result = {}
+            for r in args.pose_resolution_sweep:
+                res_r = run_match_at_resolution(
+                    frac_i, c_i, u_i, v_i, n_i, frac_j, c_j, u_j, v_j, n_j,
+                    span_i, span_j, r, args, R_ij_gt, t_ij_gt)
+                res_r["n_frac_pts_min"] = n_frac_min_pair
+                density_sweep_result[str(r)] = res_r
+
         dmap_i, valid_i, u_min_i, v_min_i = rasterize(
             frac_i, c_i, u_i, v_i, n_i, args.resolution, pixel_size,
             dilate_px=args.dilate_px, gaussian_sigma_px=args.gaussian_sigma_px)
@@ -653,7 +756,8 @@ def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, a
 
         n_pix_i, n_pix_j = int(valid_i.sum()), int(valid_j.sum())
         if n_pix_i < MIN_OVERLAP_PIXELS or n_pix_j < MIN_OVERLAP_PIXELS:
-            results[strat] = {"skip": "sparse_dmap", "n_pix": (n_pix_i, n_pix_j)}
+            results[strat] = {"skip": "sparse_dmap", "n_pix": (n_pix_i, n_pix_j),
+                              "density_resolution_sweep": density_sweep_result}
             continue
 
         oracle_ovlp = oracle_overlap_frac(
@@ -701,7 +805,8 @@ def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, a
         )
 
         if pts_i3 is None or len(pts_i3) < 3:
-            results[strat] = {"skip": "no_overlap_3d"}
+            results[strat] = {"skip": "no_overlap_3d",
+                              "density_resolution_sweep": density_sweep_result}
             continue
 
         R_est, t_est = kabsch(pts_i3, pts_j3)
@@ -722,6 +827,7 @@ def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, a
             "planarity":    (float(plan_i), float(plan_j)),
             "n_frac_pts":   (len(frac_i), len(frac_j)),
             "n_dmap_pix":   (n_pix_i, n_pix_j),
+            "density_resolution_sweep": density_sweep_result,
         }
 
     return results
@@ -790,6 +896,24 @@ def main():
                              "plafond 0.758 (résolution 64 fixe) remonte à une autre "
                              "résolution, et si l'écart gt/random se maintient (sinon "
                              "même défaut que la dilatation/le splat, déjà rejetés).")
+    parser.add_argument("--pose_resolution_sweep", type=int, nargs="+", default=[],
+                        help="Résolutions RxR pour lesquelles le pipeline COMPLET "
+                             "(rasterize->match->Kabsch) est exécuté, en plus du run "
+                             "principal à --resolution (piste 3 Phase 7, 2026-07-21, "
+                             "réponse à la critique du sweep OracleOvlp seul : bon "
+                             "recouvrement != bonne pose, même défaut que dilatation/"
+                             "splat). Vide par défaut (désactivé, coût nul). Chaque "
+                             "résolution ajoutée coûte un run complet de plus par "
+                             "paire pour les stratégies listées dans "
+                             "--pose_resolution_sweep_strategies -- rester raisonnable "
+                             "(4-6 valeurs) sur un run pleine échelle.")
+    parser.add_argument("--pose_resolution_sweep_strategies", nargs="+", default=["gt"],
+                        choices=["gt", "thresh0.3", "random"],
+                        help="Stratégies sur lesquelles exécuter "
+                             "--pose_resolution_sweep. Défaut : gt seul (oracle, "
+                             "même discipline que le reste du projet -- diagnostiquer "
+                             "sur l'oracle avant de dépenser le budget de calcul sur "
+                             "thresh0.3/random).")
     parser.add_argument("--device",      default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--summary_json", default="")
     args = parser.parse_args()
@@ -912,6 +1036,21 @@ def main():
                         accum[strat]["planarity"].append(float(np.mean(res["planarity"])))
                         accum[strat]["n_frac_pts"].append(float(np.mean(res["n_frac_pts"])))
                         accum[strat]["n_frac_pts_min"].append(float(min(res["n_frac_pts"])))
+
+                    # Sweep densité x résolution (piste 3 Phase 7, 2026-07-21) : hors du
+                    # if/else ci-dessus -- présent que le run principal (à args.resolution)
+                    # ait réussi ou non, puisque d'autres résolutions peuvent réussir même
+                    # quand args.resolution échoue (sparse_dmap/no_overlap_3d).
+                    dsweep = res.get("density_resolution_sweep")
+                    if dsweep:
+                        for r_key, r_res in dsweep.items():
+                            if "skip" in r_res:
+                                continue
+                            accum[strat][f"dsweep_res{r_key}_rot_err"].append(r_res["rot_err"])
+                            accum[strat][f"dsweep_res{r_key}_n_frac_pts_min"].append(
+                                r_res["n_frac_pts_min"])
+                            for k_ps, v_ps in r_res["pose_success"].items():
+                                accum[strat][f"dsweep_res{r_key}_pose_{k_ps}"].append(float(v_ps))
 
     elapsed = time.time() - t0
     print(f"\nFini : {n_pairs_total} paires traitées ({n_2frag_seen} objets 2-frags vus)"
@@ -1132,6 +1271,49 @@ def main():
           " calibrée et une résolution adaptative (liée à la densité de points) a de\n"
           " bonnes chances d'aider réellement. Si gt et random bougent pareil (comme la\n"
           " dilatation/le splat), c'est un gain mécanique, pas un vrai signal -- rejeter.)")
+
+    # ── Sweep densité x résolution : Pose@30 RÉEL (pipeline complet), stratifié
+    # par min(n_i, n_j) -- réponse à la critique du 2026-07-21 sur le sweep
+    # OracleOvlp seul (biaisé, moyenne globale, overlap != pose) ────────────────
+    if args.pose_resolution_sweep:
+        print(f"\nSWEEP DENSITÉ x RÉSOLUTION (Pose@30/Pose@15 RÉELS, pipeline complet, "
+              f"stratifié par min(n_i,n_j) -- piste 3 Phase 7)")
+        for strat in args.pose_resolution_sweep_strategies:
+            acc = accum[strat]
+            for r in args.pose_resolution_sweep:
+                re_key   = f"dsweep_res{r}_rot_err"
+                nmin_key = f"dsweep_res{r}_n_frac_pts_min"
+                p30_key  = f"dsweep_res{r}_pose_30deg_0.1"
+                p15_key  = f"dsweep_res{r}_pose_15deg_0.05"
+                if not acc.get(re_key):
+                    print(f"\n{strat} @ R={r} : aucune paire (tout skip)")
+                    continue
+                rows_r = density_pose_stratification(
+                    acc[nmin_key], acc[re_key], acc[p30_key], acc[p15_key])
+                n_total = len(acc[re_key])
+                p30_overall = 100.0 * float(np.mean(acc[p30_key]))
+                print(f"\n{strat} @ R={r} (N={n_total}, Pose@30 global={p30_overall:.2f}%)")
+                dr_header = f"  {'Bin':<12} {'N':>5} {'RotErr°':>8} {'Pose@30':>9} {'Pose@15':>9}"
+                print(dr_header)
+                for row in rows_r:
+                    if row["n"] == 0:
+                        print(f"  {row['bin']:<12} {'—':>5}")
+                    else:
+                        print(f"  {row['bin']:<12} {row['n']:>5} "
+                              f"{row['rot_err_mean']:>8.2f} {row['pose_30deg_0.1']:>8.2f}% "
+                              f"{row['pose_15deg_0.05']:>8.2f}%")
+                summary.setdefault(strat, {}).setdefault(
+                    "density_resolution_sweep", {})[str(r)] = {
+                        "n": n_total, "pose_30deg_0.1_overall": p30_overall,
+                        "strata": rows_r,
+                    }
+        print("\n(Lecture : pour chaque tranche de densité (côté le plus PAUVRE de la\n"
+              " paire), quelle résolution donne le meilleur Pose@30 réel -- pas juste le\n"
+              " meilleur OracleOvlp ? Si une résolution plus fine aide les tranches denses\n"
+              " et une résolution plus grossière aide les tranches éparses, ça confirme\n"
+              " l'hypothèse d'une résolution ADAPTATIVE liée à la densité. Si aucune\n"
+              " résolution ne change Pose@30 dans aucune tranche, la résolution n'est pas\n"
+              " le facteur limitant -- chercher ailleurs.)")
 
     if args.summary_json:
         Path(args.summary_json).parent.mkdir(parents=True, exist_ok=True)
