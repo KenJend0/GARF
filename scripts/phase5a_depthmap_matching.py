@@ -133,6 +133,20 @@ PLANARITY_LABELS = ["<0.02", "0.02-0.05", "0.05-0.10", "0.10-0.15", "0.15-0.20",
 N_FRAC_PTS_BINS = [0, 100, 300, 1000, 3000, 10**9]
 N_FRAC_PTS_LABELS = ["<100", "100-300", "300-1000", "1000-3000", "3000+"]
 
+# Tranches de MIN(n_i, n_j) — le côté le plus pauvre de la paire, pas la
+# moyenne. Ajouté le 2026-07-20 après inspection visuelle de l'objet#21
+# (script phase5a_visualize_pair.py) : un fragment "grand" (le reste de
+# l'objet) échantillonne très peu de points sur sa fracture (crack = petite
+# fraction de sa surface totale) tandis qu'un fragment "petit" (le bout
+# cassé) en échantillonne beaucoup (crack = quasi toute sa surface), même
+# budget de points total par fragment (5000 chacun sur l'exemple observé).
+# La MOYENNE cache ce déséquilibre (131 et 2832 pts → moyenne ~1481, tranche
+# "dense" de N_FRAC_PTS_BINS, alors que la paire échoue à cause du côté à
+# 131 pts). Le MIN teste directement l'hypothèse : c'est le maillon faible
+# qui limite le matching, pas la moyenne des deux côtés.
+N_FRAC_PTS_MIN_BINS = [50, 100, 200, 500, 1000, 10**9]
+N_FRAC_PTS_MIN_LABELS = ["50-100", "100-200", "200-500", "500-1000", "1000+"]
+
 
 # ── Géométrie ─────────────────────────────────────────────────────────────────
 
@@ -502,6 +516,46 @@ def frac_pts_stratification(n_frac_pts, oracle_ovlp, rot_err, pose30, pose15):
     return rows
 
 
+def frac_pts_min_stratification(n_frac_pts_min, oracle_ovlp, rot_err, pose30, pose15):
+    """Comme `frac_pts_stratification`, mais sur MIN(n_i, n_j) au lieu de la
+    moyenne des deux fragments.
+
+    Ajouté le 2026-07-20 après inspection visuelle de l'objet#21
+    (`phase5a_visualize_pair.py`) : un fragment "grand" (le reste de l'objet)
+    échantillonne très peu de points sur sa fracture (crack = petite fraction
+    de sa surface totale) tandis qu'un fragment "petit" (le bout cassé) en
+    échantillonne beaucoup — même budget total de points par fragment. La
+    MOYENNE cache ce déséquilibre (ex. 131 et 2832 pts → moyenne ~1481,
+    tranche "dense", alors que la paire échoue à cause du côté à 131 pts).
+    Teste directement l'hypothèse du maillon faible : c'est le côté le plus
+    pauvre qui limite le matching, pas la moyenne des deux côtés.
+    Retourne une liste de dicts, un par tranche (vide si aucune paire dedans).
+    """
+    n_frac_pts_min = np.asarray(n_frac_pts_min)
+    oracle_ovlp    = np.asarray(oracle_ovlp)
+    rot_err        = np.asarray(rot_err)
+    pose30         = np.asarray(pose30)
+    pose15         = np.asarray(pose15)
+    idx = np.digitize(n_frac_pts_min, N_FRAC_PTS_MIN_BINS[1:-1])   # 0..len(labels)-1
+
+    rows = []
+    for b, label in enumerate(N_FRAC_PTS_MIN_LABELS):
+        mask = idx == b
+        n = int(mask.sum())
+        if n == 0:
+            rows.append({"bin": label, "n": 0})
+            continue
+        rows.append({
+            "bin": label,
+            "n": n,
+            "oracle_overlap_frac_mean": float(oracle_ovlp[mask].mean()),
+            "rot_err_mean": float(rot_err[mask].mean()),
+            "pose_30deg_0.1": 100.0 * float(pose30[mask].mean()),
+            "pose_15deg_0.05": 100.0 * float(pose15[mask].mean()),
+        })
+    return rows
+
+
 def oracle_overlap_frac(frac_i, frac_j, c_j, u_j, v_j, u_min_j, v_min_j,
                          resolution, pixel_size, R_ij_gt, t_ij_gt,
                          dilate_px=0, gaussian_sigma_px=0.0):
@@ -830,6 +884,7 @@ def main():
                             accum[strat][f"oracle_ovlp_{key}"].append(v)
                         accum[strat]["planarity"].append(float(np.mean(res["planarity"])))
                         accum[strat]["n_frac_pts"].append(float(np.mean(res["n_frac_pts"])))
+                        accum[strat]["n_frac_pts_min"].append(float(min(res["n_frac_pts"])))
 
     elapsed = time.time() - t0
     print(f"\nFini : {n_pairs_total} paires traitées ({n_2frag_seen} objets 2-frags vus)"
@@ -936,6 +991,39 @@ def main():
           " densification (splat gaussien) devrait aider spécifiquement les cas épars.\n"
           " Si OracleOvlp est stable quel que soit le nombre de points, la sparsité\n"
           " n'est pas la vraie cause, il faut chercher ailleurs.)")
+
+    # ── Stratification par MIN(n_i, n_j) : le maillon faible, pas la moyenne
+    # (2026-07-20, suite à l'inspection visuelle de l'objet#21) ────────────────
+    print(f"\nSTRATIFICATION PAR MIN(N_PTS_I, N_PTS_J) (le côté le plus pauvre "
+          f"de la paire, pas la moyenne)")
+    nmin_header = (f"{'Strategy':<12} {'Bin':<12} {'N':>5} {'OracleOvlp':>10} "
+                   f"{'RotErr°':>8} {'Pose@30':>9} {'Pose@15':>9}")
+    print(nmin_header)
+    print("-" * len(nmin_header))
+    for strat in ("gt", "thresh0.3", "random"):
+        acc = accum[strat]
+        if not acc.get("rot_err"):
+            continue
+        rows_nmin = frac_pts_min_stratification(
+            acc["n_frac_pts_min"], acc.get("oracle_overlap_frac", [0] * len(acc["rot_err"])),
+            acc["rot_err"],
+            acc.get("pose_30deg_0.1", [0] * len(acc["rot_err"])),
+            acc.get("pose_15deg_0.05", [0] * len(acc["rot_err"])),
+        )
+        for row in rows_nmin:
+            if row["n"] == 0:
+                print(f"{strat:<12} {row['bin']:<12} {'—':>5}")
+            else:
+                print(f"{strat:<12} {row['bin']:<12} {row['n']:>5} "
+                      f"{row['oracle_overlap_frac_mean']:>10.3f} {row['rot_err_mean']:>8.2f} "
+                      f"{row['pose_30deg_0.1']:>8.2f}% {row['pose_15deg_0.05']:>8.2f}%")
+        summary[strat]["n_frac_pts_min_strata"] = rows_nmin
+    print("(Lecture : si Pose@30 monte nettement quand le côté le plus PAUVRE a plus\n"
+          " de points -- même si l'autre côté est déjà dense -- ça confirme l'hypothèse\n"
+          " du maillon faible (objet#21) : le déséquilibre entre les deux côtés est le\n"
+          " vrai problème, pas la densité moyenne. Comparer à la table précédente\n"
+          " (moyenne) : si celle-ci était plate mais celle-ci est nette, la moyenne\n"
+          " cachait bien le signal.)")
 
     print(f"\nRéférence Phase 2 global : Pose@30 ≈ 1.3-3.2%  |  gt_edge oracle : Pose@30 ≈ 9.6%")
     print(f"score_mode={args.score_mode}  "
