@@ -1919,13 +1919,91 @@ faudrait un pipeline en deux temps (CNN sur échantillon uniforme pour la
 prédiction, puis ré-échantillonnage dense/pondéré de la zone détectée
 spécifiquement pour le matching) — pas encore implémenté.
 
+### Correction de la sémantique `num_points_to_sample` (2026-07-20)
+
+**Hypothèse posée avant de tester (discipline habituelle du projet) :**
+`num_points_to_sample` n'a pas le même sens en `uniform` et en `weighted` —
+en `uniform` c'est un budget **par fragment** (5000/fragment, donc 10000 au
+total sur un objet à 2 fragments) ; en `weighted` c'est un budget **par
+objet entier**, réparti par aire. Laisser la valeur de config (5000) en
+`weighted` divise donc par ~2 la densité totale de points par rapport à
+`uniform`, sans le vouloir — suspecté d'expliquer le taux élevé de
+`too_few_points`/`no_overlap_3d` du premier test `weighted` (N=107).
+
+**Ajouté à `phase5a_weighted_gt_check.py` : `--num_points_to_sample`**
+(override de `cfg.data.num_points_to_sample` après `load_config_and_model`,
+avant `instantiate`).
+
+**Résultat (`--num_points_to_sample 10000`, N=2545 scanné) — hypothèse
+confirmée pour le RENDEMENT, avec une nuance sur la qualité agrégée :**
+```
+                  5k (par objet)    10k (par objet)   uniform (référence)
+N_ok                   107               426                511
+too_few_points         45%               20%                 —
+no_overlap_3d (rel.)   ~90%              ~75%                 —
+RotErr                69.67°            86.55°             94.95°
+Pose@30               48.60%            39.20%             27.59%
+Pose@15               29.91%            27.23%             13.70%
+```
+`N_ok` quadruple (107→426), `too_few_points` divisé par ~2 — confirme le
+diagnostic sur le rendement. La qualité agrégée baisse par rapport au run à
+N=107 (`RotErr`/`Pose@30` moins bons), **mais ce n'est probablement pas une
+vraie dégradation** : avec N=426 vs 107, le mélange des tranches change
+(beaucoup plus de paires dans `200-500`, tranche moins performante,
+auparavant sous-représentée) — même piège de confusion qu'on a appris à
+éviter toute la journée. **Dans tous les cas, largement au-dessus de la
+référence `uniform`** (39.20% vs 27.59%, 27.23% vs 13.70%).
+
+**Indice (faible N, à confirmer) en faveur de la résolution adaptative :**
+la tranche `1000+` tombe à **0%** (N=9). Hypothèse : à haute densité de
+points, la grille fixe `RESOLUTION=64` sur-agrège plusieurs points très
+différents dans la même case (perte de détail par écrasement) — symétrique
+au problème de sparsité (trop peu de points → trop de cases vides). Si
+confirmé à plus grande échelle, ça validerait la piste résolution
+adaptative dans les deux sens (pas assez ET trop de points sont mauvais
+pour une grille fixe), pas seulement comme réponse à la sparsité.
+
+### Discussion de direction (2026-07-20, avec l'utilisateur) — architecture en deux étages
+
+**Décision d'architecture pour la suite du pipeline, actée avec l'utilisateur :**
+ne pas utiliser le matching point-à-point dès le départ (les fragments ne
+sont pas alignés dans l'espace 3D au début — exactement pourquoi Phase
+3A/4A/4B avaient échoué, aucune bonne initialisation). Le garder pour un
+**raffinement final**, après une première estimation grossière par
+depth-map matching. Schéma retenu :
+```
+1. Depth-map matching (avec résolution adaptative) → estimation grossière de pose
+2. [à calibrer] Raffinement point-à-point (ICP ou équivalent) → pose précise
+```
+
+**Un test à faire plus tard (pas maintenant, mais retenu comme prochaine
+étape après stabilisation du depth-map matching) : le bassin de convergence
+du raffinement point-à-point.** Prendre des paires GT, perturber la vraie
+pose de 10°/20°/30°/45°, mesurer jusqu'à quel angle un raffinement simple
+(ICP ou équivalent) reconverge encore vers la bonne réponse. Objectif :
+savoir quel niveau de précision viser en sortie de l'étape 1 (est-ce que
+"~30°" suffit, ou faut-il viser plus précis avant de passer la main au
+point-à-point) — sans ce calibrage, on ne sait pas quel est le vrai objectif
+de qualité pour le depth-map matching.
+
+**Ordre de travail retenu :** stabiliser/améliorer le depth-map matching
+(résolution adaptative en priorité) jusqu'à un résultat jugé satisfaisant,
+**puis seulement** faire le test de bassin de convergence pour calibrer
+l'objectif exact, **puis** construire le raffinement point-à-point.
+
 **Prochaine action concrète, dans l'ordre (diagnostic avant grosse implémentation) :**
-1. Réfléchir/cadrer le pipeline en deux temps pour rendre ce gain exploitable
-   en condition réelle (`thresh0.3`), pas seulement à l'oracle GT.
-2. Comprendre le taux de skip `no_overlap_3d` élevé en weighted (rendement
-   vs qualité) — voir si un réglage (résolution, seuil `MIN_OVERLAP_PIXELS`)
-   peut le réduire sans perdre le gain de qualité.
-3. Dataset réel TU Wien (reporté, moins prioritaire vu ce résultat) :
+1. **Résolution adaptative sur les depth maps** — piste prioritaire retenue
+   avec l'utilisateur. Deux liens à creuser ensemble (pas indépendants) :
+   la densité de points par case (déjà en partie traitée par le fix
+   `num_points_to_sample`, mais l'indice `1000+`=0% suggère qu'il reste du
+   travail même après) et la taille de grille elle-même (`RESOLUTION=64`
+   fixe, à faire varier selon la densité/taille du fragment plutôt que de
+   garder une valeur unique pour tous).
+2. Réfléchir/cadrer le pipeline en deux temps pour rendre le gain `weighted`
+   exploitable en condition réelle (`thresh0.3`), pas seulement à l'oracle GT.
+3. Test de bassin de convergence du raffinement point-à-point (reporté,
+   après stabilisation du depth-map matching — voir discussion ci-dessus).
+4. Dataset réel TU Wien (reporté, moins prioritaire vu ces résultats) :
    télécharger un objet simple (Brick ou Venus), vérifier l'existence d'une
    pose GT exploitable, mesurer la planéité, tester le CNN Step 15 en
    zero-shot.
@@ -2095,12 +2173,32 @@ même jour (voir **Phase 7** ci-dessus, section complète).
   réouverture 5A (échantillon déjà large à l'époque, pas un problème de
   taille d'échantillon comme 5A).
 
+**Mise à jour (`num_points_to_sample` corrigé, 5000→10000 sur objets à 2
+fragments) :** confirme le diagnostic sur le rendement (`N_ok` ×4, 107→426 ;
+`too_few_points` divisé par ~2) sans perdre le gain vs `uniform`
+(`Pose@30`=39.20% vs 27.59%, `Pose@15`=27.23% vs 13.70%). Indice faible-N
+(`1000+`=0%, N=9) suggérant que `RESOLUTION=64` fixe devient elle-même
+limitante à haute densité — pas seulement à la sparsité.
+
+**Architecture retenue avec l'utilisateur (2026-07-20) : pipeline en deux
+étages, pas un seul matching point-à-point direct.** Depth-map matching
+d'abord (estimation grossière), point-à-point (ICP ou équivalent) en
+raffinement final seulement — le point-à-point direct avait déjà échoué en
+Phase 3A/4A/4B faute de bonne initialisation. Le calibrage exact de l'angle
+"assez bon" pour passer la main (test de bassin de convergence) est reporté
+après stabilisation du depth-map matching, pas avant.
+
 **Prochaine action concrète (détail complet dans la section Phase 7, sous-section
-"Découverte majeure — hypothèse du maillon faible") :**
-1. Cadrer un pipeline en deux temps pour étendre le gain du sampling pondéré
+"Correction de la sémantique num_points_to_sample" + "Discussion de direction") :**
+1. **Résolution adaptative sur les depth maps** — piste prioritaire retenue.
+   Deux aspects liés à traiter ensemble : densité de points par case (partiel
+   avec le fix `num_points_to_sample`, indice `1000+`=0% à creuser) et taille
+   de grille elle-même (`RESOLUTION=64` fixe → variable selon densité/taille).
+2. Cadrer un pipeline en deux temps pour étendre le gain du sampling pondéré
    à `thresh0.3` (condition réelle) sans casser la contrainte `uniform` du CNN.
-2. Comprendre le rendement plus faible en `weighted` (taux `no_overlap_3d`
-   élevé) — voir si un réglage récupère ce rendement sans perdre le gain de
-   qualité.
-3. Dataset réel TU Wien 3D Puzzles — reporté, moins prioritaire vu ce résultat
-   (poses GT à vérifier, planéité à mesurer, CNN Step 15 en zero-shot).
+3. Test de bassin de convergence du raffinement point-à-point — reporté après
+   stabilisation du depth-map matching (calibrera l'objectif de précision
+   exact à viser en sortie de l'étape 1, ex. "30° suffit" ou pas).
+4. Dataset réel TU Wien 3D Puzzles — reporté, moins prioritaire vu ces
+   résultats (poses GT à vérifier, planéité à mesurer, CNN Step 15 en
+   zero-shot).
