@@ -1991,19 +1991,103 @@ de qualité pour le depth-map matching.
 **puis seulement** faire le test de bassin de convergence pour calibrer
 l'objectif exact, **puis** construire le raffinement point-à-point.
 
+### Audit complet des rejets, avant tout fix (2026-07-20)
+
+**Recadrage méthodologique de l'utilisateur, avant d'imaginer un fix :**
+comprendre PRÉCISÉMENT pourquoi les paires sont rejetées, pas juste
+supposer. Argument de fond : deux fragments d'une même cassure ont
+forcément une vraie surface de fracture des deux côtés — aucune paire
+n'est structurellement impossible ; un rejet vient d'un choix de seuil de
+notre pipeline, pas d'une absence physique de signal. Objectif premier
+avant tout : maximiser le nombre de paires traitées (élimine les rejets
+artificiels), ce qui est aussi un préalable pour faire confiance aux
+métriques de qualité elles-mêmes (calculées uniquement sur les paires
+survivantes, potentiellement biaisées si ce sous-ensemble n'est pas
+représentatif).
+
+**Implémenté : `scripts/phase5a_skip_audit.py`.** Contrairement aux
+scripts précédents, ne s'arrête JAMAIS aux seuils officiels
+(`MIN_FRAC_POINTS=50`, `max_planarity=0.15`, `MIN_OVERLAP_PIXELS=20`) — pousse
+chaque paire aussi loin que possible (plancher numérique pur `ABS_MIN_POINTS=5`),
+enregistre à la fois si chaque seuil AURAIT rejeté la paire (`would_skip_*`)
+et le résultat réel obtenu malgré tout.
+
+**Résultat (N=1487 paires auditées, `num_points_to_sample=10000`, `joint`) :**
+
+**Funnel réel (seuils ignorés) :**
+```
+unusable_too_few         4  ( 0.3%)   -- vraiment dégénéré, négligeable
+no_correspondence      1094  (73.6%)   -- LE vrai goulot
+pose_computed           389  (26.2%)   -- dont 134 (34.4%) réussissent Pose@30
+```
+**Taux de succès réel sur l'ensemble des paires : ~9% (134/1487)** — bien
+plus bas que les chiffres agrégés précédents (`Pose@30`≈40-48%), qui étaient
+calculés uniquement sur le sous-ensemble survivant aux filtres, pas sur
+l'ensemble des paires réelles.
+
+**Coût de chaque seuil officiel (paires rejetées qui auraient quand même
+réussi si on ne les avait pas rejetées) :**
+```
+too_few_points (50 pts)   : 227 rejetées → 0%    auraient réussi  → seuil JUSTIFIÉ
+sparse_dmap (20 px)       :  38 rejetées → 0%    auraient réussi  → seuil JUSTIFIÉ
+too_curved (planarity 0.15): 161 rejetées → 16.8% auraient réussi  → seuil TROP STRICT
+```
+**Seul `too_curved` est un vrai artefact** — `too_few_points` et
+`sparse_dmap` sont validés comme non-gaspilleurs (ils ne rejettent
+quasiment que des cas qui n'auraient de toute façon rien donné).
+
+**Distributions par résultat final (percentiles) — où est la vraie
+frontière :**
+```
+                    n_pix (après rasterisation)   planarity moyenne   best_overlap_frac
+Pose@30 succès              médiane 370                médiane 0.11        médiane 0.25
+Pose@30 échec               médiane 368 (≈ succès!)    médiane 0.11 (≈ succès!) médiane 0.20
+no_correspondence           médiane  88 (4x moins)     médiane 0.03 (bien + plat) médiane 0.12
+```
+
+**Deux enseignements distincts et importants :**
+1. **Ce qui distingue "on obtient une pose" de "on n'obtient rien"** (`no_correspondence`
+   vs `pose_computed`) : la **densité** (n_pix ~4x plus bas) et le **relief**
+   (planéité 3x plus plat). C'est exactement la cible pour la résolution
+   adaptative : les paires qui échouent totalement remplissent la grille
+   64×64 à ~2% (88/4096), celles qui réussissent à ~9% (370/4096) — une
+   grille dimensionnée à la densité réelle du fragment devrait faire
+   franchir ce seuil à beaucoup plus de paires.
+2. **Ce qui distingue "pose juste" de "pose fausse"** (une fois qu'on EN a
+   une) n'est PAS la densité ni la planéité (quasi identiques entre succès
+   et échec) — **c'est `best_overlap_frac`, qui discrimine proprement à
+   tous les percentiles** (0.25 vs 0.20 vs 0.12). C'est un signal de
+   confiance exploitable même sans connaître la vérité terrain (utile pour
+   un futur filtre de confiance en condition réelle `thresh0.3`).
+
+**Implication directe pour la résolution adaptative :** ne pas viser une
+grille plus fine ou plus grossière au hasard — viser un dimensionnement qui
+fait passer le taux de remplissage des paires actuellement `no_correspondence`
+(~2%) vers celui des paires qui réussissent (~9%), par exemple en
+dimensionnant la grille pour un nombre de points par case cible plutôt
+qu'un nombre de cases fixe.
+
 **Prochaine action concrète, dans l'ordre (diagnostic avant grosse implémentation) :**
-1. **Résolution adaptative sur les depth maps** — piste prioritaire retenue
-   avec l'utilisateur. Deux liens à creuser ensemble (pas indépendants) :
-   la densité de points par case (déjà en partie traitée par le fix
-   `num_points_to_sample`, mais l'indice `1000+`=0% suggère qu'il reste du
-   travail même après) et la taille de grille elle-même (`RESOLUTION=64`
-   fixe, à faire varier selon la densité/taille du fragment plutôt que de
-   garder une valeur unique pour tous).
-2. Réfléchir/cadrer le pipeline en deux temps pour rendre le gain `weighted`
+1. **Assouplir/retirer le seuil `too_curved` (planarity > 0.15)** — gain
+   rapide et déjà quantifié par l'audit (16.8% des paires rejetées
+   auraient réussi), contrairement à `too_few_points`/`sparse_dmap` qui
+   sont validés comme légitimes. Remplacer le couperet dur par une
+   pénalité continue (cohérent avec la conclusion déjà tirée du diagnostic
+   planéité : pénaliser en douceur plutôt que couper).
+2. **Résolution adaptative sur les depth maps** — piste prioritaire,
+   maintenant avec une cible chiffrée précise grâce à l'audit : faire
+   passer le taux de remplissage des paires `no_correspondence` (~2%,
+   88/4096 px) vers celui des paires qui réussissent (~9%, 370/4096 px) —
+   dimensionner la grille pour une densité de points par case cible,
+   plutôt qu'un nombre de cases fixe (`RESOLUTION=64` aujourd'hui).
+3. Exploiter `best_overlap_frac` comme signal de confiance (discrimine
+   proprement succès/échec/no_correspondence) — utile notamment pour un
+   futur filtre de confiance en condition réelle (`thresh0.3`, sans GT).
+4. Réfléchir/cadrer le pipeline en deux temps pour rendre le gain `weighted`
    exploitable en condition réelle (`thresh0.3`), pas seulement à l'oracle GT.
-3. Test de bassin de convergence du raffinement point-à-point (reporté,
+5. Test de bassin de convergence du raffinement point-à-point (reporté,
    après stabilisation du depth-map matching — voir discussion ci-dessus).
-4. Dataset réel TU Wien (reporté, moins prioritaire vu ces résultats) :
+6. Dataset réel TU Wien (reporté, moins prioritaire vu ces résultats) :
    télécharger un objet simple (Brick ou Venus), vérifier l'existence d'une
    pose GT exploitable, mesurer la planéité, tester le CNN Step 15 en
    zero-shot.
