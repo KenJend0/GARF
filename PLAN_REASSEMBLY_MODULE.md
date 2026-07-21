@@ -2418,7 +2418,52 @@ combinaisons (résolution, n_angles) à tester : chaque R de
 au run précédent), PLUS des combinaisons explicites `"R:NA"` via
 `--pose_angle_sweep` (ex. `128:72 128:144`) pour tester une résolution fine
 avec une recherche angulaire plus fine, isolément. Tables de sortie mises à
-jour (clé `R,n_angles` au lieu de `R` seul). Résultat pas encore lancé —
-prochaine action : sweep étendu vers R plus bas (12/16/20) ET
-`--pose_angle_sweep 128:72 128:144` pour trancher si R=128 mal desservi
-par un `n_angles` trop grossier rattrape R=24 une fois affiné.
+jour (clé `R,n_angles` au lieu de `R` seul).
+
+## Recadrage stratégique (2026-07-21) : étape A (éligibilité) vs étape B (précision)
+
+**Le tuteur/l'utilisateur a clarifié la structure du problème en deux
+étapes distinctes, à ne pas mélanger :**
+- **Étape A (maintenant)** : maximiser l'ÉLIGIBILITÉ — combien de paires
+  produisent une pose (n'importe laquelle), indépendamment de sa justesse.
+  Plafond réaliste ~99.7% (100% − `unusable_too_few` de l'audit des rejets).
+- **Étape B (après le test de bassin de convergence, pas encore fait)** :
+  maximiser Pose@X° pour le X° que le raffinement point-à-point pourra
+  vraiment digérer comme point de départ (pas encore connu — 20°, 30°, 45°
+  selon ce que le bassin de convergence tolère).
+
+**Conséquence : tout ce qui portait sur `Pose@30` (stratification par
+résolution, garde-fou `random`, comparaison RotErr appariée fin/grossier)
+était en fait de l'étape B, fait un peu tôt.** Ces résultats restent valides
+et utiles pour plus tard, mais ne doivent pas guider les décisions
+d'éligibilité maintenant — le vrai signal d'étape A déjà disponible dans les
+données du 2026-07-21 est la colonne `N` (nombre de paires atteignant Kabsch)
+du sweep densité x résolution, pas `Pose@30`.
+
+**Idée de l'utilisateur, reformulée comme architecture cible : résolution
+ADAPTATIVE en cascade**, pas une résolution fixe ni un choix a priori par
+densité (l'hypothèse "fin pour dense / grossier pour épars" avait déjà été
+infirmée le même jour). Principe : pour chaque paire, essayer la résolution
+la plus fine d'abord (précision maximale) ; si `no_overlap_3d` (échec),
+retomber sur une résolution plus grossière ; répéter jusqu'à succès ou
+épuisement des niveaux. En l'absence de GT en conditions réelles
+(`thresh0.3`), la décision "garder cette pose" s'appuiera sur
+`best_overlap_frac` (déjà identifié dans l'audit comme un signal de
+confiance discriminant sans GT) plutôt que sur `Pose@30`.
+
+**Test intermédiaire décidé avant de coder la cascade (bon marché, réutilise
+les données déjà collectées) : plafond d'éligibilité par UNION.** Question
+posée : sur les résolutions déjà testées, quelle fraction de paires réussit
+à AU MOINS UNE résolution (pas une résolution fixe) ? Si ce plafond approche
+~99.7% avec peu de niveaux de repli, la cascade est justifiée avant même
+d'écrire sa logique de décision. Implémenté : tracking `cascade_union_downto_res{R}`
+par paire (dans l'ordre décroissant de résolution, comme une cascade réelle
+tenterait), nouvelle table **PLAFOND D'ÉLIGIBILITÉ PAR CASCADE (UNION)**.
+Résultat pas encore lancé — prochaine action : relancer avec
+`--pose_resolution_sweep` étendu vers le bas (ex. `12 16 20 24 32 48 64 96 128`)
+et lire cette nouvelle table.
+
+**Reporté après ce test (étape B, pas urgent) :** comparaison RotErr appariée
+par paire (finer vs coarser, parmi les succès aux deux résolutions) — ne sert
+qu'à décider QUELLE pose garder quand plusieurs résolutions réussissent en
+même temps, pas si la cascade vaut la peine d'être construite.

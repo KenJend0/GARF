@@ -1139,6 +1139,25 @@ def main():
                             for k_ps, v_ps in r_res["pose_success"].items():
                                 accum[strat][f"dsweep_res{r_key}_pose_{k_ps}"].append(float(v_ps))
 
+                        # Plafond d'éligibilité par UNION (étape A, 2026-07-21) : pour
+                        # CETTE paire, réussit-elle à AU MOINS UNE résolution parmi
+                        # --pose_resolution_sweep (essayées de la plus fine à la plus
+                        # grossière, dans l'ordre où une cascade réelle les tenterait) ?
+                        # Répond à "la cascade vaut-elle la peine d'être construite" SANS
+                        # avoir à coder la logique de décision (best_overlap_frac, etc.) --
+                        # si l'union sur quelques niveaux approche le plafond ~99.7% de
+                        # l'audit des rejets, la cascade est justifiée ; sinon, il reste des
+                        # paires non-éligibles à AUCUNE résolution, un problème plus profond.
+                        resolutions_desc = sorted(args.pose_resolution_sweep, reverse=True)
+                        accum[strat]["cascade_total_n"].append(1)
+                        union_ok = False
+                        for r_casc in resolutions_desc:
+                            r_res_casc = dsweep.get(f"{r_casc}_na{args.n_angles}")
+                            if r_res_casc is not None and "skip" not in r_res_casc:
+                                union_ok = True
+                            accum[strat][f"cascade_union_downto_res{r_casc}"].append(
+                                1.0 if union_ok else 0.0)
+
     elapsed = time.time() - t0
     print(f"\nFini : {n_pairs_total} paires traitées ({n_2frag_seen} objets 2-frags vus)"
           f" en {elapsed:.0f}s ({elapsed/max(n_pairs_total,1):.2f}s/paire)\n")
@@ -1446,6 +1465,41 @@ def main():
               " défaut intrinsèque (perte de détail réelle, pas juste un souci de recherche).\n"
               " Si c'est concentré sur les tranches éparses, le problème est spécifique à la\n"
               " densité, pas à la résolution en général.)")
+
+        # ── Plafond d'éligibilité par UNION (étape A, 2026-07-21) : la cascade
+        # (essayer fin d'abord, retomber sur plus grossier si échec) vaut-elle la
+        # peine d'être construite ? Ne dépend PAS de Pose@30 (étape B) -- ne compte
+        # que si AU MOINS UNE résolution a produit une pose, quelle qu'elle soit. ──
+        print(f"\nPLAFOND D'ÉLIGIBILITÉ PAR CASCADE (UNION) -- étape A, piste 3 Phase 7")
+        print("(à chaque ligne : union des résolutions de la plus fine jusqu'à celle-ci "
+              "incluse, dans l'ordre où une cascade réelle les tenterait)")
+        for strat in args.pose_resolution_sweep_strategies:
+            acc = accum[strat]
+            n_total = len(acc.get("cascade_total_n", []))
+            if n_total == 0:
+                continue
+            print(f"\n{strat} (N_total={n_total}, paires ayant atteint le sweep)")
+            casc_col1 = "Cascade jusqu'a"
+            casc_header = f"  {casc_col1:<18} {'N_ok (union)':>13} {'Eligibilite':>12}"
+            print(casc_header)
+            resolutions_desc = sorted(args.pose_resolution_sweep, reverse=True)
+            for r_casc in resolutions_desc:
+                vals = acc.get(f"cascade_union_downto_res{r_casc}", [])
+                if not vals:
+                    continue
+                n_ok = int(sum(vals))
+                rate = 100.0 * n_ok / n_total
+                label = f"R={resolutions_desc[0]}..{r_casc}"
+                print(f"  {label:<18} {n_ok:>13} {rate:>11.1f}%")
+                summary.setdefault(strat, {}).setdefault(
+                    "cascade_union_eligibility", {})[str(r_casc)] = rate
+        print("\n(Lecture : si l'éligibilité par union grimpe vite vers ~99.7% [plafond de\n"
+              " l'audit des rejets, 100% - unusable_too_few] en ajoutant peu de niveaux de\n"
+              " repli, la cascade est justifiée -- coder ensuite la logique de décision\n"
+              " (best_overlap_frac comme signal de confiance sans GT). Si le plafond stagne\n"
+              " nettement en dessous même en ajoutant tous les niveaux testés, il reste des\n"
+              " paires non-éligibles à AUCUNE résolution -- problème plus profond que la\n"
+              " grille, à investiguer avant de construire la cascade.)")
 
     if args.summary_json:
         Path(args.summary_json).parent.mkdir(parents=True, exist_ok=True)
