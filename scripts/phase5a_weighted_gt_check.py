@@ -173,6 +173,17 @@ def main():
     parser.add_argument("--max_planarity", type=float, default=0.15)
     parser.add_argument("--score_mode",  default="joint", choices=["relief", "overlap_only", "joint"])
     parser.add_argument("--max_batches", type=int, default=0, help="0 = tout le split")
+    parser.add_argument("--num_points_to_sample", type=int, default=None,
+                        help="Override du budget de points. ATTENTION à la sémantique : "
+                             "en uniform (CNN), c'est PAR FRAGMENT (5000/fragment, donc "
+                             "10000 au total sur un objet à 2 fragments) ; en weighted, "
+                             "c'est le budget de l'OBJET ENTIER, réparti par aire entre les "
+                             "fragments. Laisser au défaut de config (5000) en weighted donne "
+                             "donc ~2x MOINS de points par fragment qu'en uniform sur un "
+                             "objet à 2 fragments -- suspecté (2026-07-20) d'expliquer le taux "
+                             "élevé de skip too_few_points/no_overlap_3d. Défaut ici : None "
+                             "(garde la valeur de la config, 5000) ; mettre 10000 pour "
+                             "retrouver un total comparable à uniform sur 2 fragments.")
     parser.add_argument("--summary_json", default="")
     args = parser.parse_args()
 
@@ -185,6 +196,10 @@ def main():
         batch_size=1, num_workers=4, categories=args.categories, model_type="garf",
     )
     cfg = load_config_and_model(fake_args)
+    if args.num_points_to_sample is not None:
+        cfg.data.num_points_to_sample = args.num_points_to_sample
+        print(f"  num_points_to_sample override -> {args.num_points_to_sample} "
+              f"(budget PAR OBJET en weighted, pas par fragment)")
     datamodule = instantiate(cfg.data)
     datamodule.setup("fit")
     loader = datamodule.val_dataloader() if args.split == "val" else datamodule.test_dataloader()
