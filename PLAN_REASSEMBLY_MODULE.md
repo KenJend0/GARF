@@ -1752,28 +1752,183 @@ approches utilisent la position réelle des points plutôt que de simplement
 que `random` n'en profite pas autant que `gt`, AVANT de brancher dans le
 pipeline réel comme pour la dilatation).
 
+### Piste 1, tentative 2 — splat gaussien : NÉGATIF aussi, confirmé (2026-07-20)
+
+**Motivation.** Après le rejet de la dilatation binaire, hypothèse que le
+problème vient de la nature "tout-ou-rien" de la dilatation (elle étend le
+masque sans utiliser la position réelle des points). Le **splat gaussien**
+floute le canal "nombre de points par case" avec un noyau gaussien
+(`scipy.ndimage.gaussian_filter`) au lieu d'une dilatation binaire — flou
+correct d'une moyenne pondérée (numérateur et dénominateur floutés
+séparément, pas la moyenne déjà calculée).
+
+**Implémenté dans `phase5a_depthmap_matching.py`** : `points_to_valid_mask()`
+(helper partagé entre `rasterize()` et `oracle_overlap_frac()`, refactorisée
+pour prendre `frac_j` — points bruts — au lieu d'un `valid_j` précalculé, afin
+que i et j soient traités de façon strictement symétrique). `--gaussian_sigma_px`
+(pipeline réel) + `--gaussian_sweep` (diagnostic) + table `SWEEP SPLAT GAUSSIEN`.
+
+**Diagnostic isolé (sweep sur `OracleOvlp` seul) — plus encourageant que la
+dilatation à faible sigma :**
+```
+σ=0.0 : gt=0.757  random=0.442  →  écart = 0.315
+σ=0.5 : gt=0.948  random=0.629  →  écart = 0.319   (maintenu, léger mieux)
+σ=1.0 : gt=0.989  random=0.765  →  écart = 0.224   (érosion commence)
+σ=2.0 : gt=0.881  random=0.840  →  écart = 0.041   (quasi effondré, comme la dilatation)
+```
+Bon signe à σ=0.5 : le plafond monte nettement (0.757→0.948) sans éroder
+l'écart gt-random. Au-delà de σ=1.0, même défaut que la dilatation.
+
+**Test en conditions réelles (`--gaussian_sigma_px 0.5`, dans le vrai
+pipeline) — verdict : NÉGATIF, comme la dilatation :**
+```
+                  σ=0 (référence)   σ=0.5
+OvlpFrac trouvé        0.655         0.839   ↑
+Pose@30 (gt)          20.87%        19.08%   ↓
+Pose@15 (gt)          10.43%         9.92%   ↓
+RotErr (gt)          105.90°       107.57°   ↑ (pire)
+```
+Quasiment identique au résultat négatif de la dilatation (`d=1` : 18.28%/9.68%).
+
+**Explication (discussion avec l'utilisateur, 2026-07-20) : un bon
+recouvrement est une condition nécessaire mais pas suffisante.** Il dit "ces
+deux formes ont à peu près la même taille et position", pas "elles s'emboîtent
+précisément ICI et pas ailleurs" — analogie du puzzle : flouter une pièce fait
+disparaître les petites encoches (le détail fin qui distingue le bon angle des
+autres), donc deux formes floutées se recouvrent bien à plein d'angles
+différents, pas seulement au bon. **Les deux sources possibles de précision
+fine (le relief, déjà faible car les surfaces sont trop planes ; le contour
+précis) sont affaiblies simultanément par le lissage** — d'où le double rejet.
+
+**Conclusion : piste 1 (densification) rejetée dans ses deux versions
+testées.** Le diagnostic isolé (`OracleOvlp` gt vs random à la vraie pose) ne
+suffit pas à prédire la performance réelle de la recherche — il ne teste
+jamais si le lissage garde la vraie pose plus précise que les poses fausses
+très proches, qui est la vraie question que la recherche doit résoudre.
+
+---
+
+### Outil de visualisation diagnostique (2026-07-20)
+
+Après deux résultats négatifs sur les métriques agrégées, besoin de regarder
+concrètement des paires plutôt que rester sur des moyennes qui cachent le
+mécanisme d'échec. **`scripts/phase5a_visualize_pair.py`** — réutilise
+directement les fonctions du pipeline réel (aucune réimplémentation), génère
+par paire une figure PNG à 8 panneaux : nuages de points complets (1-2),
+points de fracture surlignés (3-4), depth maps 2D (5-6), overlay 3D de la pose
+trouvée (7) vs la vraie pose GT (8). `--filter success/fail` cible
+spécifiquement des réussites ou des échecs.
+
+**Bug trouvé et corrigé le jour même :** `bp_pairs` contient des tuples
+`(b, p)`, pas `(k, p)`. Le code initial faisait `(k0, p0), (k1, p1) = bp_pairs`,
+assignant `b` (toujours 0 en `batch_size=1`) à `k0`/`k1` au lieu du vrai indice
+de fragment dans `pc_per_k`/`gt_per_k`/`score_per_k` — **`raw_i` et `raw_j`
+pointaient donc sur LE MÊME fragment** pour toute paire. Explique un premier
+run à 0 succès trouvés sur tout le split (`--filter success`, alors que le
+pipeline principal mesure ~27% de réussite sur `gt`) : comparer un fragment à
+lui-même ne peut jamais matcher la vraie pose relative. Fix : `k` = position
+dans `enumerate(bp_pairs)`, pas `b`. Toutes les figures générées avant ce fix
+sont invalides et ont été régénérées.
+
+---
+
+### Découverte majeure — hypothèse du maillon faible, puis root cause identifiée (2026-07-20)
+
+**Inspection visuelle de l'objet#21** (après le fix du bug ci-dessus) : sur
+une paire à 2 fragments, fragment i (le reste de l'objet) a **131 points de
+fracture** (depth map quasi vide, 124/4096 pixels valides), fragment j (le
+petit bout cassé) en a **2832** (depth map bien remplie, 1334/4096) — ratio
+~21x sur la MÊME fracture, alors que les deux fragments sont échantillonnés
+avec le même budget total de points (5000 chacun).
+
+**Explication physique :** échantillonnage `uniform` (`BreakingBadUniform`,
+utilisé par le CNN Step15) — budget de points FIXE par fragment, indépendant
+de sa taille. Un grand fragment a sa fracture diluée dans une immense surface
+totale (peu de points y tombent) ; un petit fragment a sa fracture qui occupe
+quasiment toute sa surface (beaucoup de points y tombent).
+
+**Test de l'hypothèse — stratification par `MIN(n_i, n_j)` (le côté le plus
+pauvre), pas la moyenne** (qui cachait le déséquilibre : (131+2832)/2≈1481,
+tranche "dense" alors que la paire échoue). Ajouté `frac_pts_min_stratification()`
+dans `phase5a_depthmap_matching.py`. **Résultat (N=2415, `joint`) : confirmation
+PARTIELLE, pas dominante :**
+```
+Bin (gt)     Pose@30   Pose@15
+50-100        28.57%     9.52%
+100-200       26.75%    12.72%
+200-500       28.43%    15.69%
+500-1000      25.00%    18.75%
+```
+`Pose@30` reste plat (~26-28%), mais `Pose@15` (précision fine) double presque
+(9.52%→18.75%) — et pour `thresh0.3` (condition réelle), `Pose@30` progresse
+nettement sur la partie fiable (14.81%→25.26%). Le maillon faible affecte
+réellement la précision, mais n'est pas, à lui seul, LE facteur dominant sur
+la plage testée (données `gt` manquantes au-delà de 1000 points).
+
+**Root cause identifiée : GARF a déjà la solution, le CNN ne peut juste pas
+l'utiliser.** Vérifié dans le code : `BreakingBadWeighted`
+(`assembly/data/breaking_bad/weighted.py`) répartit le budget total de points
+**proportionnellement à l'aire réelle de chaque fragment** — exactement la
+parade cherchée, et c'est le sampling **par défaut de GARF**
+(`configs/data/breaking_bad.yaml`). Le CNN Step15 force `sample_method: uniform`
+(`configs/experiment/cnn_ablation_shared.yaml`) parce que son architecture de
+backprojection bilinéaire exige un nombre de points constant par fragment —
+contrainte technique du CNN, pas une limitation du dataset/repo.
+
+**Test rendu possible sans toucher au CNN :** `fracture_surface_gt` est un
+label géométrique du dataset (confirmé dans
+`assembly/models/cnn_segmentation_model.py` — le CNN ne fait que le relire,
+aucun calcul dérivé), donc la stratégie `gt` peut être testée directement en
+`sample_method=weighted`, sans jamais charger le CNN.
+
+**Implémenté : `scripts/phase5a_weighted_gt_check.py`.** Charge le datamodule
+via `load_config_and_model(..., model_type="garf")` (force déjà
+`sample_method=weighted` + `batch_size=1`, mécanisme existant réutilisé tel
+quel). `extract_gt_variable()` découpe `pointclouds`/`fracture_surface_gt` par
+les offsets réels de `points_per_part` (PAS `extract_gt_for_valid_frags`
+existante, qui suppose un reshape `(B,P,num_pts)` invalide en weighted —
+tailles de fragments variables). Vérifié : formule de `scale` identique entre
+`BreakingBadUniform`/`BreakingBadWeighted` (même sémantique, même alignement
+des slots) — pas un bug de ce côté.
+
+**Résultat définitif (N=107 valides sur 2545 objets scannés, comparable à la
+référence uniform N=511) — POSITIF, confirmé à densité égale, pas juste en
+moyenne globale :**
+```
+Bin           uniform Pose@30   weighted Pose@30   ratio
+100-200          26.75%             55.56%          ~2.1x
+200-500          28.43%             47.50%          ~1.7x
+500-1000         25.00%             28.57%          ~1.1x
+
+Global : uniform N=511  RotErr=94.95°  Pose@30=27.59%  Pose@15=13.70%
+         weighted N=107 RotErr=69.67°  Pose@30=48.60%  Pose@15=29.91%
+```
+**`Pose@30` quasi doublé, `Pose@15` plus que doublé — à densité de points
+comparable, pas par simple déplacement de la distribution.** C'est le
+résultat le plus solide de la Phase 7 à ce jour.
+
+**Caveat à garder** : le taux de skip `no_overlap_3d` reste élevé en weighted
+(~90% des paires ayant passé les filtres planéité/points) — le sampling
+pondéré améliore beaucoup la QUALITÉ des poses trouvées, mais moins de paires
+produisent une pose du tout (rendement plus faible). Compromis à creuser, mais
+qui n'enlève rien au résultat principal.
+
+**Limite connue, pas encore résolue : ça ne marche que pour `gt`.** Pour
+`thresh0.3` (condition réelle), le CNN reste contraint à `uniform` — il
+faudrait un pipeline en deux temps (CNN sur échantillon uniforme pour la
+prédiction, puis ré-échantillonnage dense/pondéré de la zone détectée
+spécifiquement pour le matching) — pas encore implémenté.
+
 **Prochaine action concrète, dans l'ordre (diagnostic avant grosse implémentation) :**
-1. Cadrer et prototyper une vraie densification (splat gaussien ou
-   interpolation pondérée) — voir discussion ci-dessus. Tester d'abord en
-   diagnostic isolé (comme le sweep de dilatation), avec le même garde-fou
-   (vérifier que `random` ne profite pas autant que `gt`) avant de brancher
-   dans le pipeline réel.
-2. Stratifier par `n_frac_pts` (piste 2 de la roadmap) — même logique que la
-   stratification planéité, données déjà loggées.
-3. Télécharger un objet simple du dataset TU Wien (Brick ou Venus, peu de
-   fragments) et vérifier concrètement s'il existe une pose GT exploitable
-   (dans les fichiers, une éventuelle publication associée, ou à défaut aucune
-   — auquel cas définir un protocole d'évaluation qualitatif/manuel).
-4. Mesurer la planéité des faces de fracture sur ce dataset (réutiliser le
-   script de la Phase 5A.0) — vérifie si les surfaces réelles sont
-   effectivement plus irrégulières que Breaking Bad, sachant maintenant que
-   plus de courbure n'aide pas avec la représentation PCA actuelle (diagnostic
-   A) — donc ce test doit être lu comme "combien de faces seraient hors de la
-   plage exploitable actuelle", pas comme validation directe de l'hypothèse
-   du tuteur.
-5. Tester le CNN Step 15 en zero-shot sur ce dataset (comme le split `artifact`
-   du projet) — pas de garantie de transfert, format de points/normales
-   probablement différent de Breaking Bad.
+1. Réfléchir/cadrer le pipeline en deux temps pour rendre ce gain exploitable
+   en condition réelle (`thresh0.3`), pas seulement à l'oracle GT.
+2. Comprendre le taux de skip `no_overlap_3d` élevé en weighted (rendement
+   vs qualité) — voir si un réglage (résolution, seuil `MIN_OVERLAP_PIXELS`)
+   peut le réduire sans perdre le gain de qualité.
+3. Dataset réel TU Wien (reporté, moins prioritaire vu ce résultat) :
+   télécharger un objet simple (Brick ou Venus), vérifier l'existence d'une
+   pose GT exploitable, mesurer la planéité, tester le CNN Step 15 en
+   zero-shot.
 
 ## Métriques d'évaluation déjà disponibles (ne pas réécrire)
 
@@ -1920,19 +2075,32 @@ les phases closes, rédaction du rapport" — dépassé depuis par la réouvertu
 la Phase 5A (2026-07-20) et la nouvelle direction validée avec le tuteur le
 même jour (voir **Phase 7** ci-dessus, section complète).
 
-**État réel au 2026-07-20 :**
+**État réel au 2026-07-20 (fin de journée) :**
 - Phase 4D (compatibilité fragment-fragment, AUC≈0.80) : close, positive, mise
   de côté pour plus tard (pas abandonnée) — le tuteur a explicitement recentré
   sur la pose entre paires déjà connues comme adjacentes.
-- Phase 5A (depth-map matching) : rouverte, positive mais partielle, confirmée
-  à grande échelle (`Pose@30`=27.59% GT / `joint`, N=2415 objets). **C'est la
-  direction active.**
+- Phase 5A (depth-map matching) : rouverte, positive mais partielle. **Deux
+  pistes de densification rejetées** (dilatation binaire, splat gaussien —
+  toutes deux améliorent le recouvrement mesuré sans améliorer `Pose@30` en
+  pratique). **Root cause du vrai goulot identifiée et corrigée pour `gt` :**
+  le CNN force un échantillonnage `uniform` (budget de points fixe par
+  fragment) alors que GARF utilise déjà par défaut un échantillonnage
+  `weighted` (proportionnel à l'aire réelle) — en testant `weighted` sur la
+  stratégie `gt` (qui n'a pas besoin du CNN), `Pose@30` passe de 27.59% à
+  **48.60%** et `Pose@15` de 13.70% à **29.91%**, confirmé à densité de points
+  égale (pas un artefact de moyenne). **C'est le résultat le plus solide de
+  toute la Phase 7.** Reste à étendre ce gain à `thresh0.3` (condition réelle
+  avec CNN, pipeline en deux temps pas encore implémenté).
 - Phase 6.0 (recall@k du classifieur 4D) : close NO-GO — non concernée par la
   réouverture 5A (échantillon déjà large à l'époque, pas un problème de
   taille d'échantillon comme 5A).
 
-**Prochaine action concrète (détail complet dans la section Phase 7) :** explorer
-le dataset réel TU Wien 3D Puzzles (poses GT à vérifier — probablement absentes),
-mesurer sa planéité, tester le CNN Step 15 en zero-shot dessus, puis cadrer les
-5 pistes d'amélioration du matching depth-map (sliding window, extrapolation,
-résolution, features, modèle appris) une par une avant tout code.
+**Prochaine action concrète (détail complet dans la section Phase 7, sous-section
+"Découverte majeure — hypothèse du maillon faible") :**
+1. Cadrer un pipeline en deux temps pour étendre le gain du sampling pondéré
+   à `thresh0.3` (condition réelle) sans casser la contrainte `uniform` du CNN.
+2. Comprendre le rendement plus faible en `weighted` (taux `no_overlap_3d`
+   élevé) — voir si un réglage récupère ce rendement sans perdre le gain de
+   qualité.
+3. Dataset réel TU Wien 3D Puzzles — reporté, moins prioritaire vu ce résultat
+   (poses GT à vérifier, planéité à mesurer, CNN Step 15 en zero-shot).
