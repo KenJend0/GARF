@@ -337,6 +337,16 @@ def main():
             rows.append(row)
 
     elapsed = time.time() - t0
+    report_zoom_sweep(rows, budgets, args, n_seen_2frag, n_zoom_failed, elapsed)
+
+
+def report_zoom_sweep(rows, budgets, args, n_seen_2frag, n_zoom_failed, elapsed):
+    """Imprime toutes les tables de comparaison baseline vs zoomed (par budget)
+    et sauvegarde CSV/JSON -- factorisé pour être réutilisé identiquement par
+    le diagnostic GT (`main()` ci-dessus) et par la version `thresh0.3`/CNN
+    (`phase5a_zoom_resample_thresh03_check.py`, 2026-07-22), qui produisent
+    exactement la même structure de `rows` (n_frac_pts_min_base, base_stage,
+    base_pose_30, zoom_by_budget[k] = {n_frac_pts_min, stage, pose_30})."""
     print(f"\nFini : {len(rows)} paires comparées ({n_seen_2frag} objets 2-frags vus, "
           f"{n_zoom_failed} zooms impossibles -- zone fracture introuvable sur le maillage) "
           f"en {elapsed:.0f}s\n")

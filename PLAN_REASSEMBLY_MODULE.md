@@ -2662,6 +2662,63 @@ résout l'essentiel :**
 **Meilleure config trouvée jusqu'ici : `--expand_rings 0 --extra_budget 500`**
 (gain net sur éligibilité ET précision simultanément, pas un compromis).
 
+**Sweep étendu (2026-07-22, N=1483, budgets 200/300/500/800/1200, même passe) :
+tendance monotone et contre-intuitive.** Plus le budget augmente, MIEUX ça se
+passe sur les deux axes à la fois — `NoCorr` 37.2%→24.8%, `pose_computed`
+62.8%→75.2%, ET la dégradation sur les paires déjà éligibles en baseline
+**diminue** avec plus de points (-4.7pp à budget=200 jusqu'à seulement
+-1.6pp à budget=1200), au lieu d'empirer. Pas de plafond trouvé à 1200 ;
+`NoCorr` reste loin du ~0.3% théorique. Explication : avec `ring=0` (zone
+correctement délimitée), plus de points dans la zone CORRECTE stabilise le
+repère PCA plutôt que de le diluer — le problème initial venait bien de la
+délimitation de zone (rings=1), pas du volume de points.
+
+## Recadrage stratégique (2026-07-22) : arrêter de peaufiner GT, généraliser à thresh0.3
+
+**Question de l'utilisateur, avant de pousser le sweep plus loin (1500-3000) :
+"est-ce que ce qu'on fait est cohérent ?"** Réponse convenue : oui
+méthodologiquement (diagnostic avant action, contrôles pour isoler les
+confusions, sweeps en une passe plutôt que tâtonnage), mais le rendement
+marginal de peaufiner `extra_budget` sur l'oracle GT (qui ne sera jamais
+utilisé tel quel en production) est faible comparé à la vraie question
+ouverte : est-ce que la recette (`ring=0` + budget généreux) se transfère à
+`thresh0.3` (condition réelle, jamais testée). **Décision : rediriger vers
+`thresh0.3` maintenant plutôt que de continuer à raffiner GT.**
+
+**Deuxième point soulevé par l'utilisateur, décisif pour la suite : le CNN
+n'a jamais été entraîné/évalué sur des points zoomés — est-ce un problème ?**
+Réponse établie par l'architecture en deux temps déjà actée : NON
+directement — le CNN ne voit JAMAIS les points zoomés, il tourne seulement
+sur son échantillonnage `uniform` standard pour LOCALISER (masque
+`thresh0.3`), le zoom se fait ensuite sur le maillage, sans repasser par le
+CNN. **La vraie question ouverte : le masque `thresh0.3` (faux positifs/
+négatifs que le GT n'a jamais) est-il assez propre spatialement pour bien
+localiser la zone ?** La Phase 2D avait déjà montré que le clustering
+spatial de `thresh0.3` est quasi identique à `gt` (signe encourageant), mais
+jamais testé pour CE mécanisme précis.
+
+**Implémenté (2026-07-22) : `scripts/phase5a_zoom_resample_thresh03_check.py`.**
+Contrainte technique résolue : le CNN exige `sample_method=uniform`, mais
+`BreakingBadUniform.transform()` ne conserve PAS `data["meshes"]`
+(contrairement à `BreakingBadWeighted`, vérifié par inspection du code) —
+besoin du maillage pour zoomer. Solution : DEUX datasets sur le même split,
+en lockstep par position (`cnn_dataset` via DataLoader batch_size=1
+shuffle=False pour l'inférence CNN ; `mesh_dataset` indexé directement
+`dataset[idx]`, UNIQUEMENT pour `data["meshes"]` — le maillage est identique
+entre les deux instances, seule la façon d'échantillonner des points dessus
+change), avec `assert` sur le nom d'objet à chaque itération pour vérifier
+l'alignement. Graines du zoom = points prédits fracture par le CNN
+(`coarse_seg_pred > threshold`), en repère maillage (`pointclouds_gt` du
+`cnn_dataset`, aligné index-à-index avec les prédictions via
+`extract_fragment_list` appelé deux fois avec les mêmes offsets). Repère de
+sortie des points zoomés : quaternion/translation du `cnn_dataset` (pas du
+`mesh_dataset` — chaque `transform()` tire sa propre rotation aléatoire).
+Reporting factorisé : `report_zoom_sweep()` extrait de
+`phase5a_zoom_resample_check.py` et réutilisé tel quel (même structure de
+résultats). Résultat pas encore lancé — prochaine action : lancer avec
+`--expand_rings 0 --extra_budget_sweep 500 1200` et comparer directement aux
+résultats GT.
+
 **Correction méthodologique demandée par l'utilisateur (2026-07-22) : ne pas
 tâtonner un paramètre à la fois en relançant tout le run à chaque fois —
 construire un vrai sweep dans la même passe**, comme déjà fait pour la
