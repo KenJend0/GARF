@@ -172,6 +172,45 @@ def gate_cost_report(rows, gate_key, gate_label):
           f"{n_success} ({100*n_success/n_gated:.1f}% du total rejeté) auraient réussi Pose@30")
 
 
+DENSITY_OUTCOME_BINS = [0, 50, 75, 100, 150, 200, 300, 500, 1000, 10**9]
+DENSITY_OUTCOME_LABELS = ["<50", "50-75", "75-100", "100-150", "150-200",
+                           "200-300", "300-500", "500-1000", "1000+"]
+
+
+def density_outcome_stratification(rows):
+    """Pour chaque tranche fine de `n_frac_pts_min` (le côté le plus pauvre de
+    la paire), répartit les paires entre `no_correspondence` / `pose_computed`
+    mais faux / `Pose@30` réussi. Ajouté le 2026-07-22 à la demande de
+    l'utilisateur : avant de choisir une solution pour la sparsité (zoom +
+    rééchantillonnage local sur la zone de fracture, ou une représentation
+    non-planaire type SOM -- discutées, pas encore implémentées), il faut
+    savoir précisément à partir de quelle densité `no_correspondence` devient
+    rare, pas seulement comparer des percentiles globaux. Retourne une liste
+    de dicts, un par tranche (vide si tranche non peuplée)."""
+    nmins = np.asarray([r["n_frac_pts_min"] for r in rows])
+    idx = np.digitize(nmins, DENSITY_OUTCOME_BINS[1:-1])
+
+    out_rows = []
+    for b, label in enumerate(DENSITY_OUTCOME_LABELS):
+        bin_rows = [r for r, i in zip(rows, idx) if i == b]
+        n = len(bin_rows)
+        if n == 0:
+            out_rows.append({"bin": label, "n": 0})
+            continue
+        n_unusable = sum(1 for r in bin_rows if r["reached_stage"] == "unusable_too_few")
+        n_no_corr  = sum(1 for r in bin_rows if r["reached_stage"] == "no_correspondence")
+        n_pose     = sum(1 for r in bin_rows if r["reached_stage"] == "pose_computed")
+        n_succ     = sum(1 for r in bin_rows if r.get("pose_30"))
+        out_rows.append({
+            "bin": label, "n": n,
+            "unusable_pct":         100.0 * n_unusable / n,
+            "no_correspondence_pct": 100.0 * n_no_corr / n,
+            "pose_computed_pct":     100.0 * n_pose / n,
+            "pose30_pct":            100.0 * n_succ / n,
+        })
+    return out_rows
+
+
 def percentile_summary(values, label):
     values = [v for v in values if v is not None]
     if not values:
@@ -339,6 +378,29 @@ def main():
           " Si 'no_correspondence' a des percentiles nettement plus bas que 'échec' sur\n"
           " best_overlap_frac, ça confirme que c'est un manque de données, pas un problème\n"
           " de recherche.)")
+
+    # ── Stratification par densité fine (2026-07-22) : à partir de quel
+    # n_frac_pts_min no_correspondence devient-il rare ? Nécessaire avant de
+    # choisir une solution pour la sparsité (zoom + rééchantillonnage local sur
+    # la zone de fracture, ou une représentation non-planaire type SOM --
+    # discutées, pas encore implémentées) -- pas juste comparer des percentiles
+    # globaux (ci-dessus), voir précisément où la frontière se situe. ─────────
+    print("\nSTRATIFICATION FINE PAR DENSITÉ (n_frac_pts_min, le côté le plus pauvre)")
+    dens_header = (f"  {'Bin':<10} {'N':>6} {'Unusable':>9} {'NoCorr':>8} "
+                   f"{'PoseComp':>9} {'Pose@30':>8}")
+    print(dens_header)
+    for row_d in density_outcome_stratification(rows):
+        if row_d["n"] == 0:
+            print(f"  {row_d['bin']:<10} {'—':>6}")
+        else:
+            print(f"  {row_d['bin']:<10} {row_d['n']:>6} "
+                  f"{row_d['unusable_pct']:>8.1f}% {row_d['no_correspondence_pct']:>7.1f}% "
+                  f"{row_d['pose_computed_pct']:>8.1f}% {row_d['pose30_pct']:>7.1f}%")
+    print("(Lecture : cherche la tranche à partir de laquelle NoCorr descend nettement --\n"
+          " c'est le vrai plancher de densité en dessous duquel la méthode ne peut\n"
+          " structurellement rien faire, quelle que soit la résolution. Sert à juger si un\n"
+          " zoom + rééchantillonnage local ciblé sur la zone de fracture des tranches\n"
+          " basses vaut le coup, plutôt qu'augmenter le budget de points globalement.)")
 
     # ── Cascade de résolution (2026-07-22) : combien de niveaux de repli ont
     # réellement été nécessaires, et à quelle résolution la cascade s'arrête-t-elle

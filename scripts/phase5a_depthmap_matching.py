@@ -95,11 +95,6 @@ from torch.utils.data import DataLoader
 DEFAULT_RESOLUTION     = 64      # taille de la depth map (RESOLUTION × RESOLUTION px)
 DEFAULT_N_ANGLES       = 36      # sweep rotation : 360/36 = 10° par pas
 MIN_FRAC_POINTS        = 50      # moins de N pts fracture → skip (PCA bruitée)
-DEFAULT_MAX_PLANARITY  = 0.15    # planéité PCA > seuil → face trop courbe → skip
-                                  # (overridable via --max_planarity ; 0.333 = isotrope,
-                                  # borne théorique haute — cf. discussion 2026-07-20 :
-                                  # augmenter le seuil teste les faces jusqu'ici exclues,
-                                  # au lieu de seulement stratifier ce qui est déjà gardé)
 MIN_OVERLAP_PIXELS     = 20      # correspondances 3D < N → skip Kabsch
 POSE_SUCCESS_THRESH    = [(30.0, 0.1), (15.0, 0.05)]
 
@@ -114,10 +109,9 @@ GAUSSIAN_VALID_THRESH  = 0.2
 
 # Tranches de planéité pour la stratification post-hoc (bornes alignées sur les
 # percentiles du pré-check Phase 5A.0 : p25=0.016, p50=0.043, p75=0.098, p90=0.150 ;
-# étendues jusqu'à 0.333 = isotrope, indépendamment du seuil --max_planarity utilisé,
-# pour rester comparables d'un run à l'autre même si le seuil change). Sert à
-# vérifier si "moins plat" corrèle vraiment avec un meilleur matching, plutôt que de
-# le supposer en excluant simplement les faces les plus courbées.
+# étendues jusqu'à 0.333 = isotrope). Sert à vérifier si "moins plat" corrèle
+# vraiment avec un meilleur matching -- diagnostic pur, plus un seuil de rejet
+# depuis la suppression du gate too_curved le 2026-07-22 (cf. process_pair).
 PLANARITY_BINS = [0.0, 0.02, 0.05, 0.10, 0.15, 0.20, 0.334]
 PLANARITY_LABELS = ["<0.02", "0.02-0.05", "0.05-0.10", "0.10-0.15", "0.15-0.20", "0.20+"]
 
@@ -774,11 +768,13 @@ def process_pair(raw_i, raw_j, gt_i, gt_j, score_i, score_j, R_ij_gt, t_ij_gt, a
 
         c_i, u_i, v_i, n_i, plan_i = compute_pca_frame(frac_i)
         c_j, u_j, v_j, n_j, plan_j = compute_pca_frame(frac_j)
-
-        if plan_i > args.max_planarity or plan_j > args.max_planarity:
-            results[strat] = {"skip": "too_curved",
-                              "planarity": (float(plan_i), float(plan_j))}
-            continue
+        # Seuil too_curved (max_planarity) SUPPRIMÉ le 2026-07-22 -- l'audit avec
+        # cascade de résolution a montré que 90.4% des paires qu'il rejetait
+        # produisaient quand même une pose une fois la cascade en place (contre
+        # 16.8% mesuré hier à résolution fixe) : ce n'était pas un cas dégénéré,
+        # juste un artefact de résolution fixe. `plan_i`/`plan_j` restent calculés
+        # (utilisés par `planarity_stratification` en diagnostic) mais ne
+        # bloquent plus aucune paire.
 
         # Taille physique commune : chaque pixel couvre la même surface pour les deux maps
         ci = frac_i - c_i
@@ -920,13 +916,6 @@ def main():
                         help="relief = formule d'origine (buggée, garde-fou overlap>0.5px) ; "
                              "overlap_only = contour seul, sans relief (teste l'hypothèse "
                              "contour-suffit) ; joint = fix, relief_score * overlap_frac.")
-    parser.add_argument("--max_planarity", type=float, default=DEFAULT_MAX_PLANARITY,
-                        help="Seuil de planéité au-delà duquel une face est jugée "
-                             "trop courbe et la paire skippée (défaut 0.15). Augmenter "
-                             "(ex. 0.333 = isotrope, borne théorique) pour tester si les "
-                             "faces jusqu'ici exclues matchent mieux ou moins bien — "
-                             "cf. incohérence relevée le 2026-07-20 entre 'trop plat' et "
-                             "'on exclut les plus courbées sans jamais les tester'.")
     parser.add_argument("--dilate_px", type=int, default=0,
                         help="Dilate le masque `valid` de N pixels dans le pipeline réel "
                              "(recherche + score), pas seulement le diagnostic oracle. "

@@ -2516,6 +2516,49 @@ corrections appliquées ENSEMBLE. Nouvelles sorties : `resolution_used`/
 des résolutions retenues, distribution du nombre de niveaux essayés).
 Retiré : `would_skip_sparse_dmap`/`n_pix_i`/`n_pix_j` (n'ont plus de sens
 sous cascade multi-résolution — un pair "sparse" à une résolution peut
-réussir à une autre). Résultat pas encore lancé — prochaine action : lancer
-avec `--num_points_to_sample 10000 --max_batches 3000` et lire la table
-CASCADE DE RÉSOLUTION + le funnel mis à jour.
+réussir à une autre).
+
+**Résultat (2026-07-22, N=1487, `num_points_to_sample=10000`, cascade
+R=128..12) — gros progrès sur l'éligibilité, ET une découverte majeure sur
+`too_curved`.** `no_correspondence` passe de **73.6% (hier, résolution fixe)
+à 48.1%** (715/1487) — `pose_computed` (éligibilité réelle) quasiment double,
+de ~26% à **51.6%**. La cascade seule (combinée au `weighted`/10000 déjà en
+place) comble une bonne partie de l'écart, sans qu'il ait fallu toucher aux
+seuils `too_few_points`/`too_curved`. `n_resolutions_tried` : médiane=8 (sur 9
+niveaux) — la plupart des paires résolues ont besoin de plusieurs niveaux de
+repli, la cascade n'est pas un luxe cosmétique.
+
+**`too_curved` : le coût réel est BEAUCOUP plus grand qu'estimé le
+2026-07-20.** Avec la cascade : **90.4%** des 157 paires que ce seuil aurait
+rejetées produisent quand même une pose (contre les 16.8% de Pose@30
+estimés hier SANS cascade — la cascade rattrape presque toute l'éligibilité
+perdue par la courbure, même si seulement 12.7% de ces paires atteignent
+Pose@30). `too_few_points` reste confirmé légitime (1.7% récupérable,
+inchangé). **Décision (2026-07-22, utilisateur) : supprimer complètement le
+seuil `too_curved`, pas seulement le relâcher.** Implémenté dans
+`phase5a_depthmap_matching.py` : le bloc `if plan_i > args.max_planarity ...:
+skip too_curved` retiré de `process_pair()`, `--max_planarity` et
+`DEFAULT_MAX_PLANARITY` supprimés (plus de raison d'être) ; `plan_i`/`plan_j`
+restent calculés pour la stratification diagnostique
+(`planarity_stratification`), juste plus utilisés comme seuil de rejet.
+
+**Sur la sparsité restante (48.1% `no_correspondence`) : `n_frac_pts_min`
+discrimine très fort (médiane=64 pour `no_correspondence` vs 257-335 pour les
+paires qui produisent une pose), `planarity` NE discrimine PAS dans le sens
+attendu (`no_correspondence` est en fait plus PLAT, pas plus courbé — 0.02 vs
+0.07-0.10) — confirme que ce n'est pas une histoire de courbure mais de pure
+quantité de points.** **Décision de l'utilisateur (2026-07-22) : ne PAS
+augmenter `num_points_to_sample` comme solution — plutôt identifier
+précisément les tranches de densité concernées, puis explorer un zoom +
+rééchantillonnage LOCAL ciblé sur la zone de fracture identifiée (pas
+augmenter le budget global de points sur tout le fragment), ou une
+représentation non-planaire type SOM (discutée, à reprendre plus tard).**
+Implémenté : `density_outcome_stratification()` dans `phase5a_skip_audit.py`
+— répartit `unusable_too_few`/`no_correspondence`/`pose_computed`/`Pose@30`
+par tranche fine de `n_frac_pts_min` (`<50` à `1000+`), nouvelle table
+**STRATIFICATION FINE PAR DENSITÉ**. Objectif : trouver le plancher de
+densité exact en dessous duquel la méthode échoue structurellement, avant de
+choisir/dimensionner une solution de zoom-resampling. Résultat pas encore
+lancé — prochaine action : relancer `phase5a_skip_audit.py` (cascade +
+`max_planarity` déjà sans effet ici puisque jamais un hard-stop) et lire
+cette nouvelle table.
