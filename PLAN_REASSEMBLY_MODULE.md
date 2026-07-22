@@ -2617,5 +2617,31 @@ que `phase5a_skip_audit.py`, sur les MÊMES paires en conditions baseline vs
 zoomed. Comparaison globale + par tranche de densité baseline (mêmes bornes
 que `density_outcome_stratification`), pour voir si le zoom aide
 spécifiquement les tranches basses sans diluer les tranches déjà bonnes.
-Résultat pas encore lancé — prochaine action : lancer sur le serveur et lire
-la table PAR TRANCHE DE DENSITÉ BASELINE.
+
+**Résultat (2026-07-22, N=1483, `extra_budget=500`, `expand_rings=1`) —
+gain massif en éligibilité, coût réel en précision.** `no_correspondence`
+47.9%→**22.3%**, `pose_computed` 52.1%→**77.7%** (+25.6 points) — gain net
+sur l'objectif actuel (étape A). Mais `Pose@30` global BAISSE : 13.6%→10.8%.
+Par tranche : `<50` et `75-100` s'améliorent aussi en précision (2.2%→3.5%,
+10.1%→11.3%), mais `50-75`, `100-150`, `150-200`, `200-300`, `300-500`
+baissent tous en `Pose@30`, y compris des tranches qui n'avaient presque pas
+besoin d'aide en éligibilité (`500-1000` : `NoCorr` empire même,
+8.4%→12.6%). Hypothèse de travail : `--expand_rings 1` déborde légèrement
+au-delà de la vraie limite de fracture, les points ajoutés sur cette bordure
+élargie décalent le repère PCA (u/v/normale) même quand il était déjà bon.
+
+**Décision (2026-07-22, utilisateur) : accepter tel quel pour l'étape A**
+(éligibilité = objectif actuel), la baisse de précision est une question
+d'étape B à recalibrer une fois le seuil du raffinement point-à-point connu
+— pas la peine d'optimiser maintenant. Utilisateur a demandé un test pour
+vérifier si la baisse est un effet de composition (les paires récupérées
+sont juste plus dures intrinsèquement) ou une vraie dégradation (le zoom
+abîme aussi les paires qui marchaient déjà). **Implémenté :** nouvelle
+section **COMPOSITION vs DÉGRADATION** dans
+`phase5a_zoom_resample_check.py` — compare `Pose@30` sur le sous-ensemble
+FIXE des paires déjà éligibles en baseline (avant/après zoom) séparément des
+paires nouvellement récupérées par le zoom. Si le premier chiffre reste
+stable, effet de composition pur ; s'il baisse aussi, vraie dégradation.
+Ajout aussi `--csv_out` (dump par paire, permet de recalculer d'autres
+croisements sans relancer). Résultat pas encore lancé — prochaine action :
+relancer et lire cette nouvelle table.

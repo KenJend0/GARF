@@ -203,6 +203,7 @@ def main():
     parser.add_argument("--expand_rings", type=int, default=1,
                         help="Anneaux d'adjacence de faces pour étendre la zone zoom "
                              "au-delà des seules faces déjà touchées par l'échantillon épars.")
+    parser.add_argument("--csv_out", default="", help="Dump complet, une ligne par paire.")
     parser.add_argument("--summary_json", default="")
     args = parser.parse_args()
     args.dilate_px = 0
@@ -363,8 +364,62 @@ def main():
           " chute sur les tranches déjà bonnes (300+), le zoom dilue un signal déjà propre --\n"
           " à surveiller, pas juste regarder les tranches basses.)")
 
+    # ── Composition vs dégradation (2026-07-22, demande de l'utilisateur) : la
+    # baisse de Pose@30 global vient-elle juste du fait que PLUS de paires sont
+    # comptées (les nouvelles récupérées sont intrinsèquement plus dures), ou le
+    # zoom abîme-t-il aussi la précision des paires qui marchaient DÉJÀ en
+    # baseline ? Isole en comparant Pose@30 sur le MÊME sous-ensemble fixe (déjà
+    # éligible en baseline) avant/après zoom -- si stable, effet de composition
+    # pur (rien à corriger) ; si ça baisse aussi ici, vraie dégradation (le zoom
+    # décale le repère PCA même quand il n'était pas nécessaire). ─────────────
+    base_eligible = [r for r in rows if r["base_stage"] == "pose_computed"]
+    newly_rescued = [r for r in rows if r["base_stage"] != "pose_computed"
+                      and r["zoom_stage"] == "pose_computed"]
+    print(f"\nCOMPOSITION vs DÉGRADATION (isole l'effet du zoom sur la précision) :")
+    if base_eligible:
+        nbe = len(base_eligible)
+        be_base_p30 = 100 * sum(1 for r in base_eligible if r["base_pose_30"]) / nbe
+        be_zoom_p30 = 100 * sum(1 for r in base_eligible if r["zoom_pose_30"]) / nbe
+        print(f"  Paires DÉJÀ éligibles en baseline (N={nbe}) : "
+              f"Pose@30 base={be_base_p30:.1f}% -> zoomed={be_zoom_p30:.1f}%")
+    else:
+        print("  Paires déjà éligibles en baseline : aucune")
+    if newly_rescued:
+        nnr = len(newly_rescued)
+        nr_p30 = 100 * sum(1 for r in newly_rescued if r["zoom_pose_30"]) / nnr
+        print(f"  Paires récupérées PAR le zoom, no_correspondence en baseline (N={nnr}) : "
+              f"Pose@30 zoomed={nr_p30:.1f}%")
+    else:
+        print("  Paires récupérées par le zoom : aucune")
+    print("\n(Lecture : si la ligne 'déjà éligibles' reste stable (base ≈ zoomed), la baisse\n"
+          " globale vient d'un effet de composition -- les paires récupérées sont juste plus\n"
+          " dures intrinsèquement, le zoom n'abîme rien. Si elle baisse aussi nettement, le\n"
+          " zoom dégrade réellement la précision même là où il n'était pas nécessaire\n"
+          " (probablement --expand_rings qui déborde de la vraie limite de fracture).)")
+
+    if args.csv_out:
+        import csv
+        Path(args.csv_out).parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = list(rows[0].keys())
+        with open(args.csv_out, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"\nCSV complet sauvegardé ({len(rows)} lignes) : {args.csv_out} "
+              f"(permet de recalculer d'autres croisements sans relancer le run)")
+
     if args.summary_json:
         Path(args.summary_json).parent.mkdir(parents=True, exist_ok=True)
+        composition = {}
+        if base_eligible:
+            nbe = len(base_eligible)
+            composition["base_eligible_n"] = nbe
+            composition["base_eligible_pose30_base"] = 100*sum(1 for r in base_eligible if r["base_pose_30"])/nbe
+            composition["base_eligible_pose30_zoom"] = 100*sum(1 for r in base_eligible if r["zoom_pose_30"])/nbe
+        if newly_rescued:
+            nnr = len(newly_rescued)
+            composition["newly_rescued_n"] = nnr
+            composition["newly_rescued_pose30_zoom"] = 100*sum(1 for r in newly_rescued if r["zoom_pose_30"])/nnr
         with open(args.summary_json, "w") as f:
             json.dump({
                 "config": vars(args), "n_pairs": n, "n_zoom_failed": n_zoom_failed,
@@ -372,6 +427,7 @@ def main():
                 "pose_computed": {"base": 100*base_pose/n, "zoom": 100*zoom_pose/n},
                 "pose_30": {"base": 100*base_p30/n, "zoom": 100*zoom_p30/n},
                 "by_density_bin": summary_bins,
+                "composition_vs_degradation": composition,
             }, f, indent=2)
         print(f"JSON résumé sauvegardé : {args.summary_json}")
 
