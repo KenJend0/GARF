@@ -2467,3 +2467,55 @@ et lire cette nouvelle table.
 par paire (finer vs coarser, parmi les succès aux deux résolutions) — ne sert
 qu'à décider QUELLE pose garder quand plusieurs résolutions réussissent en
 même temps, pas si la cascade vaut la peine d'être construite.
+
+**Résultat du plafond d'union (2026-07-21, `phase5a_depthmap_matching.py`,
+R=12..128, gt, N_total=1015) : 68.7% (697/1015) — plafonne loin des ~99.7%
+visés, avec des rendements décroissants (+9.5pp par niveau au début, +1.2pp
+en fin de cascade).** Mais l'utilisateur a fait remarquer un point essentiel :
+ces 1015 paires sont DÉJÀ celles qui passent les filtres `too_few_points`/
+`too_curved` — sur les 2415 paires GT totales, **1400 (58%) sont exclues
+avant même d'atteindre ce calcul**, un filtrage bien plus massif que le
+plafond des 31% restants. Retour au principe fondateur du projet (déjà
+énoncé en ouvrant l'audit des rejets) : deux fragments de la même cassure ont
+FORCÉMENT une vraie surface de fracture des deux côtés — aucune paire n'est
+structurellement impossible, un rejet reflète un choix de pipeline, pas une
+absence physique de signal.
+
+**Clarification (2026-07-21) : les étapes 1 et 2 du plan en 3 étapes sont en
+fait DÉJÀ mesurées par `phase5a_skip_audit.py`, pas besoin de les refaire.**
+Ce script ne s'arrête jamais à `too_few_points`/`too_curved` (seul
+`ABS_MIN_POINTS=5`, plancher numérique pur, arrête vraiment) ET tourne déjà
+en `sample_method=weighted` avec `num_points_to_sample=10000` (forcé via
+`model_type="garf"`). Son dernier résultat (N=1487) reflète donc déjà le
+régime corrigé : `too_few_points` légitime (0% récupérable), `too_curved` un
+vrai artefact mais modeste (16.8% récupérable). **Ce qui manque réellement :**
+ce script tournait à résolution FIXE (64) — jamais testé avec la cascade de
+résolution développée le même jour dans `phase5a_depthmap_matching.py`.
+
+**L'utilisateur a aussi noté : le verdict "légitime" sur `too_few_points`
+mérite d'être requestionné, pas juste accepté** — il a été mesuré SOUS le
+régime `weighted`/10000 déjà amélioré, donc c'est le meilleur chiffre déjà
+obtenu, mais le déséquilibre extrême de l'objet#21 (131 vs 2832 points)
+montre qu'une partie de ce qui tombe sous 50 points n'est pas intrinsèquement
+trop petite — c'est mal servie par l'échantillonnage. Ce point rejoint
+directement l'étape 2 (déjà appliquée dans ce script), pas une 4e étape
+séparée.
+
+**Implémenté (2026-07-22) : fusion des 3 axes en une seule mesure dans
+`phase5a_skip_audit.py`.** `process_pair_audit()` réutilise maintenant
+`run_match_at_resolution()` (de `phase5a_depthmap_matching.py`, pas de
+réimplémentation) en cascade : `--resolution_sweep` (défaut
+`128 96 64 48 32 24 20 16 12`, plus fine d'abord) est essayé jusqu'à la
+PREMIÈRE résolution qui produit ≥3 correspondances — reproduit directement
+l'architecture cible (fin d'abord pour la précision, repli sur grossier
+seulement si échec), pas juste un test d'union après coup. Combiné avec le
+`weighted`/`no_points_to_sample` et l'absence de hard-stop déjà en place,
+cette seule mesure donne le plafond d'éligibilité réel une fois les trois
+corrections appliquées ENSEMBLE. Nouvelles sorties : `resolution_used`/
+`n_resolutions_tried` par paire, table **CASCADE DE RÉSOLUTION** (répartition
+des résolutions retenues, distribution du nombre de niveaux essayés).
+Retiré : `would_skip_sparse_dmap`/`n_pix_i`/`n_pix_j` (n'ont plus de sens
+sous cascade multi-résolution — un pair "sparse" à une résolution peut
+réussir à une autre). Résultat pas encore lancé — prochaine action : lancer
+avec `--num_points_to_sample 10000 --max_batches 3000` et lire la table
+CASCADE DE RÉSOLUTION + le funnel mis à jour.

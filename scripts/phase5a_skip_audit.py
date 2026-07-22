@@ -29,9 +29,17 @@ et enregistre à la fois :
 paires en plus réussiraient ?" au lieu de deviner.
 
 Réutilise directement les fonctions de `phase5a_depthmap_matching.py`
-(aucune réimplémentation) et `extract_gt_variable` de
-`phase5a_weighted_gt_check.py`. Stratégie GT uniquement, aucun CNN chargé
-(label géométrique du dataset).
+(aucune réimplémentation, y compris `run_match_at_resolution` pour la
+cascade) et `extract_gt_variable` de `phase5a_weighted_gt_check.py`.
+Stratégie GT uniquement, aucun CNN chargé (label géométrique du dataset).
+
+Mise à jour 2026-07-22 (piste 3 Phase 7) : `--resolution` (fixe) remplacé par
+`--resolution_sweep` (cascade, plus fine résolution essayée en premier, repli
+sur plus grossier seulement si échec) — combine en une seule mesure les 3
+axes discutés avec l'utilisateur : sample_method=weighted (déjà en place),
+pas de hard-stop sur too_few_points/too_curved (déjà en place), ET cascade de
+résolution (nouveau). Mesure le plafond d'éligibilité réel une fois les trois
+appliqués ensemble, pas un par un.
 
 Usage (sur le serveur) :
     python scripts/phase5a_skip_audit.py \\
@@ -39,6 +47,7 @@ Usage (sur le serveur) :
         --experiment cnn_step15_final_model \\
         --categories everyday --split val --max_batches 3000 \\
         --score_mode joint --num_points_to_sample 10000 \\
+        --resolution_sweep 128 96 64 48 32 24 20 16 12 \\
         --csv_out /tmp/student7/phase5a_skip_audit.csv \\
         --summary_json /tmp/student7/phase5a_skip_audit.json
 """
@@ -48,6 +57,7 @@ import csv
 import json
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -59,9 +69,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.analyze_errors import load_config_and_model
 from scripts.phase5a_weighted_gt_check import extract_gt_variable
 from scripts.phase5a_depthmap_matching import (
-    MIN_FRAC_POINTS, MIN_OVERLAP_PIXELS,
-    compute_pca_frame, rasterize, match_depthmaps, build_correspondences,
-    kabsch, rot_err_deg, trans_err, quat_wxyz_to_rotmat,
+    MIN_FRAC_POINTS, compute_pca_frame, quat_wxyz_to_rotmat, run_match_at_resolution,
 )
 
 ABS_MIN_POINTS = 5   # plancher numérique pur (PCA non-dégénérée) -- PAS le
@@ -72,7 +80,20 @@ ABS_MIN_POINTS = 5   # plancher numérique pur (PCA non-dégénérée) -- PAS le
 def process_pair_audit(raw_i, raw_j, gt_i, gt_j, R_ij_gt, t_ij_gt, args):
     """Pousse la paire aussi loin que possible dans le pipeline, sans jamais
     s'arrêter aux seuils officiels -- enregistre would_skip_* (le seuil
-    officiel aurait-il rejeté ?) ET le résultat réel obtenu malgré tout."""
+    officiel aurait-il rejeté ?) ET le résultat réel obtenu malgré tout.
+
+    CASCADE DE RÉSOLUTION (2026-07-22, piste 3 Phase 7 -- fusionne les 3
+    étapes du plan discutées avec l'utilisateur en une seule mesure) : au lieu
+    d'une résolution fixe, essaie `args.resolution_sweep` de la plus fine à la
+    plus grossière (ordre exact d'une cascade réelle) et s'arrête à la
+    PREMIÈRE qui produit >= 3 correspondances -- reproduit directement
+    l'architecture cible (fin d'abord pour la précision, repli sur grossier
+    seulement si échec), pas juste un test d'union après coup. Combiné avec le
+    sample_method=weighted + num_points_to_sample déjà en place dans ce
+    script ET l'absence de hard-stop sur too_few_points/too_curved (déjà le
+    comportement de ce script), ça mesure le plafond d'éligibilité réel une
+    fois les trois corrections appliquées ENSEMBLE, pas une par une.
+    """
     frac_i = raw_i[gt_i == 1]
     frac_j = raw_j[gt_j == 1]
     n_i, n_j = len(frac_i), len(frac_j)
@@ -81,8 +102,8 @@ def process_pair_audit(raw_i, raw_j, gt_i, gt_j, R_ij_gt, t_ij_gt, args):
         "n_frac_pts_i": n_i, "n_frac_pts_j": n_j, "n_frac_pts_min": min(n_i, n_j),
         "would_skip_too_few_points": bool(n_i < MIN_FRAC_POINTS or n_j < MIN_FRAC_POINTS),
         "planarity_i": None, "planarity_j": None, "would_skip_too_curved": None,
-        "n_pix_i": None, "n_pix_j": None, "would_skip_sparse_dmap": None,
-        "best_overlap_frac": None, "n_corr": None, "would_skip_no_overlap_3d": None,
+        "resolution_used": None, "n_resolutions_tried": 0,
+        "best_overlap_frac": None, "n_corr": None,
         "rot_err": None, "trans_err": None, "pose_30": None, "pose_15": None,
         "reached_stage": "unusable_too_few", "compute_error": None,
     }
@@ -102,41 +123,30 @@ def process_pair_audit(raw_i, raw_j, gt_i, gt_j, R_ij_gt, t_ij_gt, args):
                      float((ci @ v_i).max() - (ci @ v_i).min()), 1e-8)
         span_j = max(float((cj @ u_j).max() - (cj @ u_j).min()),
                      float((cj @ v_j).max() - (cj @ v_j).min()), 1e-8)
-        pixel_size = max(span_i, span_j) * 1.1 / args.resolution
 
-        dmap_i, valid_i, u_min_i, v_min_i = rasterize(
-            frac_i, c_i, u_i, v_i, n_i_ax, args.resolution, pixel_size)
-        dmap_j, valid_j, u_min_j, v_min_j = rasterize(
-            frac_j, c_j, u_j, v_j, n_j_ax, args.resolution, pixel_size)
-        n_pix_i, n_pix_j = int(valid_i.sum()), int(valid_j.sum())
-        row["n_pix_i"], row["n_pix_j"] = n_pix_i, n_pix_j
-        row["would_skip_sparse_dmap"] = bool(n_pix_i < MIN_OVERLAP_PIXELS or n_pix_j < MIN_OVERLAP_PIXELS)
-        row["reached_stage"] = "rasterized"
+        resolutions_desc = sorted(args.resolution_sweep, reverse=True)   # fin -> grossier
+        last_result = None
+        for n_tried, r in enumerate(resolutions_desc, start=1):
+            last_result = run_match_at_resolution(
+                frac_i, c_i, u_i, v_i, n_i_ax, frac_j, c_j, u_j, v_j, n_j_ax,
+                span_i, span_j, r, args.n_angles, args, R_ij_gt, t_ij_gt,
+            )
+            row["n_resolutions_tried"] = n_tried
+            if "skip" not in last_result:
+                row["resolution_used"] = r
+                break   # cascade : on garde la PREMIÈRE (plus fine) qui réussit
 
-        best_score, best_theta, best_shift, best_flip, best_overlap_frac = match_depthmaps(
-            dmap_i, valid_i, dmap_j, valid_j, args.n_angles, score_mode=args.score_mode)
-        row["best_overlap_frac"] = float(best_overlap_frac)
-        row["reached_stage"] = "searched"
-
-        pts_i3, pts_j3 = build_correspondences(
-            dmap_i, valid_i, c_i, u_i, v_i, n_i_ax, u_min_i, v_min_i,
-            dmap_j, valid_j, c_j, u_j, v_j, n_j_ax, u_min_j, v_min_j,
-            pixel_size, best_theta, best_shift, best_flip,
-        )
-        n_corr = 0 if pts_i3 is None else len(pts_i3)
-        row["n_corr"] = n_corr
-        row["would_skip_no_overlap_3d"] = bool(n_corr < 3)
-        if n_corr < 3:
+        if row["resolution_used"] is None:
             row["reached_stage"] = "no_correspondence"
             return row
-        row["reached_stage"] = "correspondence_found"
 
-        R_est, t_est = kabsch(pts_i3, pts_j3)
-        re = rot_err_deg(R_est, R_ij_gt)
-        te = trans_err(t_est, t_ij_gt)
-        row["rot_err"], row["trans_err"] = float(re), float(te)
-        row["pose_30"] = bool(re < 30.0 and te < 0.1)
-        row["pose_15"] = bool(re < 15.0 and te < 0.05)
+        row["reached_stage"] = "correspondence_found"
+        row["best_overlap_frac"] = last_result["best_overlap_frac"]
+        row["n_corr"] = last_result["n_corr"]
+        row["rot_err"] = last_result["rot_err"]
+        row["trans_err"] = last_result["trans_err"]
+        row["pose_30"] = bool(last_result["pose_success"]["30deg_0.1"])
+        row["pose_15"] = bool(last_result["pose_success"]["15deg_0.05"])
         row["reached_stage"] = "pose_computed"
     except Exception as e:
         row["compute_error"] = str(e)[:200]
@@ -180,7 +190,14 @@ def main():
     parser.add_argument("--categories",  default="everyday")
     parser.add_argument("--split",       default="val", choices=["train", "val", "test"])
     parser.add_argument("--seed",        type=int, default=42)
-    parser.add_argument("--resolution",  type=int, default=64)
+    parser.add_argument("--resolution_sweep", type=int, nargs="+",
+                        default=[128, 96, 64, 48, 32, 24, 20, 16, 12],
+                        help="Cascade de résolutions RxR, essayées de la plus fine à la "
+                             "plus grossière (ordre exact d'une cascade réelle) -- s'arrête "
+                             "à la première qui produit >= 3 correspondances 3D. Remplace "
+                             "l'ancien --resolution fixe (2026-07-22, piste 3 Phase 7) : "
+                             "mesure le plafond d'éligibilité combiné weighted + pas de "
+                             "gate dur too_few_points/too_curved + cascade de résolution.")
     parser.add_argument("--n_angles",    type=int, default=36)
     parser.add_argument("--max_planarity", type=float, default=0.15)
     parser.add_argument("--score_mode",  default="joint", choices=["relief", "overlap_only", "joint"])
@@ -191,6 +208,11 @@ def main():
     parser.add_argument("--csv_out", default="", help="Dump complet, une ligne par paire.")
     parser.add_argument("--summary_json", default="")
     args = parser.parse_args()
+    # run_match_at_resolution() (réutilisé depuis phase5a_depthmap_matching.py) lit
+    # args.dilate_px/args.gaussian_sigma_px -- les deux pistes de densification déjà
+    # rejetées (2026-07-20), jamais exposées ici, toujours désactivées.
+    args.dilate_px = 0
+    args.gaussian_sigma_px = 0.0
 
     print("Chargement du datamodule -- sample_method=weighted (forcé via model_type=garf), "
           "AUCUN CNN chargé")
@@ -258,10 +280,8 @@ def main():
           f"en {elapsed:.0f}s\n")
 
     # ── Funnel : où s'arrête chaque paire, en réalité (avec ou sans les seuils) ──
-    stages = ["unusable_too_few", "pca_done", "rasterized", "searched",
-              "no_correspondence", "correspondence_found", "pose_computed"]
-    # pca_done/rasterized/searched/correspondence_found ne sont que des étapes
-    # intermédiaires normalement dépassées -- ne compter que les "vrais" arrêts finaux :
+    # pca_done/correspondence_found ne sont que des étapes intermédiaires normalement
+    # dépassées -- ne compter que les "vrais" arrêts finaux :
     final_counts = {}
     for r in rows:
         s = r["reached_stage"]
@@ -280,10 +300,14 @@ def main():
           f"{n_success} ({100*n_success/max(n_pose,1):.1f}%) réussissent Pose@30")
 
     # ── Coût de chaque seuil officiel : combien de succès perdus si on le garde ? ──
-    print("\nCOÛT DE CHAQUE SEUIL OFFICIEL (paires rejetées qui auraient quand même marché) :")
+    # (sparse_dmap n'est plus un seuil unique pertinent ici -- avec la cascade de
+    # résolution, une paire "sparse" à la résolution fine peut réussir à une plus
+    # grossière ; ce qui compte maintenant est le résultat global de la cascade,
+    # déjà capturé par no_correspondence/pose_computed ci-dessus.)
+    print("\nCOÛT DE CHAQUE SEUIL OFFICIEL (paires rejetées qui auraient quand même marché, "
+          "AVEC la cascade de résolution) :")
     gate_cost_report(rows, "would_skip_too_few_points", "too_few_points (seuil=50 pts)")
     gate_cost_report(rows, "would_skip_too_curved", "too_curved (seuil planarity=0.15)")
-    gate_cost_report(rows, "would_skip_sparse_dmap", "sparse_dmap (seuil=20 px)")
 
     # ── Distributions par résultat final : où est la vraie frontière ? ──
     print("\nDISTRIBUTIONS PAR RÉSULTAT FINAL (percentiles) :")
@@ -310,20 +334,33 @@ def main():
     percentile_summary([r["best_overlap_frac"] for r in fail_rows], "Pose@30 = échec")
     percentile_summary([r["best_overlap_frac"] for r in no_corr_rows], "no_correspondence")
 
-    print(" -- n_pix (moyenne i/j, après rasterisation) --")
-    def npix_mean(r):
-        if r["n_pix_i"] is None or r["n_pix_j"] is None:
-            return None
-        return (r["n_pix_i"] + r["n_pix_j"]) / 2
-    percentile_summary([npix_mean(r) for r in success_rows], "Pose@30 = succès")
-    percentile_summary([npix_mean(r) for r in fail_rows], "Pose@30 = échec")
-    percentile_summary([npix_mean(r) for r in no_corr_rows], "no_correspondence")
-
     print("\n(Lecture : compare les percentiles entre 'succès', 'échec' et 'no_correspondence'.\n"
           " Si les distributions se recouvrent beaucoup, la variable ne discrimine pas bien.\n"
           " Si 'no_correspondence' a des percentiles nettement plus bas que 'échec' sur\n"
-          " n_pix/best_overlap_frac, ça confirme que c'est un manque de données, pas un\n"
-          " problème de recherche.)")
+          " best_overlap_frac, ça confirme que c'est un manque de données, pas un problème\n"
+          " de recherche.)")
+
+    # ── Cascade de résolution (2026-07-22) : combien de niveaux de repli ont
+    # réellement été nécessaires, et à quelle résolution la cascade s'arrête-t-elle
+    # le plus souvent ? Répond directement à "la cascade vaut-elle la peine, et
+    # combien de niveaux faut-il vraiment" une fois weighted + pas de gate dur
+    # appliqués ensemble. ──────────────────────────────────────────────────────
+    resolved_rows = [r for r in rows if r["resolution_used"] is not None]
+    print(f"\nCASCADE DE RÉSOLUTION : {len(resolved_rows)}/{len(rows)} paires "
+          f"({100*len(resolved_rows)/max(len(rows),1):.1f}%) résolues à AU MOINS UNE "
+          f"résolution parmi {sorted(args.resolution_sweep, reverse=True)}")
+    res_counts = Counter(r["resolution_used"] for r in resolved_rows)
+    print("  Résolution retenue (la plus fine qui a réussi) -- répartition :")
+    for r_val in sorted(args.resolution_sweep, reverse=True):
+        n = res_counts.get(r_val, 0)
+        print(f"    R={r_val:<5} {n:>6}  ({100*n/max(len(resolved_rows),1):.1f}% des résolues)")
+    ntried_vals = [r["n_resolutions_tried"] for r in rows if r["n_resolutions_tried"] > 0]
+    if ntried_vals:
+        percentile_summary(ntried_vals, "n_resolutions_tried (avant succès ou abandon)")
+    print("\n(Lecture : si la plupart des paires résolues le sont dès la résolution la plus\n"
+          " fine, la cascade ne coûte presque rien en pratique -- le repli ne sert que pour\n"
+          " la minorité qui en a besoin. Comparer le % résolu ici au plafond de la table\n"
+          " FUNNEL ci-dessus : c'est la mesure combinée weighted + pas de gate dur + cascade.)")
 
     if args.csv_out:
         Path(args.csv_out).parent.mkdir(parents=True, exist_ok=True)
