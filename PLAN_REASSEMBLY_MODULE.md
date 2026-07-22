@@ -2643,5 +2643,36 @@ FIXE des paires déjà éligibles en baseline (avant/après zoom) séparément d
 paires nouvellement récupérées par le zoom. Si le premier chiffre reste
 stable, effet de composition pur ; s'il baisse aussi, vraie dégradation.
 Ajout aussi `--csv_out` (dump par paire, permet de recalculer d'autres
-croisements sans relancer). Résultat pas encore lancé — prochaine action :
-relancer et lire cette nouvelle table.
+croisements sans relancer).
+
+**Résultats successifs (2026-07-22, N=1483 à chaque fois) — confirment une
+vraie dégradation (pas juste de la composition), et `expand_rings=0`
+résout l'essentiel :**
+- `expand_rings=1, budget=500` : `Pose@30` global 13.6%→10.8% (baisse),
+  déjà-éligibles 27.7%→18.1% (baisse forte) → vraie dégradation confirmée.
+- `expand_rings=0, budget=500` : `Pose@30` global 13.9%→**16.3%** (hausse
+  nette !), déjà-éligibles 26.5%→24.1% (baisse légère seulement),
+  nouvellement récupérées Pose@30=19.8% (vs 9.6% avec rings=1) → confirme
+  l'hypothèse, l'expansion d'anneau débordait de la vraie limite de fracture.
+- `expand_rings=0, budget=200` : PIRE que budget=500 sur les 3 indicateurs
+  globaux (`NoCorr` 37.4% vs 31.4%, `pose_computed` 62.6% vs 68.6%,
+  `Pose@30` 14.9% vs 16.3%) — réduire le budget n'aide pas, contre-intuitif
+  mais net sur les chiffres agrégés (plus fiables que les sous-tranches).
+
+**Meilleure config trouvée jusqu'ici : `--expand_rings 0 --extra_budget 500`**
+(gain net sur éligibilité ET précision simultanément, pas un compromis).
+
+**Correction méthodologique demandée par l'utilisateur (2026-07-22) : ne pas
+tâtonner un paramètre à la fois en relançant tout le run à chaque fois —
+construire un vrai sweep dans la même passe**, comme déjà fait pour la
+résolution. **Implémenté : `--extra_budget_sweep`** (liste de budgets,
+remplace `--extra_budget` si fourni) — le budget le plus grand du sweep est
+tiré UNE FOIS par fragment (`zoom_resample` appelé une seule fois à
+`max(budgets)`), les budgets plus petits prennent un SOUS-ENSEMBLE de ce même
+tirage (statistiquement valide : un sous-ensemble d'un tirage i.i.d. est un
+tirage i.i.d. valide de cette taille, pas besoin de retirer à chaque fois).
+Toutes les tables (comparaison globale, par tranche de densité, composition
+vs dégradation) sont maintenant imprimées par budget testé, plus `--csv_out`
+mis à jour (colonnes `zoom_b{k}_*` par budget). Résultat pas encore lancé —
+prochaine action : `--extra_budget_sweep 200 500 800 1200` avec
+`--expand_rings 0` pour trouver le vrai optimum en une seule passe.

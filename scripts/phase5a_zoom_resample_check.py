@@ -46,14 +46,22 @@ déjà validée (`run_match_at_resolution`, de `phase5a_depthmap_matching.py`) :
                localisée à partir des points fracture déjà connus, pas
                d'information nouvelle "trichée")
 
+Mise à jour 2026-07-22 : `--extra_budget_sweep` teste PLUSIEURS budgets dans
+la MÊME passe du dataloader (au lieu de relancer tout le run pour chaque
+valeur, ce qui revenait à tâtonner) -- le budget le plus grand est tiré UNE
+FOIS par fragment, les budgets plus petits prennent un sous-ensemble de ce
+même tirage (statistiquement valide, pas besoin de retirer).
+
 Usage (sur le serveur) :
     CUDA_VISIBLE_DEVICES=1 python scripts/phase5a_zoom_resample_check.py \\
         --data_root /storage/student7/teyssir/data/breaking_bad_vol.hdf5 \\
         --experiment cnn_step15_final_model \\
         --categories everyday --split val --max_batches 3000 \\
-        --num_points_to_sample 10000 --extra_budget 500 \\
+        --num_points_to_sample 10000 --expand_rings 0 \\
+        --extra_budget_sweep 200 500 800 1200 \\
         --resolution_sweep 128 96 64 48 32 24 20 16 12 \\
-        --summary_json /tmp/student7/phase5a_zoom_check.json
+        --csv_out /tmp/student7/phase5a_zoom_sweep.csv \\
+        --summary_json /tmp/student7/phase5a_zoom_sweep.json
 """
 
 import argparse
@@ -199,7 +207,17 @@ def main():
     parser.add_argument("--num_points_to_sample", type=int, default=10000)
     parser.add_argument("--extra_budget", type=int, default=500,
                         help="Nombre de points supplémentaires tirés sur la zone zoomée, "
-                             "PAR FRAGMENT, en plus de l'échantillonnage normal.")
+                             "PAR FRAGMENT, en plus de l'échantillonnage normal. Ignoré si "
+                             "--extra_budget_sweep est donné.")
+    parser.add_argument("--extra_budget_sweep", type=int, nargs="+", default=[],
+                        help="Teste PLUSIEURS budgets dans la MÊME passe du dataloader "
+                             "(2026-07-22, évite de relancer tout le run pour chaque valeur "
+                             "-- même principe que --pose_resolution_sweep). Le budget le "
+                             "plus grand est tiré UNE FOIS ; les budgets plus petits prennent "
+                             "un sous-ensemble de ce même tirage (statistiquement valide -- "
+                             "un sous-ensemble d'un tirage i.i.d. est un tirage i.i.d. valide "
+                             "de cette taille, pas besoin de retirer). Remplace --extra_budget "
+                             "si fourni.")
     parser.add_argument("--expand_rings", type=int, default=1,
                         help="Anneaux d'adjacence de faces pour étendre la zone zoom "
                              "au-delà des seules faces déjà touchées par l'échantillon épars.")
@@ -208,6 +226,9 @@ def main():
     args = parser.parse_args()
     args.dilate_px = 0
     args.gaussian_sigma_px = 0.0
+
+    budgets = sorted(args.extra_budget_sweep) if args.extra_budget_sweep else [args.extra_budget]
+    max_budget = budgets[-1]
 
     rng = np.random.default_rng(args.seed)
 
@@ -228,7 +249,7 @@ def main():
     n_zoom_failed = 0
     t0 = time.time()
     print(f"\nDiagnostic zoom + rééchantillonnage local -- "
-          f"{args.categories}/{args.split}, extra_budget={args.extra_budget}...\n")
+          f"{args.categories}/{args.split}, budgets={budgets}...\n")
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
@@ -281,34 +302,39 @@ def main():
             baseline_res = run_cascade(frac_i_base, frac_j_base, R_ij, t_ij, args)
 
             # ── Zoom : localise la zone fracture sur CHAQUE maillage à partir des
-            # points fracture déjà connus (repère GT/maillage), tire des points
-            # supplémentaires dessus, les ramène en repère input, concatène. ──────
+            # points fracture déjà connus (repère GT/maillage), tire UNE FOIS le
+            # budget le plus grand du sweep, ramène en repère input, concatène.
+            # Les budgets plus petits prennent un sous-ensemble de CE MÊME tirage
+            # (cf. --extra_budget_sweep : statistiquement valide, évite de retirer
+            # et de repasser tout le dataloader pour chaque valeur testée). ──────
             seed_i_gt = frag_pts_gt[0][gt_i == 1]
             seed_j_gt = frag_pts_gt[1][gt_j == 1]
-            new_i_gt = zoom_resample(meshes[p0], seed_i_gt, args.extra_budget,
-                                      args.expand_rings, rng)
-            new_j_gt = zoom_resample(meshes[p1], seed_j_gt, args.extra_budget,
-                                      args.expand_rings, rng)
-            if new_i_gt is None or new_j_gt is None:
+            new_i_gt_max = zoom_resample(meshes[p0], seed_i_gt, max_budget,
+                                          args.expand_rings, rng)
+            new_j_gt_max = zoom_resample(meshes[p1], seed_j_gt, max_budget,
+                                          args.expand_rings, rng)
+            if new_i_gt_max is None or new_j_gt_max is None:
                 n_zoom_failed += 1
                 continue
 
-            new_i_input = to_input_frame(new_i_gt, quats_np[p0], trans_np[p0])
-            new_j_input = to_input_frame(new_j_gt, quats_np[p1], trans_np[p1])
-
-            frac_i_zoom = np.concatenate([frac_i_base, new_i_input], axis=0)
-            frac_j_zoom = np.concatenate([frac_j_base, new_j_input], axis=0)
-
-            zoomed_res = run_cascade(frac_i_zoom, frac_j_zoom, R_ij, t_ij, args)
-
-            rows.append({
+            row = {
                 "n_frac_pts_min_base": n_min_base,
                 "base_stage": baseline_res["reached_stage"],
                 "base_pose_30": baseline_res.get("pose_30", False),
-                "zoom_n_frac_pts_min": zoomed_res["n_frac_pts_min"],
-                "zoom_stage": zoomed_res["reached_stage"],
-                "zoom_pose_30": zoomed_res.get("pose_30", False),
-            })
+                "zoom_by_budget": {},
+            }
+            for k in budgets:
+                new_i_input = to_input_frame(new_i_gt_max[:k], quats_np[p0], trans_np[p0])
+                new_j_input = to_input_frame(new_j_gt_max[:k], quats_np[p1], trans_np[p1])
+                frac_i_zoom = np.concatenate([frac_i_base, new_i_input], axis=0)
+                frac_j_zoom = np.concatenate([frac_j_base, new_j_input], axis=0)
+                zoomed_res = run_cascade(frac_i_zoom, frac_j_zoom, R_ij, t_ij, args)
+                row["zoom_by_budget"][k] = {
+                    "n_frac_pts_min": zoomed_res["n_frac_pts_min"],
+                    "stage": zoomed_res["reached_stage"],
+                    "pose_30": zoomed_res.get("pose_30", False),
+                }
+            rows.append(row)
 
     elapsed = time.time() - t0
     print(f"\nFini : {len(rows)} paires comparées ({n_seen_2frag} objets 2-frags vus, "
@@ -319,115 +345,121 @@ def main():
         print("Aucune paire exploitable.")
         return
 
-    # ── Comparaison globale baseline vs zoomed ──────────────────────────────────
+    # ── Comparaison globale baseline vs zoomed, POUR CHAQUE budget du sweep ─────
     n = len(rows)
     base_no_corr = sum(1 for r in rows if r["base_stage"] == "no_correspondence")
-    zoom_no_corr = sum(1 for r in rows if r["zoom_stage"] == "no_correspondence")
     base_pose = sum(1 for r in rows if r["base_stage"] == "pose_computed")
-    zoom_pose = sum(1 for r in rows if r["zoom_stage"] == "pose_computed")
     base_p30 = sum(1 for r in rows if r["base_pose_30"])
-    zoom_p30 = sum(1 for r in rows if r["zoom_pose_30"])
+    print(f"BASELINE (N={n}) : no_correspondence={100*base_no_corr/n:.1f}%  "
+          f"pose_computed={100*base_pose/n:.1f}%  Pose@30={100*base_p30/n:.1f}%")
 
-    print("COMPARAISON GLOBALE (mêmes N paires, baseline vs zoomed) :")
-    print(f"  {'':<20} {'baseline':>10} {'zoomed':>10}")
-    print(f"  {'no_correspondence':<20} {100*base_no_corr/n:>9.1f}% {100*zoom_no_corr/n:>9.1f}%")
-    print(f"  {'pose_computed':<20} {100*base_pose/n:>9.1f}% {100*zoom_pose/n:>9.1f}%")
-    print(f"  {'Pose@30 (/ total)':<20} {100*base_p30/n:>9.1f}% {100*zoom_p30/n:>9.1f}%")
-
-    # ── Par tranche de densité BASELINE (avant zoom) : où le zoom aide-t-il le
-    # plus ? Compare directement à density_outcome_stratification de
-    # phase5a_skip_audit.py (mêmes tranches). ───────────────────────────────────
-    print(f"\nPAR TRANCHE DE DENSITÉ BASELINE (n_frac_pts_min AVANT zoom) :")
-    header = (f"  {'Bin':<10} {'N':>5} {'NoCorr(base)':>13} {'NoCorr(zoom)':>13} "
-              f"{'Pose30(base)':>13} {'Pose30(zoom)':>13}")
-    print(header)
     idx = np.digitize([r["n_frac_pts_min_base"] for r in rows], DENSITY_BINS[1:-1])
-    summary_bins = {}
-    for b, label in enumerate(DENSITY_LABELS):
-        bin_rows = [r for r, i in zip(rows, idx) if i == b]
-        nb = len(bin_rows)
-        if nb == 0:
-            print(f"  {label:<10} {'—':>5}")
-            continue
-        b_nc = 100 * sum(1 for r in bin_rows if r["base_stage"] == "no_correspondence") / nb
-        z_nc = 100 * sum(1 for r in bin_rows if r["zoom_stage"] == "no_correspondence") / nb
-        b_p3 = 100 * sum(1 for r in bin_rows if r["base_pose_30"]) / nb
-        z_p3 = 100 * sum(1 for r in bin_rows if r["zoom_pose_30"]) / nb
-        print(f"  {label:<10} {nb:>5} {b_nc:>12.1f}% {z_nc:>12.1f}% "
-              f"{b_p3:>12.1f}% {z_p3:>12.1f}%")
-        summary_bins[label] = {"n": nb, "no_corr_base": b_nc, "no_corr_zoom": z_nc,
-                                "pose30_base": b_p3, "pose30_zoom": z_p3}
+    summary_by_budget = {}
 
-    print("\n(Lecture : le zoom vaut la peine si NoCorr(zoom) << NoCorr(base) et\n"
-          " Pose30(zoom) >= Pose30(base) SPÉCIFIQUEMENT sur les tranches basses (<150) --\n"
-          " c'est exactement là que le problème de densité a été identifié. Si Pose30(zoom)\n"
-          " chute sur les tranches déjà bonnes (300+), le zoom dilue un signal déjà propre --\n"
-          " à surveiller, pas juste regarder les tranches basses.)")
+    for k in budgets:
+        zoom_no_corr = sum(1 for r in rows if r["zoom_by_budget"][k]["stage"] == "no_correspondence")
+        zoom_pose = sum(1 for r in rows if r["zoom_by_budget"][k]["stage"] == "pose_computed")
+        zoom_p30 = sum(1 for r in rows if r["zoom_by_budget"][k]["pose_30"])
 
-    # ── Composition vs dégradation (2026-07-22, demande de l'utilisateur) : la
-    # baisse de Pose@30 global vient-elle juste du fait que PLUS de paires sont
-    # comptées (les nouvelles récupérées sont intrinsèquement plus dures), ou le
-    # zoom abîme-t-il aussi la précision des paires qui marchaient DÉJÀ en
-    # baseline ? Isole en comparant Pose@30 sur le MÊME sous-ensemble fixe (déjà
-    # éligible en baseline) avant/après zoom -- si stable, effet de composition
-    # pur (rien à corriger) ; si ça baisse aussi ici, vraie dégradation (le zoom
-    # décale le repère PCA même quand il n'était pas nécessaire). ─────────────
-    base_eligible = [r for r in rows if r["base_stage"] == "pose_computed"]
-    newly_rescued = [r for r in rows if r["base_stage"] != "pose_computed"
-                      and r["zoom_stage"] == "pose_computed"]
-    print(f"\nCOMPOSITION vs DÉGRADATION (isole l'effet du zoom sur la précision) :")
-    if base_eligible:
-        nbe = len(base_eligible)
-        be_base_p30 = 100 * sum(1 for r in base_eligible if r["base_pose_30"]) / nbe
-        be_zoom_p30 = 100 * sum(1 for r in base_eligible if r["zoom_pose_30"]) / nbe
-        print(f"  Paires DÉJÀ éligibles en baseline (N={nbe}) : "
-              f"Pose@30 base={be_base_p30:.1f}% -> zoomed={be_zoom_p30:.1f}%")
-    else:
-        print("  Paires déjà éligibles en baseline : aucune")
-    if newly_rescued:
-        nnr = len(newly_rescued)
-        nr_p30 = 100 * sum(1 for r in newly_rescued if r["zoom_pose_30"]) / nnr
-        print(f"  Paires récupérées PAR le zoom, no_correspondence en baseline (N={nnr}) : "
-              f"Pose@30 zoomed={nr_p30:.1f}%")
-    else:
-        print("  Paires récupérées par le zoom : aucune")
-    print("\n(Lecture : si la ligne 'déjà éligibles' reste stable (base ≈ zoomed), la baisse\n"
-          " globale vient d'un effet de composition -- les paires récupérées sont juste plus\n"
-          " dures intrinsèquement, le zoom n'abîme rien. Si elle baisse aussi nettement, le\n"
-          " zoom dégrade réellement la précision même là où il n'était pas nécessaire\n"
-          " (probablement --expand_rings qui déborde de la vraie limite de fracture).)")
+        print(f"\n=== extra_budget={k} ===")
+        print("COMPARAISON GLOBALE (mêmes N paires, baseline vs zoomed) :")
+        print(f"  {'':<20} {'baseline':>10} {'zoomed':>10}")
+        print(f"  {'no_correspondence':<20} {100*base_no_corr/n:>9.1f}% {100*zoom_no_corr/n:>9.1f}%")
+        print(f"  {'pose_computed':<20} {100*base_pose/n:>9.1f}% {100*zoom_pose/n:>9.1f}%")
+        print(f"  {'Pose@30 (/ total)':<20} {100*base_p30/n:>9.1f}% {100*zoom_p30/n:>9.1f}%")
+
+        # ── Par tranche de densité BASELINE (avant zoom) : où le zoom aide-t-il le
+        # plus ? Compare directement à density_outcome_stratification de
+        # phase5a_skip_audit.py (mêmes tranches). ───────────────────────────────
+        print(f"  PAR TRANCHE DE DENSITÉ BASELINE (n_frac_pts_min AVANT zoom) :")
+        header = (f"    {'Bin':<10} {'N':>5} {'NoCorr(base)':>13} {'NoCorr(zoom)':>13} "
+                  f"{'Pose30(base)':>13} {'Pose30(zoom)':>13}")
+        print(header)
+        summary_bins = {}
+        for b, label in enumerate(DENSITY_LABELS):
+            bin_rows = [r for r, i in zip(rows, idx) if i == b]
+            nb = len(bin_rows)
+            if nb == 0:
+                print(f"    {label:<10} {'—':>5}")
+                continue
+            b_nc = 100 * sum(1 for r in bin_rows if r["base_stage"] == "no_correspondence") / nb
+            z_nc = 100 * sum(1 for r in bin_rows if r["zoom_by_budget"][k]["stage"] == "no_correspondence") / nb
+            b_p3 = 100 * sum(1 for r in bin_rows if r["base_pose_30"]) / nb
+            z_p3 = 100 * sum(1 for r in bin_rows if r["zoom_by_budget"][k]["pose_30"]) / nb
+            print(f"    {label:<10} {nb:>5} {b_nc:>12.1f}% {z_nc:>12.1f}% "
+                  f"{b_p3:>12.1f}% {z_p3:>12.1f}%")
+            summary_bins[label] = {"n": nb, "no_corr_base": b_nc, "no_corr_zoom": z_nc,
+                                    "pose30_base": b_p3, "pose30_zoom": z_p3}
+
+        # ── Composition vs dégradation (2026-07-22) : la baisse de Pose@30 global
+        # vient-elle juste du fait que PLUS de paires sont comptées (les nouvelles
+        # récupérées sont intrinsèquement plus dures), ou le zoom abîme-t-il aussi
+        # la précision des paires qui marchaient DÉJÀ en baseline ? ─────────────
+        base_eligible = [r for r in rows if r["base_stage"] == "pose_computed"]
+        newly_rescued = [r for r in rows if r["base_stage"] != "pose_computed"
+                          and r["zoom_by_budget"][k]["stage"] == "pose_computed"]
+        print(f"  COMPOSITION vs DÉGRADATION :")
+        composition = {}
+        if base_eligible:
+            nbe = len(base_eligible)
+            be_base_p30 = 100 * sum(1 for r in base_eligible if r["base_pose_30"]) / nbe
+            be_zoom_p30 = 100 * sum(1 for r in base_eligible if r["zoom_by_budget"][k]["pose_30"]) / nbe
+            print(f"    Paires DÉJÀ éligibles en baseline (N={nbe}) : "
+                  f"Pose@30 base={be_base_p30:.1f}% -> zoomed={be_zoom_p30:.1f}%")
+            composition = {"base_eligible_n": nbe, "base_eligible_pose30_base": be_base_p30,
+                           "base_eligible_pose30_zoom": be_zoom_p30}
+        if newly_rescued:
+            nnr = len(newly_rescued)
+            nr_p30 = 100 * sum(1 for r in newly_rescued if r["zoom_by_budget"][k]["pose_30"]) / nnr
+            print(f"    Paires récupérées PAR le zoom (N={nnr}) : Pose@30 zoomed={nr_p30:.1f}%")
+            composition["newly_rescued_n"] = nnr
+            composition["newly_rescued_pose30_zoom"] = nr_p30
+
+        summary_by_budget[str(k)] = {
+            "no_correspondence_zoom": 100*zoom_no_corr/n,
+            "pose_computed_zoom": 100*zoom_pose/n,
+            "pose_30_zoom": 100*zoom_p30/n,
+            "by_density_bin": summary_bins,
+            "composition_vs_degradation": composition,
+        }
+
+    print("\n(Lecture : pour chaque budget, le zoom vaut la peine si NoCorr(zoom) << NoCorr(base)\n"
+          " et Pose30(zoom) >= Pose30(base) SPÉCIFIQUEMENT sur les tranches basses (<150).\n"
+          " Comparer les 'COMPOSITION vs DÉGRADATION' entre budgets : si la ligne 'déjà\n"
+          " éligibles' se dégrade moins à un budget qu'à un autre, ce budget préserve mieux\n"
+          " la précision sans sacrifier l'éligibilité -- chercher le meilleur compromis sur\n"
+          " l'ensemble des budgets testés, pas juste le premier qui améliore l'éligibilité.)")
 
     if args.csv_out:
         import csv
         Path(args.csv_out).parent.mkdir(parents=True, exist_ok=True)
-        fieldnames = list(rows[0].keys())
+        flat_rows = []
+        for r in rows:
+            flat = {"n_frac_pts_min_base": r["n_frac_pts_min_base"],
+                    "base_stage": r["base_stage"], "base_pose_30": r["base_pose_30"]}
+            for k in budgets:
+                zb = r["zoom_by_budget"][k]
+                flat[f"zoom_b{k}_n_frac_pts_min"] = zb["n_frac_pts_min"]
+                flat[f"zoom_b{k}_stage"] = zb["stage"]
+                flat[f"zoom_b{k}_pose_30"] = zb["pose_30"]
+            flat_rows.append(flat)
+        fieldnames = list(flat_rows[0].keys())
         with open(args.csv_out, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(rows)
-        print(f"\nCSV complet sauvegardé ({len(rows)} lignes) : {args.csv_out} "
+            writer.writerows(flat_rows)
+        print(f"\nCSV complet sauvegardé ({len(flat_rows)} lignes) : {args.csv_out} "
               f"(permet de recalculer d'autres croisements sans relancer le run)")
 
     if args.summary_json:
         Path(args.summary_json).parent.mkdir(parents=True, exist_ok=True)
-        composition = {}
-        if base_eligible:
-            nbe = len(base_eligible)
-            composition["base_eligible_n"] = nbe
-            composition["base_eligible_pose30_base"] = 100*sum(1 for r in base_eligible if r["base_pose_30"])/nbe
-            composition["base_eligible_pose30_zoom"] = 100*sum(1 for r in base_eligible if r["zoom_pose_30"])/nbe
-        if newly_rescued:
-            nnr = len(newly_rescued)
-            composition["newly_rescued_n"] = nnr
-            composition["newly_rescued_pose30_zoom"] = 100*sum(1 for r in newly_rescued if r["zoom_pose_30"])/nnr
         with open(args.summary_json, "w") as f:
             json.dump({
                 "config": vars(args), "n_pairs": n, "n_zoom_failed": n_zoom_failed,
-                "no_correspondence": {"base": 100*base_no_corr/n, "zoom": 100*zoom_no_corr/n},
-                "pose_computed": {"base": 100*base_pose/n, "zoom": 100*zoom_pose/n},
-                "pose_30": {"base": 100*base_p30/n, "zoom": 100*zoom_p30/n},
-                "by_density_bin": summary_bins,
-                "composition_vs_degradation": composition,
+                "budgets": budgets,
+                "baseline": {"no_correspondence": 100*base_no_corr/n,
+                             "pose_computed": 100*base_pose/n, "pose_30": 100*base_p30/n},
+                "by_budget": summary_by_budget,
             }, f, indent=2)
         print(f"JSON résumé sauvegardé : {args.summary_json}")
 
