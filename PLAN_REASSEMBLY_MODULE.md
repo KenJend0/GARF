@@ -2562,3 +2562,60 @@ choisir/dimensionner une solution de zoom-resampling. Résultat pas encore
 lancé — prochaine action : relancer `phase5a_skip_audit.py` (cascade +
 `max_planarity` déjà sans effet ici puisque jamais un hard-stop) et lire
 cette nouvelle table.
+
+**Résultat (2026-07-22, N=1487, cascade R=128..12) : stratification fine
+confirme une courbe dose-réponse nette et exploitable.** `NoCorr` chute de
+97.0% (`<50` pts) à ~10-12% (`300+` pts), la plus grosse baisse se jouant
+entre 100 et 300 points ; au-delà de 300 ça plafonne (résidu probablement
+géométrique, pas de densité). **Population concernée : 771/1487 paires
+(52%) sous 150 points**, avec des taux d'échec 97%/84.6%/74.7%/42.5% — cible
+énorme pour un fix de densité ciblé. `too_curved` confirmé à 89.4%
+récupérable (cohérent avec le run précédent) → **décision : suppression
+complète du seuil (pas juste relâché)**, implémentée dans
+`phase5a_depthmap_matching.py` (`--max_planarity`/`DEFAULT_MAX_PLANARITY`
+retirés, `plan_i`/`plan_j` restent calculés pour la stratification
+diagnostique uniquement).
+
+## Piste "zoom + rééchantillonnage local" (2026-07-22)
+
+**Idée de l'utilisateur, étendue en architecture de pipeline complète** :
+plutôt qu'augmenter `num_points_to_sample` globalement (déjà écarté par
+l'utilisateur — gaspille le budget sur tout le fragment), zoomer
+spatialement sur la zone de fracture déjà repérée (GT ici ; CNN `thresh0.3`
+plus tard, ça referme l'item resté ouvert du "pipeline en deux temps") et y
+rééchantillonner densément, EN PLUS de l'échantillonnage normal.
+
+**Faisabilité vérifiée avant de coder (inspection de
+`assembly/data/breaking_bad/base.py`/`weighted.py`)** : chaque fragment est
+stocké comme un MAILLAGE complet (`data["meshes"]`, conservé en val/test,
+supprimé en train pour la mémoire — pas un problème, tout Phase 5A/7 tourne
+sur val). `shared_faces` (indices de faces fracture) existe côté dataset
+mais n'est PAS conservé dans le dict retourné par `get_data()` — seul
+`fracture_surface_gt` (labels par POINT) et `pointclouds_gt` (repère
+maillage, avant recentrage/rotation/rescale) survivent jusqu'au batch.
+Solution : localiser la zone fracture par PROXIMITÉ SPATIALE
+(`trimesh.proximity.closest_point`, donne le triangle le plus proche de
+chaque point fracture déjà connu) plutôt que par indice de face stocké —
+cette méthode fonctionne IDENTIQUEMENT pour GT (points exacts) et pour
+`thresh0.3` (points prédits par le CNN) plus tard, un seul mécanisme pour
+les deux cas.
+
+**Implémenté : `scripts/phase5a_zoom_resample_check.py`.** Pour chaque
+paire : (1) localise la zone fracture sur le maillage à partir des points
+fracture déjà échantillonnés (`trimesh.proximity.closest_point`), étend d'un
+anneau d'adjacence (`mesh.face_adjacency`, `--expand_rings`, défaut 1) pour
+couvrir un peu plus que les seules faces déjà touchées par l'échantillon
+épars ; (2) tire `--extra_budget` (défaut 500) nouveaux points RESTREINTS à
+cette zone via `trimesh.sample.sample_surface(mesh, face_weight=...)` (déjà
+utilisé ailleurs dans le codebase pour l'échantillonnage `weighted`, pas de
+réimplémentation) ; (3) ramène ces nouveaux points du repère maillage/GT au
+repère "input" (celui de `raw_i` dans les autres scripts) via l'inverse de
+la formule de reconstruction Phase 0 : `q = (pts_gt - translation) @
+R(quat)` ; (4) concatène aux points fracture existants, relance la MÊME
+cascade de résolution (`run_match_at_resolution`, pas de réimplémentation)
+que `phase5a_skip_audit.py`, sur les MÊMES paires en conditions baseline vs
+zoomed. Comparaison globale + par tranche de densité baseline (mêmes bornes
+que `density_outcome_stratification`), pour voir si le zoom aide
+spécifiquement les tranches basses sans diluer les tranches déjà bonnes.
+Résultat pas encore lancé — prochaine action : lancer sur le serveur et lire
+la table PAR TRANCHE DE DENSITÉ BASELINE.
