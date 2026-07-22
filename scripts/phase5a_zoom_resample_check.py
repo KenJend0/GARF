@@ -21,9 +21,13 @@ Mécanisme (confirmé faisable en inspectant `assembly/data/breaking_bad/`) :
 - `pointclouds_gt`/`fracture_surface_gt` (dans le batch) sont dans le repère
   du maillage (AVANT recentrage/rotation/rescale) -- donc les points
   fracture déjà échantillonnés servent de "graine" pour localiser la zone
-  sur le maillage (via `trimesh.proximity.closest_point`, qui donne le
-  triangle le plus proche de chaque point), sans avoir besoin de l'indice de
-  face d'origine (jeté après `sample_points()`, jamais stocké dans `data`).
+  sur le maillage. Face la plus proche de chaque point : `cKDTree` (scipy)
+  sur `mesh.triangles_center` -- PAS `trimesh.proximity.closest_point`
+  (dépend de `rtree`, absent de l'environnement serveur ; l'approximation
+  "centroïde de face le plus proche" suffit ici, on veut juste délimiter un
+  voisinage, pas une projection géométrique exacte) -- sans avoir besoin de
+  l'indice de face d'origine (jeté après `sample_points()`, jamais stocké
+  dans `data`).
 - On étend le jeu de faces "zoom" par 1 anneau d'adjacence
   (`mesh.face_adjacency`), on construit un `face_weight` nul partout sauf sur
   ces faces (pondéré par leur aire), et on tire nouveaux points via
@@ -61,6 +65,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import trimesh
+from scipy.spatial import cKDTree
 from hydra.utils import instantiate
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -108,7 +113,13 @@ def zoom_resample(mesh, seed_pts_gt_frame, extra_budget, expand_rings, rng):
     est vide (ne devrait pas arriver si seed_pts_gt_frame est non-vide)."""
     if len(seed_pts_gt_frame) == 0:
         return None
-    _, _, seed_face_idx = trimesh.proximity.closest_point(mesh, seed_pts_gt_frame)
+    # cKDTree sur les centroïdes de faces plutôt que trimesh.proximity.closest_point
+    # (qui dépend de `rtree`, absent de l'environnement du serveur) -- approximation
+    # "face la plus proche du point" au lieu du point exact sur le triangle, largement
+    # suffisant pour localiser la zone (on veut juste "quelles faces sont dans le
+    # voisinage", pas une projection géométrique exacte).
+    tree = cKDTree(mesh.triangles_center)
+    _, seed_face_idx = tree.query(seed_pts_gt_frame)
     zoom_face_idx = expand_faces_by_adjacency(mesh, np.unique(seed_face_idx), expand_rings)
     if len(zoom_face_idx) == 0:
         return None
