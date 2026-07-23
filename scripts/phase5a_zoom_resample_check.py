@@ -173,7 +173,7 @@ def run_cascade(frac_i, frac_j, R_ij_gt, t_ij_gt, args):
     resolutions_desc = sorted(args.resolution_sweep, reverse=True)
     result = {"reached_stage": "no_correspondence", "n_frac_pts_min": min(n_i, n_j),
               "resolution_used": None, "pose_30": False, "pose_15": False,
-              "rot_err": None, "trans_err": None}
+              "rot_err": None, "trans_err": None, "R_est": None, "t_est": None}
     for r in resolutions_desc:
         res_r = run_match_at_resolution(
             frac_i, c_i, u_i, v_i, n_i_ax, frac_j, c_j, u_j, v_j, n_j_ax,
@@ -186,6 +186,10 @@ def run_cascade(frac_i, frac_j, R_ij_gt, t_ij_gt, args):
             result["trans_err"] = res_r["trans_err"]
             result["pose_30"] = bool(res_r["pose_success"]["30deg_0.1"])
             result["pose_15"] = bool(res_r["pose_success"]["15deg_0.05"])
+            # R_est/t_est (2026-07-22, Phase 6B) : la pose estimée par ce stade,
+            # utilisable comme initialisation d'un raffinement point-à-point.
+            result["R_est"] = res_r["R_est"]
+            result["t_est"] = res_r["t_est"]
             break
     return result
 

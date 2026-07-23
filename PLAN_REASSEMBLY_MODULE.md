@@ -3024,3 +3024,30 @@ deux étages — prendre les poses produites par `phase5a_depthmap_matching.py`
 `trimmed_icp_normals()` dessus, et mesurer le taux de succès final réel du
 pipeline complet (pas juste en perturbation contrôlée) sur les ~69% de
 paires "faciles".
+
+## Phase 6B — Pipeline complet bout-en-bout (2026-07-22)
+
+**Implémenté : `scripts/phase6b_pipeline_check.py`.** Chaîne réellement les
+deux étages validés le même jour, sur les VRAIES poses produites par
+l'étage 1 (pas une perturbation contrôlée comme en Phase 6A) :
+- Étage 1 : masque GT + zoom (`ring=0`, `--extra_budget` fixe, défaut 1200 —
+  meilleur compromis trouvé dans le sweep GT du jour) → `run_cascade()` →
+  pose `(R_est, t_est)` si `pose_computed`.
+- Étage 2 : `trimmed_icp_normals()` initialisé par `(R_est, t_est)`, sur les
+  VRAIS points GT non zoomés (le zoom servait à l'éligibilité de l'étage 1,
+  l'étage 2 a déjà assez de vrais points).
+- Compare `Pose@30`/`Pose@15` étage-1-seul vs étage-1+étage-2, plus le taux
+  de succès strict (5°/0.02) du bassin de convergence Phase 6A.
+
+**Changement nécessaire pour ça : `R_est`/`t_est` exposés.**
+`run_match_at_resolution()` (`phase5a_depthmap_matching.py`) et
+`run_cascade()` (`phase5a_zoom_resample_check.py`) calculaient déjà la pose
+estimée en interne mais la jetaient (ne retournaient que `rot_err`/
+`trans_err` déjà comparés au GT) — ajout non-cassant (nouvelles clés dans
+les dicts de retour, les appelants existants les ignorent simplement).
+Restreint à `n_frac_pts_min >= 50` (population "facile", cohérent avec la
+décision du jour). Réutilise `zoom_resample`/`to_input_frame`/`run_cascade`,
+`trimmed_icp_normals`, `extract_gt_variable`,
+`quat_wxyz_to_rotmat`/`rot_err_deg`/`trans_err` — aucune réimplémentation.
+Résultat pas encore lancé — prochaine action : lancer sur le serveur et
+lire la table **COMPARAISON ÉTAGE 1 SEUL vs ÉTAGE 1 + ÉTAGE 2**.

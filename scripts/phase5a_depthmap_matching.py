@@ -653,6 +653,11 @@ def run_match_at_resolution(frac_i, c_i, u_i, v_i, n_i,
         "pose_success": {f"{int(r)}deg_{t}": bool(re < r and te < t)
                           for r, t in POSE_SUCCESS_THRESH},
         "best_overlap_frac": float(best_overlap_frac),
+        # R_est/t_est exposés (2026-07-22, Phase 6B) : nécessaires pour chaîner
+        # ce résultat comme initialisation d'un raffinement point-à-point
+        # (trimmed_icp_normals) -- jusqu'ici calculés en interne mais jetés.
+        "R_est":        R_est,
+        "t_est":        t_est,
         "n_corr":       len(pts_i3),
         "n_dmap_pix":   (n_pix_i, n_pix_j),
     }
