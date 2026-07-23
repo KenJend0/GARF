@@ -143,6 +143,11 @@ def main():
     parser.add_argument("--expand_rings", type=int, default=0,
                         help="Défaut 0 (pas d'expansion) -- validé en GT le 2026-07-22 : "
                              "l'expansion à 1 anneau dégradait la précision sans nécessité.")
+    parser.add_argument("--max_n_min_base", type=int, default=0,
+                        help="Ne traite QUE les paires dont n_frac_pts_min (baseline, "
+                             "AVANT zoom) est < ce seuil (2026-07-22, diagnostic ciblé sur "
+                             "la tranche '<50' -- évite de dépenser du calcul sur les "
+                             "paires déjà bien servies). 0 = pas de filtre (défaut).")
     parser.add_argument("--csv_out", default="", help="Dump complet, une ligne par paire.")
     parser.add_argument("--summary_json", default="")
     parser.add_argument("--device",      default="cuda" if torch.cuda.is_available() else "cpu")
@@ -269,6 +274,8 @@ def main():
             n_min_base = min(len(frac_i_base), len(frac_j_base))
             if n_min_base < ABS_MIN_POINTS:
                 continue
+            if args.max_n_min_base > 0 and n_min_base >= args.max_n_min_base:
+                continue   # diagnostic ciblé sur une tranche de densité (2026-07-22)
 
             baseline_res = run_cascade(frac_i_base, frac_j_base, R_ij, t_ij, args)
 
@@ -321,6 +328,14 @@ def main():
                 "n_frac_pts_min_base": n_min_base,
                 "base_stage": baseline_res["reached_stage"],
                 "base_pose_30": baseline_res.get("pose_30", False),
+                # Tracking des graines avant/après clustering (2026-07-22, demande de
+                # l'utilisateur -- "comment avec 200pts de plus on ne trouve toujours
+                # pas 3 correspondances, c'est un mystère") : distingue "le CNN ne
+                # prédit presque rien" (n_seed_raw bas) de "le clustering détruit ce
+                # qu'il y avait" (n_seed_clustered << n_seed_raw).
+                "n_seed_raw_i": int(mask0.sum()), "n_seed_raw_j": int(mask1.sum()),
+                "n_seed_clustered_i": int(cluster_mask0.sum()),
+                "n_seed_clustered_j": int(cluster_mask1.sum()),
                 "zoom_by_budget": {},
             }
             for k in budgets:
@@ -339,6 +354,25 @@ def main():
             rows.append(row)
 
     elapsed = time.time() - t0
+
+    if rows:
+        print("\nGRAINES AVANT/APRÈS CLUSTERING (le côté le plus pauvre des deux "
+              "fragments, par paire) :")
+        n_raw_min = np.array([min(r["n_seed_raw_i"], r["n_seed_raw_j"]) for r in rows])
+        n_clu_min = np.array([min(r["n_seed_clustered_i"], r["n_seed_clustered_j"]) for r in rows])
+        n_dropped_to_zero = int(np.sum(n_clu_min == 0))
+        for label, vals in [("n_seed_raw (avant clustering)", n_raw_min),
+                             ("n_seed_clustered (après clustering)", n_clu_min)]:
+            print(f"  {label:<38} N={len(vals):>5}  "
+                  f"p25={np.percentile(vals,25):>6.1f}  p50={np.percentile(vals,50):>6.1f}  "
+                  f"p75={np.percentile(vals,75):>6.1f}  moyenne={np.mean(vals):>6.1f}")
+        print(f"  Paires où le clustering réduit un côté à 0 graine : "
+              f"{n_dropped_to_zero}/{len(rows)} ({100*n_dropped_to_zero/len(rows):.1f}%)")
+        print("(Lecture : si n_seed_clustered est beaucoup plus bas que n_seed_raw, le "
+              "clustering (MIN_CLUSTER_SIZE=10) détruit une bonne partie des graines déjà "
+              "rares. Si les deux sont proches et bas, le CNN ne prédit tout simplement "
+              "presque rien -- le clustering n'est pas en cause.)\n")
+
     report_zoom_sweep(rows, budgets, args, n_seen_2frag, n_zoom_failed, elapsed)
 
 

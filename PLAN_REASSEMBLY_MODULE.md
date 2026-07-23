@@ -2810,6 +2810,40 @@ sur `Pose@30` global (reste stable plutôt que d'augmenter) — cohérent avec
 le fait que le masque `thresh0.3` a un peu plus de bruit résiduel que le
 GT, même après filtrage par clustering.
 
+**Sweep de budget étendu (2026-07-22, N=1468, budgets 500/1200/2000/3000) :
+éligibilité continue de progresser, rendements décroissants mais pas de
+plafond net.** `no_correspondence` : 59.0%(base)→47.0%→41.6%→39.6%→**37.7%**.
+`Pose@30` reste stable autour de 6% à tous les budgets (pas de tendance
+claire). **Le vrai goulot pour l'éligibilité totale : la tranche `<50`**,
+qui représente **462/1468 paires (31.5% de TOUT le dataset)** et reste à
+64.3% de `NoCorr` même à budget=3000 (contre 98.7% en baseline — progrès
+réel mais très incomplet). Cette seule tranche pèse plus que tout le reste
+de l'écart vers les ~99.7% visés.
+
+**Décision utilisateur (2026-07-22) : ne pas continuer à augmenter le
+budget** (rendements décroissants, ne résout pas le vrai problème de la
+tranche `<50`) — investiguer plutôt POURQUOI même un budget modeste (200
+points) ne suffit pas à créer 3 correspondances dans cette tranche.
+Hypothèse proposée : `MIN_CLUSTER_SIZE=10` (calé sur la Phase 2D, masques
+GT toujours bien peuplés) pourrait être trop strict pour des masques
+`thresh0.3` déjà épars — un fragment où le CNN prédit seulement 15-20
+points pourrait perdre la moitié de ses graines au clustering, précisément
+là où on en a le plus besoin.
+
+**Implémenté (2026-07-22) : instrumentation du tracking des graines +
+filtre de tranche ciblé.** `phase5a_zoom_resample_thresh03_check.py` :
+`--max_n_min_base` (ne traite que les paires sous ce seuil de densité
+baseline, économise le calcul sur les paires déjà bien servies) ;
+`row["n_seed_raw_i/j"]`/`row["n_seed_clustered_i/j"]` trace le nombre de
+graines avant et après `dominant_cluster_mask()`, nouveau résumé console
+**GRAINES AVANT/APRÈS CLUSTERING** (percentiles du côté le plus pauvre,
++ compteur de paires réduites à 0 graine par le clustering).
+`phase5a_zoom_resample_check.py::report_zoom_sweep()` : export CSV
+généralisé pour passer automatiquement tout champ additionnel présent dans
+`rows` (pas de couplage explicite entre les deux scripts). Résultat pas
+encore lancé — prochaine action : `--max_n_min_base 50` et lire le nouveau
+résumé de graines.
+
 **Correction méthodologique demandée par l'utilisateur (2026-07-22) : ne pas
 tâtonner un paramètre à la fois en relançant tout le run à chaque fois —
 construire un vrai sweep dans la même passe**, comme déjà fait pour la

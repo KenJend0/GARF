@@ -443,10 +443,18 @@ def report_zoom_sweep(rows, budgets, args, n_seen_2frag, n_zoom_failed, elapsed)
     if args.csv_out:
         import csv
         Path(args.csv_out).parent.mkdir(parents=True, exist_ok=True)
+        _known_keys = {"n_frac_pts_min_base", "base_stage", "base_pose_30", "zoom_by_budget"}
         flat_rows = []
         for r in rows:
             flat = {"n_frac_pts_min_base": r["n_frac_pts_min_base"],
                     "base_stage": r["base_stage"], "base_pose_30": r["base_pose_30"]}
+            # Passe automatiquement les champs additionnels que certains appelants
+            # ajoutent (ex. n_seed_raw_i/j, n_seed_clustered_i/j dans
+            # phase5a_zoom_resample_thresh03_check.py) -- pas de couplage explicite
+            # nécessaire entre les deux scripts.
+            for extra_key, extra_val in r.items():
+                if extra_key not in _known_keys:
+                    flat[extra_key] = extra_val
             for k in budgets:
                 zb = r["zoom_by_budget"][k]
                 flat[f"zoom_b{k}_n_frac_pts_min"] = zb["n_frac_pts_min"]
