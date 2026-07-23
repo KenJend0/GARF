@@ -279,6 +279,19 @@ def main():
 
             baseline_res = run_cascade(frac_i_base, frac_j_base, R_ij, t_ij, args)
 
+            # ── Comparaison GT sur les MÊMES objets (2026-07-22, demande de
+            # l'utilisateur) : la tranche '<50 côté CNN' est-elle aussi dure pour
+            # le GT (fracture physiquement petite/ambiguë pour tout le monde), ou
+            # est-ce spécifique à la localisation du CNN ? `fracture_surface_gt`
+            # est déjà dans le batch `uniform` (pas besoin du mesh_dataset ici,
+            # simple label par point, même alignement que pc_per_k). ──────────
+            fracture_gt_np = batch["fracture_surface_gt"].numpy()   # (1, P, N)
+            gt_label0 = fracture_gt_np[0, p0]
+            gt_label1 = fracture_gt_np[0, p1]
+            frac_i_gt = raw0[gt_label0 == 1]
+            frac_j_gt = raw1[gt_label1 == 1]
+            gt_res = run_cascade(frac_i_gt, frac_j_gt, R_ij, t_ij, args)
+
             # ── Zoom : graines = points prédits fracture par le CNN (PAS le GT),
             # en repère maillage (gtgt0/gtgt1, aligné index-à-index avec pc_per_k
             # puisque extract_fragment_list découpe pointclouds ET pointclouds_gt
@@ -336,6 +349,8 @@ def main():
                 "n_seed_raw_i": int(mask0.sum()), "n_seed_raw_j": int(mask1.sum()),
                 "n_seed_clustered_i": int(cluster_mask0.sum()),
                 "n_seed_clustered_j": int(cluster_mask1.sum()),
+                "gt_stage": gt_res["reached_stage"],
+                "gt_pose_30": gt_res.get("pose_30", False),
                 "zoom_by_budget": {},
             }
             for k in budgets:
@@ -372,6 +387,27 @@ def main():
               "clustering (MIN_CLUSTER_SIZE=10) détruit une bonne partie des graines déjà "
               "rares. Si les deux sont proches et bas, le CNN ne prédit tout simplement "
               "presque rien -- le clustering n'est pas en cause.)\n")
+
+        # ── GT sur les MÊMES objets (2026-07-22) : cette tranche est-elle dure
+        # pour tout le monde (fracture physiquement petite/ambiguë), ou
+        # spécifique à la localisation du CNN ? ─────────────────────────────
+        n = len(rows)
+        gt_no_corr = sum(1 for r in rows if r["gt_stage"] == "no_correspondence")
+        gt_pose    = sum(1 for r in rows if r["gt_stage"] == "pose_computed")
+        gt_p30     = sum(1 for r in rows if r["gt_pose_30"])
+        cnn_no_corr = sum(1 for r in rows if r["base_stage"] == "no_correspondence")
+        cnn_pose    = sum(1 for r in rows if r["base_stage"] == "pose_computed")
+        cnn_p30     = sum(1 for r in rows if r["base_pose_30"])
+        print(f"GT vs CNN SUR LES MÊMES {n} OBJETS (tranche sélectionnée par le CNN) :")
+        print(f"  {'':<20} {'CNN (thresh0.3)':>16} {'GT (oracle)':>14}")
+        print(f"  {'no_correspondence':<20} {100*cnn_no_corr/n:>15.1f}% {100*gt_no_corr/n:>13.1f}%")
+        print(f"  {'pose_computed':<20} {100*cnn_pose/n:>15.1f}% {100*gt_pose/n:>13.1f}%")
+        print(f"  {'Pose@30':<20} {100*cnn_p30/n:>15.1f}% {100*gt_p30/n:>13.1f}%")
+        print("(Lecture : si GT réussit largement mieux que CNN sur CES MÊMES objets, la\n"
+              " tranche n'est pas intrinsèquement dure -- c'est la localisation du CNN qui\n"
+              " est en cause, pas la sparsité ni le clustering. Si GT échoue presque autant,\n"
+              " ces objets ont une fracture physiquement petite/ambiguë pour tout le monde,\n"
+              " indépendamment du CNN -- un problème plus profond que la Phase 7 actuelle.)\n")
 
     report_zoom_sweep(rows, budgets, args, n_seen_2frag, n_zoom_failed, elapsed)
 

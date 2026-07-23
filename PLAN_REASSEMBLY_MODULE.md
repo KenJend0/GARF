@@ -2840,9 +2840,29 @@ graines avant et après `dominant_cluster_mask()`, nouveau résumé console
 + compteur de paires réduites à 0 graine par le clustering).
 `phase5a_zoom_resample_check.py::report_zoom_sweep()` : export CSV
 généralisé pour passer automatiquement tout champ additionnel présent dans
-`rows` (pas de couplage explicite entre les deux scripts). Résultat pas
-encore lancé — prochaine action : `--max_n_min_base 50` et lire le nouveau
-résumé de graines.
+`rows` (pas de couplage explicite entre les deux scripts).
+
+**Résultat (2026-07-22, N=462, tranche `<50` uniquement) — surprise : les
+graines ne sont PAS rares, le problème est ailleurs.** Médiane 32 points
+bruts (avant clustering, largement au-dessus du minimum de 3 pour Kabsch),
+20 après clustering (0 paire réduite à 0 graine). Et pourtant, `NoCorr`
+reste à 98.5% en baseline et **78.6% même avec 500 points de zoom** —
+largement pire que ce que la densité seule prédirait. Ça pointe vers un
+problème de LOCALISATION, pas de quantité : le cluster dominant retenu est
+peut-être spatialement cohérent en lui-même sans être sur la vraie
+fracture (le clustering garantit "les points se regroupent", pas "ils sont
+au bon endroit").
+
+**Implémenté (2026-07-22) : comparaison GT sur les MÊMES objets.** Pour
+trancher entre "ces objets sont difficiles pour tout le monde" (fracture
+physiquement petite/ambiguë) et "c'est spécifiquement le CNN qui les
+localise mal", ajout dans `phase5a_zoom_resample_thresh03_check.py` d'un
+calcul de la cascade sur le masque GT (`fracture_surface_gt`, déjà présent
+dans le batch `uniform`, pas besoin du `mesh_dataset`) pour les MÊMES
+paires que celles sélectionnées par le CNN (`<50` points prédits). Nouvelle
+table **GT vs CNN SUR LES MÊMES OBJETS**. Résultat pas encore lancé —
+prochaine action : relancer avec `--max_n_min_base 50` et lire cette
+comparaison.
 
 **Correction méthodologique demandée par l'utilisateur (2026-07-22) : ne pas
 tâtonner un paramètre à la fois en relançant tout le run à chaque fois —
