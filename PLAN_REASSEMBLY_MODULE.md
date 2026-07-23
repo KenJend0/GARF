@@ -2993,6 +2993,34 @@ peu près opposées (`dot(R@n_i, n_j) < --normal_dot_thresh`, défaut -0.3)
 AVANT de refaire Kabsch sur les survivantes — même principe que le scoring
 `count_times_quality_and_normal` qui avait fait la différence en Phase 2C
 (Pose@30 5%→9.6% à l'époque). Nouveau CLI `--refiner {icp, icp_normals}`.
-Résultat pas encore lancé — prochaine action : relancer avec
-`--refiner icp_normals` et comparer directement la table **BASSIN DE
-CONVERGENCE** à celle de l'ICP vanille.
+**Résultat (2026-07-22, N=1248/perturbation, `icp_normals`) — gain net et
+substantiel, confirme l'hypothèse du glissement tangentiel.**
+```
+Perturbation   Succès(vanille)   Succès(normales)   Gain
+   10°              27.9%             48.4%          x1.7
+   20°              20.2%             43.5%          x2.2
+   30°              15.5%             40.9%          x2.6
+   45°               8.8%             34.3%          x3.9
+   60°               6.3%             28.6%          x4.5
+   90°               1.8%             12.3%          x6.8
+```
+L'écart moyenne/médiane se resserre nettement (30° : médiane=5.34° contre
+20.72° en ICP vanille — la médiane est maintenant juste à la frontière du
+seuil strict, plus 3-4x au-dessus comme avant) : la pénalité d'orientation
+élimine bien le glissement dans le plan de contact, pas un effet marginal.
+
+**Implication pratique pour le seuil utile étage 1 → étage 2 :** le bassin
+reste solide jusqu'à 45-60° (34.3%/28.6% de succès), pas seulement 10-20°
+comme le suggérait l'ICP vanille — beaucoup plus compatible avec ce que le
+depth-map matching produit réellement (les poses `Pose@30` réussies
+avaient déjà des erreurs de rotation dans cette gamme). L'écart entre
+"précision produite par l'étage 1" et "précision requise par l'étage 2"
+est donc bien moins large que redouté après le premier test avec l'ICP
+vanille.
+
+**Prochaine étape possible (pas encore actée) :** chaîner concrètement les
+deux étages — prendre les poses produites par `phase5a_depthmap_matching.py`
+(cascade + zoom) telles quelles comme initialisation, lancer
+`trimmed_icp_normals()` dessus, et mesurer le taux de succès final réel du
+pipeline complet (pas juste en perturbation contrôlée) sur les ~69% de
+paires "faciles".
