@@ -2918,3 +2918,39 @@ vs dégradation) sont maintenant imprimées par budget testé, plus `--csv_out`
 mis à jour (colonnes `zoom_b{k}_*` par budget). Résultat pas encore lancé —
 prochaine action : `--extra_budget_sweep 200 500 800 1200` avec
 `--expand_rings 0` pour trouver le vrai optimum en une seule passe.
+
+## Phase 6A — Test de bassin de convergence du raffinement point-à-point (2026-07-22)
+
+**Cadrage, suite à la décision du même jour** (plafond d'éligibilité ~69%
+presque atteint pour la méthode actuelle, tranche `<50` mise de côté) : plutôt
+que de continuer à pousser l'éligibilité (rendements décroissants), passer au
+test de bassin de convergence — question orthogonale, ne dépend pas d'avoir
+"fini" l'étape A. Toute la journée on a optimisé `Pose@30°/0.1` sans savoir si
+c'est le bon seuil pour l'architecture en deux temps retenue (depth-map
+matching grossier → raffinement point-à-point) ; ce test le mesure
+directement.
+
+**Protocole (oracle GT, indépendant du depth-map matching lui-même) :** part
+de la VRAIE pose relative (formule Phase 0), la perturbe d'une rotation
+d'amplitude θ connue (axe aléatoire) + bruit de translation gaussien, lance
+un ICP point-à-point (nearest-neighbor + Kabsch itéré, avec rognage des
+correspondances les plus éloignées à chaque itération — "trimmed ICP",
+nécessaire car les deux nuages de points de fracture ne se correspondent
+jamais parfaitement un-à-un), et mesure si ça reconverge près de la vraie
+pose. Taux de succès par amplitude θ testée (10°/20°/30°/45°/60°/90°) = le
+bassin de convergence.
+
+**Implémenté : `scripts/phase6a_convergence_basin_check.py`.** Restreint à
+`n_frac_pts_min >= 50` (exclut la tranche mise de côté le même jour — ce test
+caractérise le raffinement pour la population "facile", pas pour les cas
+structurellement durs). Réutilise `kabsch`/`rot_err_deg`/`trans_err`/
+`quat_wxyz_to_rotmat` de `phase5a_depthmap_matching.py` et
+`extract_gt_variable` de `phase5a_weighted_gt_check.py` — aucune
+réimplémentation. Stratégie GT uniquement, aucun CNN chargé (même discipline
+oracle-first que tout Phase 7) : caractérise le raffinement indépendamment de
+la qualité du masque qui l'alimentera en pratique. Seuil de succès volontairement
+strict (`--success_rot_thresh 5.0`, `--success_trans_thresh 0.02`) — on veut
+vérifier une VRAIE reconvergence vers la pose exacte, pas juste "un peu mieux
+qu'au départ". Résultat pas encore lancé — prochaine action : lancer sur le
+serveur et lire la table **BASSIN DE CONVERGENCE**, chercher l'amplitude à
+partir de laquelle le taux de succès chute nettement.
