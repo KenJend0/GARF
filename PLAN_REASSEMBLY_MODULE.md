@@ -3125,3 +3125,17 @@ Questions soulevées par l'utilisateur, avec réponses données :
    moment-là si on scope le modèle appris de recalage depth-map.
 
 **Prochaine action immédiate : point 1** (chaînage `thresh0.3`).
+
+**Implémenté : `scripts/phase6b_pipeline_thresh03_check.py`.** Combine
+l'intégralité de la plomberie déjà validée : deux datasets en lockstep +
+correction `init_rot` + filtrage des graines par clustering
+(`phase5a_zoom_resample_thresh03_check.py`) pour l'étage 1 (zoom + cascade),
+puis `trimmed_icp_normals` (`phase6a_convergence_basin_check.py`) initialisé
+par `(R_est, t_est)` pour l'étage 2, sur les VRAIS points prédits par le CNN
+(masque `thresh0.3` brut, pas les points de zoom synthétiques). Restreint à
+`n_frac_pts_min >= 50` (population "facile"). Aucune réimplémentation.
+Résultat pas encore lancé — prochaine action : lancer sur le serveur et
+lire la table **COMPARAISON ÉTAGE 1 SEUL vs ÉTAGE 1 + ÉTAGE 2** en condition
+réelle. Rappel du point d'arrêt convenu : si le résultat est faible, ne pas
+enchaîner sur autre chose, revenir au point 2 (diagnostics courbure/overlap)
+et point 3 (visualisations) du plan.
