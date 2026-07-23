@@ -2860,9 +2860,49 @@ localise mal", ajout dans `phase5a_zoom_resample_thresh03_check.py` d'un
 calcul de la cascade sur le masque GT (`fracture_surface_gt`, déjà présent
 dans le batch `uniform`, pas besoin du `mesh_dataset`) pour les MÊMES
 paires que celles sélectionnées par le CNN (`<50` points prédits). Nouvelle
-table **GT vs CNN SUR LES MÊMES OBJETS**. Résultat pas encore lancé —
-prochaine action : relancer avec `--max_n_min_base 50` et lire cette
-comparaison.
+table **GT vs CNN SUR LES MÊMES OBJETS**.
+
+**Résultat (2026-07-22, N=473, tranche `<50`) — tranche l'ambiguïté
+CNN vs difficulté structurelle, et RECADRE le plafond d'éligibilité
+réaliste.**
+```
+                     CNN (thresh0.3)   GT (oracle)
+no_correspondence          98.5%          93.0%
+pose_computed                1.5%          6.6%
+Pose@30                      0.6%          3.2%
+```
+Le GT fait mieux que le CNN (93.0% vs 98.5% de `NoCorr`, ~5x plus de
+`Pose@30`) — un vrai déficit de localisation du CNN existe, réel mais
+modeste. **Mais l'essentiel du problème n'est pas le CNN : même avec la
+vérité terrain parfaite, 93% de ces objets échouent quand même.** Cette
+tranche (31-32% de tout le dataset, N=462-473 sur ~1470-1490) est donc une
+population **structurellement difficile pour la méthode elle-même**
+(depth-map matching + correspondances 3D pour Kabsch) — probablement des
+interfaces de fracture physiquement minuscules par rapport à la taille des
+fragments — indépendamment de qui fournit le masque (CNN ou GT) et
+indépendamment du budget de zoom (déjà testé jusqu'à 3000 points sans
+percée).
+
+## Décision stratégique (2026-07-22) : plafond d'éligibilité réaliste réévalué à ~69%
+
+**Le plafond de ~99.7% (100% − `unusable_too_few`, ~0.3%) supposé depuis
+l'audit des rejets était trop optimiste** — il ne tenait pas compte de
+cette population de ~31% qui semble hors de portée de la méthode actuelle,
+pas seulement mal desservie par le pipeline. **Nouveau plafond réaliste
+pour la méthode depth-map + zoom + cascade : ~69%** (100% moins les ~31%
+structurellement durs). D'après le sweep de budget étendu (2026-07-22,
+budget=3000, N=1468 sur tout le dataset) : `pose_computed`=62.3% globalement
+— soit déjà ~91% du plafond réaliste de 69% (62.3/68.5), quasiment atteint.
+
+**Décision (utilisateur, 2026-07-22) :**
+1. **Continuer avec la méthode actuelle (depth-map + zoom + cascade de
+   résolution) pour les ~69% de paires "faciles"** — plafond presque déjà
+   atteint, pas de nouvelle piste de tuning nécessaire dans l'immédiat sur
+   cette portion.
+2. **Chercher une méthode fondamentalement différente pour les ~31%
+   restants** (interfaces de fracture minuscules) — reporté, pas encore
+   scopé. Le depth-map matching (quel que soit le masque, quel que soit le
+   budget de zoom) ne semble structurellement pas adapté à ces cas.
 
 **Correction méthodologique demandée par l'utilisateur (2026-07-22) : ne pas
 tâtonner un paramètre à la fois en relançant tout le run à chaque fois —
