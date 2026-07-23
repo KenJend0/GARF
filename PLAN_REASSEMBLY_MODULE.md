@@ -2715,9 +2715,47 @@ sortie des points zoomés : quaternion/translation du `cnn_dataset` (pas du
 `mesh_dataset` — chaque `transform()` tire sa propre rotation aléatoire).
 Reporting factorisé : `report_zoom_sweep()` extrait de
 `phase5a_zoom_resample_check.py` et réutilisé tel quel (même structure de
-résultats). Résultat pas encore lancé — prochaine action : lancer avec
-`--expand_rings 0 --extra_budget_sweep 500 1200` et comparer directement aux
-résultats GT.
+résultats).
+
+**Résultat (2026-07-22, N=1475, `expand_rings=0`, budgets 500/1200) — ÉCHEC
+NET, confirme la crainte de l'utilisateur, pas un compromis.** Contrairement
+au GT, le zoom EMPIRE tout sur `thresh0.3` : `no_correspondence` monte
+(58.0%→68.4% à budget=500, →66.2% à budget=1200 — pire, pas mieux),
+`pose_computed` baisse (42.0%→31.6%/33.8%), et surtout `Pose@30` s'effondre
+(6.9%→0.5%/0.8%). Les paires déjà éligibles en baseline (N=620,
+`Pose@30`=16.5%) s'effondrent à ~1% une fois zoomées — le zoom détruit des
+poses qui marchaient déjà, pas juste "n'aide pas". Par tranche de densité,
+`no_correspondence` empire dans presque tous les bins (`150-200` :
+23.2%→61.1%, `200-300` : 17.1%→40.8%), inverse exact du comportement GT.
+
+**Diagnostic (confirmé sans ambiguïté par sample_method) : le CNN tourne
+bien en `sample_method=uniform`** (vérifié dans
+`configs/experiment/cnn_ablation_shared.yaml:26`, hérité par
+`cnn_step15_final_model.yaml` — "required: bilinear backprojection assumes
+uniform num_pts", `num_points_to_sample=5000`) — pas un bug de config, le
+problème est ailleurs.
+
+**Cause probable identifiée : le masque `thresh0.3` a des faux positifs
+dispersés que le GT n'a jamais (par construction), et le script utilisait
+TOUS les points prédits-positifs comme graines de zoom, sans filtrage
+spatial.** Contrairement au GT (graines toujours concentrées au même
+endroit), des graines dispersées font localiser plusieurs zones à la fois
+sur le maillage, corrompant le repère PCA même pour les paires qui
+marchaient déjà en baseline.
+
+**Fix implémenté (2026-07-22) : filtrage par clustering avant zoom,
+réutilise la Phase 2D.** `dominant_cluster_mask()` dans
+`phase5a_zoom_resample_thresh03_check.py` appelle directement
+`cluster_points()` de `scripts/phase2d_interface_clustering_diagnostic.py`
+(composantes connexes par proximité, `eps=0.02`/`min_cluster_size=10` —
+mêmes valeurs que le compromis trouvé en Phase 2D, `EdgeCoverage`/
+`BestCorrPrec` plafonnaient déjà à `eps=0.02`) et ne garde que le cluster
+spatial DOMINANT parmi les points prédits-positifs comme graines de zoom.
+Le masque `baseline` (comparaison au pipeline réel actuel) reste
+INCHANGÉ — seul le choix des graines de zoom est purifié, pour isoler
+précisément si c'est bien la dispersion des graines qui posait problème.
+Résultat pas encore lancé — prochaine action : relancer avec la même
+commande et comparer au résultat catastrophique précédent.
 
 **Correction méthodologique demandée par l'utilisateur (2026-07-22) : ne pas
 tâtonner un paramètre à la fois en relançant tout le run à chaque fois —

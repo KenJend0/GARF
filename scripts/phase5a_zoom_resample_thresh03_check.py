@@ -87,8 +87,36 @@ from scripts.phase5a_depthmap_matching import quat_wxyz_to_rotmat
 from scripts.phase5a_zoom_resample_check import (
     ABS_MIN_POINTS, zoom_resample, to_input_frame, run_cascade, report_zoom_sweep,
 )
+from scripts.phase2d_interface_clustering_diagnostic import cluster_points
 from assembly.models.cnn_segmentation_model import CNNFracSeg
 from assembly.models.projection_mapping_utils import extract_fragment_list
+
+# Mêmes valeurs que la Phase 2D (meilleur compromis trouvé le 2026-06-27 :
+# EdgeCoverage/BestCorrPrec plafonnent dès eps=0.02, descendre plus bas
+# n'apporte rien, juste plus de bruit).
+CLUSTER_EPS = 0.02
+MIN_CLUSTER_SIZE = 10
+
+
+def dominant_cluster_mask(points):
+    """Isole le plus GROS cluster spatial (composantes connexes par proximité,
+    réutilise `cluster_points` de la Phase 2D) parmi `points` -- ajouté le
+    2026-07-22 après un résultat catastrophique du zoom sur `thresh0.3` : le
+    masque prédit par le CNN a des faux positifs dispersés que le GT n'a
+    jamais, et les utiliser TOUS comme graines de zoom (sans filtrage)
+    localisait des zones bruitées un peu partout sur le fragment plutôt que la
+    vraie fracture, corrompant le repère PCA même pour les paires qui
+    marchaient déjà en baseline. Retourne un masque bool (True = dans le
+    cluster dominant) ; tout-vrai si le clustering n'est pas exploitable
+    (< 2 points, ou 100% classé bruit)."""
+    if len(points) < 2:
+        return np.ones(len(points), dtype=bool)
+    labels = cluster_points(points, eps=CLUSTER_EPS, min_cluster_size=MIN_CLUSTER_SIZE)
+    valid = labels[labels >= 0]
+    if len(valid) == 0:
+        return np.ones(len(points), dtype=bool)
+    dominant = np.bincount(valid).argmax()
+    return labels == dominant
 
 
 def main():
@@ -250,9 +278,19 @@ def main():
             # avec les mêmes offsets points_per_part). Maillage venant du dataset
             # `mesh_dataset` (même géométrie, sample_method n'affecte pas le mesh
             # lui-même). Repère de sortie : quaternion/translation du CNN_DATASET
-            # (celui qui possède frac_i_base), pas du mesh_dataset. ─────────────
-            seed_i_gt = gtgt0[mask0]
-            seed_j_gt = gtgt1[mask1]
+            # (celui qui possède frac_i_base), pas du mesh_dataset.
+            #
+            # FILTRAGE PAR CLUSTERING (2026-07-22, suite à l'échec du run brut) :
+            # le masque thresh0.3 a des faux positifs dispersés que le GT n'a
+            # jamais -- ne garder QUE le cluster spatial dominant (repère input,
+            # invariant à la pose) comme graine, pas tous les points prédits.
+            # Le masque `frac_i_base`/baseline reste INCHANGÉ (comparaison
+            # apples-to-apples avec le pipeline réel actuel) -- seul le choix
+            # des graines de zoom est purifié. ───────────────────────────────
+            cluster_mask0 = dominant_cluster_mask(raw0[mask0])
+            cluster_mask1 = dominant_cluster_mask(raw1[mask1])
+            seed_i_gt = gtgt0[mask0][cluster_mask0]
+            seed_j_gt = gtgt1[mask1][cluster_mask1]
             meshes = mesh_data["meshes"]
             new_i_gt_max = zoom_resample(meshes[p0], seed_i_gt, max_budget,
                                           args.expand_rings, rng)
