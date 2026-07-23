@@ -2754,8 +2754,42 @@ spatial DOMINANT parmi les points prédits-positifs comme graines de zoom.
 Le masque `baseline` (comparaison au pipeline réel actuel) reste
 INCHANGÉ — seul le choix des graines de zoom est purifié, pour isoler
 précisément si c'est bien la dispersion des graines qui posait problème.
-Résultat pas encore lancé — prochaine action : relancer avec la même
-commande et comparer au résultat catastrophique précédent.
+
+**Résultat du run avec clustering (2026-07-22, N=1469) : quasi identique au
+run brut précédent (`no_correspondence` toujours pire que baseline,
+`Pose@30` toujours effondré, `base_eligible` toujours ~13%→~1%).**
+L'utilisateur a réagi ("y'a un pb dans le code c'est impossible") — à
+raison : si le clustering ne change presque rien, ce n'est pas un problème
+de bruit dispersé (le clustering l'aurait résolu), c'est un bug de
+plomberie. Exactement le test diagnostique qu'on avait posé avant de
+lancer.
+
+**Bug trouvé par inspection du code (pas par essai-erreur) : mismatch de
+repère entre les deux datasets.** `BreakingBadUniform.transform()`
+(`uniform.py:49`, dataset CNN) applique une rotation aléatoire
+supplémentaire à TOUT L'OBJET assemblé (`rotate_whole_part`) avant la
+rotation par fragment — `BreakingBadWeighted.transform()` (dataset mesh)
+**n'applique jamais cette étape** (littéralement commentée dans son code).
+Donc `pointclouds_gt` du dataset CNN est dans un repère tourné par
+`init_rot` (aléatoire, différent par objet) relativement au maillage
+récupéré depuis le dataset weighted — chercher "quelle face du maillage
+est la plus proche de ce point fracture" sans corriger ça compare des
+points dans deux repères différents, tombant sur des faces essentiellement
+aléatoires. Explique tout : dégradation uniforme (pas seulement les paires
+bruitées), et pourquoi le clustering ne change rien (filtrer des points
+déjà mal placés dans l'espace ne les remet pas au bon endroit).
+
+**Fix implémenté (2026-07-22), vérifié mathématiquement par inspection de
+`rotate_whole_part()`** (`assembly/data/transform.py:109-146` :
+`rotated = rot_mat @ canonical`, `quat_gt` stocké = `rot_mat.T`, donc
+`canonical = R(init_rot) @ rotated`) : lit `batch["init_rot"]` (déjà
+renvoyé par le dataset, juste jamais utilisé), calcule `R_init`, et corrige
+dans les deux sens — graines ramenées au repère canonique du maillage
+avant la recherche de proximité (`gtgt @ R_init.T`), nouveaux points
+zoomés reconvertis vers le repère "tourné" avant `to_input_frame`
+(`new_pts @ R_init`). Résultat pas encore lancé — prochaine action :
+relancer avec la même commande et vérifier que le profil ressemble enfin
+à ce qu'on a vu en GT.
 
 **Correction méthodologique demandée par l'utilisateur (2026-07-22) : ne pas
 tâtonner un paramètre à la fois en relançant tout le run à chaque fois —

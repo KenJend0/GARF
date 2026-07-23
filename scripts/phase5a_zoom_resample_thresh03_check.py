@@ -286,11 +286,28 @@ def main():
             # invariant à la pose) comme graine, pas tous les points prédits.
             # Le masque `frac_i_base`/baseline reste INCHANGÉ (comparaison
             # apples-to-apples avec le pipeline réel actuel) -- seul le choix
-            # des graines de zoom est purifié. ───────────────────────────────
+            # des graines de zoom est purifié.
+            #
+            # CORRECTION DE REPÈRE (2026-07-22, bug trouvé après l'échec du run
+            # avec clustering) : `BreakingBadUniform.transform()` applique une
+            # rotation aléatoire supplémentaire à TOUT L'OBJET assemblé
+            # (`rotate_whole_part`, avant la rotation par fragment) -- que
+            # `BreakingBadWeighted.transform()` N'APPLIQUE JAMAIS (commentée
+            # dans son code). Donc `gtgt0`/`gtgt1` (venant du dataset CNN,
+            # uniform) sont dans un repère tourné par `init_rot` relativement
+            # au maillage (venant du dataset mesh, weighted, jamais tourné
+            # globalement) -- chercher "quelle face du maillage est la plus
+            # proche" sans corriger ça revient à comparer des points dans deux
+            # repères différents, donnant des faces essentiellement aléatoires.
+            # Fix : ramener les graines au repère canonique du maillage avant
+            # la recherche (`@ R_init.T`), puis reconvertir les nouveaux points
+            # zoomés vers le repère "tourné" AVANT `to_input_frame` (qui,
+            # lui, suppose déjà ce repère) via `@ R_init`. ───────────────────
+            R_init = quat_wxyz_to_rotmat(batch["init_rot"].numpy()[0])
             cluster_mask0 = dominant_cluster_mask(raw0[mask0])
             cluster_mask1 = dominant_cluster_mask(raw1[mask1])
-            seed_i_gt = gtgt0[mask0][cluster_mask0]
-            seed_j_gt = gtgt1[mask1][cluster_mask1]
+            seed_i_gt = (gtgt0[mask0][cluster_mask0]) @ R_init.T
+            seed_j_gt = (gtgt1[mask1][cluster_mask1]) @ R_init.T
             meshes = mesh_data["meshes"]
             new_i_gt_max = zoom_resample(meshes[p0], seed_i_gt, max_budget,
                                           args.expand_rings, rng)
@@ -307,8 +324,10 @@ def main():
                 "zoom_by_budget": {},
             }
             for k in budgets:
-                new_i_input = to_input_frame(new_i_gt_max[:k], quats_np[0, p0], trans_np[0, p0])
-                new_j_input = to_input_frame(new_j_gt_max[:k], quats_np[0, p1], trans_np[0, p1])
+                new_i_rotated = new_i_gt_max[:k] @ R_init
+                new_j_rotated = new_j_gt_max[:k] @ R_init
+                new_i_input = to_input_frame(new_i_rotated, quats_np[0, p0], trans_np[0, p0])
+                new_j_input = to_input_frame(new_j_rotated, quats_np[0, p1], trans_np[0, p1])
                 frac_i_zoom = np.concatenate([frac_i_base, new_i_input], axis=0)
                 frac_j_zoom = np.concatenate([frac_j_base, new_j_input], axis=0)
                 zoomed_res = run_cascade(frac_i_zoom, frac_j_zoom, R_ij, t_ij, args)
