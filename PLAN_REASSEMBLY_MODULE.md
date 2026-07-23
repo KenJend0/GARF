@@ -2787,9 +2787,28 @@ renvoyé par le dataset, juste jamais utilisé), calcule `R_init`, et corrige
 dans les deux sens — graines ramenées au repère canonique du maillage
 avant la recherche de proximité (`gtgt @ R_init.T`), nouveaux points
 zoomés reconvertis vers le repère "tourné" avant `to_input_frame`
-(`new_pts @ R_init`). Résultat pas encore lancé — prochaine action :
-relancer avec la même commande et vérifier que le profil ressemble enfin
-à ce qu'on a vu en GT.
+(`new_pts @ R_init`).
+
+**Résultat après fix (2026-07-22, N=1463, `expand_rings=0`, budgets 500/1200)
+— CONFIRME que c'était bien un bug, pas un problème de qualité du masque
+CNN, et valide le transfert à `thresh0.3`.** Profil maintenant cohérent
+avec le GT : `no_correspondence` baisse (57.3%→44.8%/40.4% selon budget,
+au lieu de monter à 68-70% avant le fix), `pose_computed` monte
+(42.7%→55.2%/59.6%), `Pose@30` global reste quasi stable (7.3%→6.5%/6.4%,
+pas d'effondrement à 0.5% comme avant). Paires déjà éligibles en baseline
+(N=625, 17.1%→13.0%, -4.2pp) : dégradation modeste, du même ordre de
+grandeur que ce qu'on observait en GT à réglages comparables — plausible,
+plus l'effondrement à ~1% d'avant le fix. Par tranche de densité, presque
+tout s'améliore (`<50` : `NoCorr` 98.0%→76.8%/68.5%, `75-100` :
+72.3%→50.8%/44.6%), sans effondrement de `Pose@30` par tranche.
+
+**Conclusion : le zoom + rééchantillonnage local se transfère à
+`thresh0.3`** — gain net sur l'éligibilité (étape A, l'objectif actuel),
+coût modeste et cohérent sur la précision (étape B, à recalibrer plus tard
+via le test de bassin de convergence). Contrairement au GT, pas de gain net
+sur `Pose@30` global (reste stable plutôt que d'augmenter) — cohérent avec
+le fait que le masque `thresh0.3` a un peu plus de bruit résiduel que le
+GT, même après filtrage par clustering.
 
 **Correction méthodologique demandée par l'utilisateur (2026-07-22) : ne pas
 tâtonner un paramètre à la fois en relançant tout le run à chaque fois —
