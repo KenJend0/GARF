@@ -2951,6 +2951,48 @@ oracle-first que tout Phase 7) : caractérise le raffinement indépendamment de
 la qualité du masque qui l'alimentera en pratique. Seuil de succès volontairement
 strict (`--success_rot_thresh 5.0`, `--success_trans_thresh 0.02`) — on veut
 vérifier une VRAIE reconvergence vers la pose exacte, pas juste "un peu mieux
-qu'au départ". Résultat pas encore lancé — prochaine action : lancer sur le
-serveur et lire la table **BASSIN DE CONVERGENCE**, chercher l'amplitude à
-partir de laquelle le taux de succès chute nettement.
+qu'au départ".
+
+**Résultat (2026-07-22, N=1252 essais/perturbation, ICP vanille) —
+bassin de convergence ÉTROIT, dès les petites perturbations.**
+```
+Perturbation   Succès(5°/0.02)   RotErr moy   RotErr méd
+   10°              27.9%           20.93°        7.97°
+   20°              20.2%           34.26°       13.51°
+   30°              15.5%           50.42°       20.72°
+   45°               8.8%           71.85°       49.02°
+   60°               6.3%           88.65°       84.17°
+   90°               1.8%          114.48°      124.71°
+```
+Écart moyenne/médiane énorme à 10° (20.93° vs 7.97°) — signature bimodale
+classique de mauvais minimum local en ICP (soit ça reconverge près de la
+vraie pose, soit ça diverge complètement). Recalcul à seuils plus
+permissifs (directement depuis le CSV, sans relancer) : même à 20°/0.05, le
+succès à 10° de perturbation ne dépasse pas 54.7%, et continue de chuter
+(30°→34.9%, 60°→14.1%, 90°→5.5%). **L'hypothèse "Pose@30 était trop
+strict" est infirmée** — le vrai seuil est plus proche de 10-20° que de 30°,
+et même à 10° la reconvergence n'est fiable qu'une fois sur deux au mieux.
+
+**Diagnostic : probablement le glissement dans le plan de contact**, le
+même problème géométrique qui avait fait échouer le scoring RANSAC en
+Phase 2 ("une pose fausse qui glisse/tourne dans le plan de contact peut
+accumuler autant ou plus d'inliers apparents qu'une pose correcte") —
+surfaces de fracture quasi-planes (planéité médiane 0.043, Phase 5A.0),
+donc un ICP point-à-point classique n'a pas de vraie force de rappel
+contre un glissement tangentiel.
+
+**Décision utilisateur (2026-07-22) : tester un ICP avec pénalité
+d'orientation avant de conclure.** Important : PAS un "point-to-plane" au
+sens strict (minimiser la distance selon la normale) — cette variante
+serait en fait PIRE ici, elle n'offre aucune résistance au glissement
+tangentiel, c'est sa faiblesse connue sur surface plate. **Implémenté :
+`trimmed_icp_normals()`** dans `phase6a_convergence_basin_check.py` — à
+chaque itération, après avoir trouvé les plus proches voisins, rejette les
+correspondances dont les normales (après rotation courante) ne sont PAS à
+peu près opposées (`dot(R@n_i, n_j) < --normal_dot_thresh`, défaut -0.3)
+AVANT de refaire Kabsch sur les survivantes — même principe que le scoring
+`count_times_quality_and_normal` qui avait fait la différence en Phase 2C
+(Pose@30 5%→9.6% à l'époque). Nouveau CLI `--refiner {icp, icp_normals}`.
+Résultat pas encore lancé — prochaine action : relancer avec
+`--refiner icp_normals` et comparer directement la table **BASSIN DE
+CONVERGENCE** à celle de l'ICP vanille.
