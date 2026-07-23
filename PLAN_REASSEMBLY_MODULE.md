@@ -3074,3 +3074,54 @@ séparément (zoom+cascade pour l'éligibilité, `icp_normals` pour le
 raffinement), se combinent bien en pratique sur les VRAIES poses produites
 par l'étage 1 — pas seulement en test contrôlé (Phase 6A). Architecture en
 deux temps confirmée comme la bonne direction pour la suite du projet.
+
+## Plan étape par étape (2026-07-22, fin de journée) — discussion de direction
+
+Discussion avec l'utilisateur sur la suite : accord explicite pour NE PAS
+enchaîner directement sur un niveau supérieur (ex. réintégrer la Phase 4D
+pour l'ordre d'assemblage global) tant que la pose par paire elle-même reste
+fragile — priorité à consolider/comprendre le pipeline actuel d'abord.
+Questions soulevées par l'utilisateur, avec réponses données :
+- **SOM (représentation non-planaire)** : justification pas encore établie.
+  Le 2026-07-20 on avait déjà trouvé que "plus de courbure" DÉGRADE le
+  matching sous la méthode actuelle (pas confirmé le contraire) — cohérent
+  avec un problème de représentation sur faces courbées, MAIS jamais vérifié
+  si la tranche difficile `<50` (31% du dataset) est plus courbée que la
+  moyenne, ni si Breaking Bad a assez de courbure en général (planéité
+  médiane 0.043) pour que ça vaille le coup. À vérifier avant d'investir.
+- **Modèle appris pour recomputer rotation+translation à partir des deux
+  depth maps** : idée jugée prometteuse, différente de l'échec de la Phase 3
+  (matcher point-à-point appris) — une depth map est une grille régulière de
+  taille fixe (terrain CNN-friendly), contrairement à un nuage de points
+  non-ordonné. Le pipeline validé aujourd'hui génère déjà des paires
+  depth-map + vraie transformation à grande échelle, exactement les données
+  d'entraînement nécessaires. Chantier plus lourd, à scoper après avoir
+  cerné les limites du pipeline actuel (pas en parallèle).
+- **Plafond `oracle_overlap_frac`≈0.7** : pas un invariant fixe -- le sweep de
+  résolution du jour montre qu'il varie énormément avec la résolution (0.989
+  à R=24, 0.404 à R=128). Reste à déterminer si le résidu (à résolution
+  fixe) est du bruit d'échantillonnage ou une vraie non-coïncidence
+  géométrique du maillage Breaking Bad.
+
+**Plan convenu, dans cet ordre :**
+1. **Chaîner le pipeline complet (étage 1 + étage 2) sur `thresh0.3`**
+   (condition réelle, CNN) — même principe que
+   `phase5a_zoom_resample_thresh03_check.py` (deux datasets en lockstep,
+   graines filtrées par clustering, correction `init_rot`) combiné à
+   `phase6b_pipeline_check.py` (chaînage étage 1 → étage 2). **Point d'arrêt
+   strict : si le résultat est faible, NE PAS monter d'un niveau** — rester
+   ici et creuser.
+2. **En parallèle (bon marché, n'attend pas le point 1) : deux diagnostics
+   ciblés** — (a) la tranche `<50` corrèle-t-elle avec la courbure/planéité
+   (répond à la question SOM) ; (b) le plafond `oracle_overlap_frac` :
+   bruit d'échantillonnage ou vraie non-coïncidence géométrique (test
+   distance maillage-à-maillage à la vraie pose GT, indépendant de tout
+   échantillonnage de points).
+3. **Visualisations des cas de succès/échec** sur le résultat du point 1
+   (adapter `phase5a_visualize_pair.py` au pipeline chaîné `thresh0.3`) —
+   transformer l'observation qualitative en hypothèses testables.
+4. **Décision sur la suite une fois 1+2+3 en main** : scoper la SOM si 2a le
+   justifie ; recadrer les attentes d'overlap selon 2b ; discuter à ce
+   moment-là si on scope le modèle appris de recalage depth-map.
+
+**Prochaine action immédiate : point 1** (chaînage `thresh0.3`).
