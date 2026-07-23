@@ -3051,3 +3051,26 @@ décision du jour). Réutilise `zoom_resample`/`to_input_frame`/`run_cascade`,
 `quat_wxyz_to_rotmat`/`rot_err_deg`/`trans_err` — aucune réimplémentation.
 Résultat pas encore lancé — prochaine action : lancer sur le serveur et
 lire la table **COMPARAISON ÉTAGE 1 SEUL vs ÉTAGE 1 + ÉTAGE 2**.
+
+**Résultat (2026-07-22, N=1245 paires "faciles" tentées, budget=1200) —
+le pipeline bout-en-bout fonctionne, gain réel et substantiel.**
+```
+n_2frag_seen=1487, skip densité<50=242, zoom échoué=0, échec étage1=240
+n_pairs_stage2=1005 (éligibilité étage 1 = 1005/1245 = 80.7%)
+
+Parmi les 1005 paires ayant atteint l'étage 2 :
+                        étage 1 seul   étage 1+2   gain
+Pose@30°/0.1                24.3%        38.7%     x1.6
+Pose@15°/0.05                14.3%        32.8%     x2.3
+Succès strict (5°/0.02)        —          22.6%       —
+```
+Rapporté à TOUTE la population "facile" (1245 paires, dénominateur commun) :
+étage 1 seul ≈ 19.6% de `Pose@30` sur l'ensemble ; étage 1+2 ≈ **31.3%**
+(`Pose@30`) et ≈ **18.2%** (succès strict 5°/0.02) — le pipeline complet
+fait quasiment le double de poses correctes que le depth-map matching seul.
+
+**Conclusion de la journée (Phase 7) :** les deux étages, chacun validé
+séparément (zoom+cascade pour l'éligibilité, `icp_normals` pour le
+raffinement), se combinent bien en pratique sur les VRAIES poses produites
+par l'étage 1 — pas seulement en test contrôlé (Phase 6A). Architecture en
+deux temps confirmée comme la bonne direction pour la suite du projet.
