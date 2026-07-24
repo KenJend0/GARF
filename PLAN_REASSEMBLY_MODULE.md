@@ -3221,3 +3221,25 @@ dégradation modérée mais suffisante pour faire basculer la cascade.
 matching — il faudrait améliorer la segmentation du CNN elle-même sur ces
 cas, ou accepter la limite.** Investigation refermée, retour au plan :
 points 2a/2b (courbure vs tranche difficile, overlap maillage-à-maillage).
+
+**Implémenté : point 2a — `scripts/phase7_curvature_vs_hardbin_check.py`.**
+Un seul dataset (CNN, `uniform`) -- pas besoin du maillage, juste des points
+et la planéité PCA (`compute_pca_frame`, réutilisée telle quelle). Pour
+chaque paire, calcule `n_min` (côté le plus pauvre du masque `thresh0.3`) et
+la planéité moyenne/max des deux fragments, compare la distribution entre
+la tranche difficile (`<50`) et le reste. Résultat pas encore lancé.
+
+**Implémenté : point 2b — `scripts/phase7_overlap_ceiling_check.py`.**
+PAS de rasterisation en grille (élimine toute dépendance à une résolution,
+contrairement au sweep du 2026-07-21) — transforme le côté le plus PAUVRE
+dans le repère du côté le plus RICHE via la VRAIE pose GT, mesure la
+distance au plus proche voisin (`cKDTree`) vers l'autre côté, fraction de
+points à moins de `--contact_eps` (0.05, même tolérance que Phase 0/2B) =
+overlap continu sans artefact de grille. Stratégie GT uniquement,
+oracle-first. Résultat pas encore lancé — si ce chiffre est proche de 1.0,
+le plafond ~0.7 mesuré par grille était un pur artefact de discrétisation ;
+s'il plafonne aussi nettement en dessous, c'est du bruit d'échantillonnage
+ou une vraie non-coïncidence géométrique du dataset (distinction à faire
+par un test de sensibilité à la densité, en suivi).
+
+**Prochaine action : lancer les deux diagnostics 2a et 2b sur le serveur.**
