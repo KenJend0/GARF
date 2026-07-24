@@ -3139,3 +3139,45 @@ lire la table **COMPARAISON ÉTAGE 1 SEUL vs ÉTAGE 1 + ÉTAGE 2** en condition
 réelle. Rappel du point d'arrêt convenu : si le résultat est faible, ne pas
 enchaîner sur autre chose, revenir au point 2 (diagnostics courbure/overlap)
 et point 3 (visualisations) du plan.
+
+**Résultat (2026-07-22, N=1487 vus, N=716 atteignant l'étage 2) — point
+d'arrêt atteint, en dessous du seuil des 20% que l'utilisateur avait fixé.**
+```
+n_2frag_seen=1487, echec etage1=292, atteint etage2=716
+Eligibilite etage1 (population >=50) = 716/1008 = 71.0%
+                        etage 1 seul   etage 1+2   gain
+Pose@30                     10.75%       24.02%     x2.2
+Pose@15                      5.17%       19.69%     x3.8
+Succes strict (5/0.02)         --        14.11%       --
+```
+Rapporté à TOUTES les 1487 paires vues (y compris la tranche `<50` mise de
+côté) : **éligibilité globale = 716/1487 = 48.2%**, `Pose@30` global
+(pipeline complet) ≈ **11.6%**. Le raffinement aide encore plus qu'en GT en
+relatif (×2.2/×3.8 contre ×1.6/×2.3), mais le chiffre absolu reste modeste
+et sous le seuil des 20% fixé par l'utilisateur comme repère de décision.
+
+**Constat de l'utilisateur, confirmé : l'éligibilité reste le vrai
+problème.** Écart notable CNN vs GT sur la MÊME tranche de densité `≥50` :
+éligibilité étage 1 = 71.0% en CNN contre 80.7% en GT (2026-07-22, run
+précédent) — un écart qui n'est PAS expliqué par la tranche `<50` déjà mise
+de côté (celle-ci est la même dans les deux cas). Clarification importante :
+les diagnostics 2a (courbure) et 2b (overlap maillage) ne portent PAS sur
+cet écart précis — 2a porte sur la population déjà exclue, 2b sur le
+plafond de précision, pas l'éligibilité.
+
+**Hypothèse plus directement pertinente, décidée avec l'utilisateur avant
+2a/2b : le masque `baseline` (utilisé directement par la cascade de
+l'étage 1) n'est JAMAIS filtré par clustering, contrairement aux graines du
+zoom** — des faux positifs dispersés du CNN pourraient polluer le calcul du
+repère PCA et la recherche de correspondance de la cascade elle-même, pas
+seulement la localisation du zoom.
+
+**Implémenté : `--cluster_baseline`** dans
+`phase6b_pipeline_thresh03_check.py` — applique le même filtre de cluster
+dominant (`dominant_cluster_mask`, déjà utilisé pour les graines de zoom)
+au masque baseline envoyé à la cascade. Le filtre de densité `<50` reste
+basé sur le compte BRUT (avant clustering), pour comparer sur exactement
+les mêmes paires qu'avec l'option désactivée. Résultat pas encore lancé —
+prochaine action : relancer avec `--cluster_baseline` et comparer
+l'éligibilité étage 1 (cible : se rapprocher de 80.7%, le niveau GT).
+Ensuite seulement : points 2a/2b du plan.

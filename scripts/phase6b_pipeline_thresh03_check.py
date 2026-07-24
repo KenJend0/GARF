@@ -80,6 +80,15 @@ def main():
     parser.add_argument("--expand_rings", type=int, default=0,
                         help="Défaut 0 -- validé 2026-07-22, l'expansion à 1 anneau "
                              "dégradait la précision sans nécessité.")
+    parser.add_argument("--cluster_baseline", action="store_true",
+                        help="Applique AUSSI le filtre de clustering (cluster dominant) au "
+                             "masque baseline utilisé par la cascade de l'étage 1 -- pas "
+                             "seulement aux graines de zoom (2026-07-22, test de l'écart "
+                             "d'éligibilité CNN vs GT : le masque baseline non filtré peut "
+                             "contenir des faux positifs dispersés qui polluent le repère "
+                             "PCA de la cascade elle-même, pas seulement la localisation du "
+                             "zoom). Le filtre de densité <50 reste basé sur le compte BRUT "
+                             "(avant clustering), pour comparer sur les mêmes paires.")
     parser.add_argument("--max_icp_iters", type=int, default=50)
     parser.add_argument("--trim_ratio", type=float, default=0.7)
     parser.add_argument("--normal_dot_thresh", type=float, default=-0.3)
@@ -208,20 +217,39 @@ def main():
 
             mask0 = sc0 > args.threshold
             mask1 = sc1 > args.threshold
-            frac_i_base = raw0[mask0]
-            frac_j_base = raw1[mask1]
-            frac_i_nrm  = nrm0[mask0]
-            frac_j_nrm  = nrm1[mask1]
-            n_min_base = min(len(frac_i_base), len(frac_j_base))
-            if n_min_base < max(ABS_MIN_POINTS, 50):
+
+            # Masque de clustering calculé UNE FOIS (repère input, invariant à la
+            # pose) -- réutilisé pour les graines de zoom ET, si --cluster_baseline
+            # est passé, pour le masque baseline lui-même (2026-07-22, test de
+            # l'hypothèse : le masque baseline non filtré, utilisé directement par
+            # la cascade de l'étage 1, peut contenir des faux positifs dispersés
+            # qui polluent le repère PCA -- pas seulement la localisation du zoom).
+            cluster_mask0 = dominant_cluster_mask(raw0[mask0])
+            cluster_mask1 = dominant_cluster_mask(raw1[mask1])
+
+            # Le filtre de densité reste basé sur le compte BRUT (avant clustering)
+            # -- garde la même population de paires qu'avec --cluster_baseline
+            # désactivé, pour une comparaison directe sur les mêmes paires.
+            n_min_raw = min(int(mask0.sum()), int(mask1.sum()))
+            if n_min_raw < max(ABS_MIN_POINTS, 50):
                 continue   # tranche <50 mise de côté (2026-07-22), structurellement dure
+
+            if args.cluster_baseline:
+                frac_i_base = raw0[mask0][cluster_mask0]
+                frac_j_base = raw1[mask1][cluster_mask1]
+                frac_i_nrm  = nrm0[mask0][cluster_mask0]
+                frac_j_nrm  = nrm1[mask1][cluster_mask1]
+            else:
+                frac_i_base = raw0[mask0]
+                frac_j_base = raw1[mask1]
+                frac_i_nrm  = nrm0[mask0]
+                frac_j_nrm  = nrm1[mask1]
+            n_min_base = n_min_raw
 
             # ── Étage 1 : zoom avec graines filtrées par clustering + correction
             # init_rot (cf. phase5a_zoom_resample_thresh03_check.py pour le détail
             # complet du bug de repère et du fix). ─────────────────────────────
             R_init_rot = quat_wxyz_to_rotmat(batch["init_rot"].numpy()[0])
-            cluster_mask0 = dominant_cluster_mask(raw0[mask0])
-            cluster_mask1 = dominant_cluster_mask(raw1[mask1])
             seed_i_gt = (gtgt0[mask0][cluster_mask0]) @ R_init_rot.T
             seed_j_gt = (gtgt1[mask1][cluster_mask1]) @ R_init_rot.T
             meshes = mesh_data["meshes"]
