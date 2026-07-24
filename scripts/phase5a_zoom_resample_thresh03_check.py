@@ -119,6 +119,31 @@ def dominant_cluster_mask(points):
     return labels == dominant
 
 
+def remove_tiny_clusters_mask(points, eps=CLUSTER_EPS, min_cluster_size=MIN_CLUSTER_SIZE):
+    """Alternative plus douce à `dominant_cluster_mask` (2026-07-23, phase7) --
+    supprime UNIQUEMENT les composantes connexes MINUSCULES (bruit isolé,
+    < min_cluster_size), sans forcer la sélection d'un seul cluster
+    "dominant". Motivation : la visualisation confusion masque CNN vs GT
+    (phase7_mask_confusion_viz.py) a montré un motif net -- petits amas
+    isolés (5-30 points) de faux positifs, spatialement séparés de la vraie
+    fracture -- mais `dominant_cluster_mask` a déjà été testé et RÉFUTÉ
+    (2026-07-22, `--cluster_baseline` : précision dégradée), probablement
+    parce qu'il peut choisir le MAUVAIS cluster comme dominant si l'amas
+    parasite est plus compact que la vraie fracture (souvent plus diffuse),
+    jetant au passage de VRAIS points de fracture non dominants. Ici,
+    `cluster_points` (Phase 2D) étiquette DÉJÀ -1 ("bruit") tout groupe plus
+    petit que `min_cluster_size` -- il suffit de garder tout ce qui n'est PAS
+    bruit (`labels >= 0`), sans se restreindre au plus gros cluster. Retourne
+    un masque bool ; tout-vrai si le clustering n'est pas exploitable
+    (< 2 points, ou 100% classé bruit)."""
+    if len(points) < 2:
+        return np.ones(len(points), dtype=bool)
+    labels = cluster_points(points, eps=eps, min_cluster_size=min_cluster_size)
+    if np.all(labels < 0):
+        return np.ones(len(points), dtype=bool)
+    return labels >= 0
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt",        required=True)

@@ -52,7 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.analyze_errors import load_config_and_model
 from scripts.phase5a_depthmap_matching import quat_wxyz_to_rotmat, rot_err_deg, trans_err
 from scripts.phase5a_zoom_resample_check import zoom_resample, to_input_frame, run_cascade
-from scripts.phase5a_zoom_resample_thresh03_check import dominant_cluster_mask
+from scripts.phase5a_zoom_resample_thresh03_check import dominant_cluster_mask, remove_tiny_clusters_mask
 from scripts.phase6a_convergence_basin_check import trimmed_icp_normals
 from assembly.models.cnn_segmentation_model import CNNFracSeg
 from assembly.models.projection_mapping_utils import extract_fragment_list
@@ -89,6 +89,15 @@ def main():
                              "PCA de la cascade elle-même, pas seulement la localisation du "
                              "zoom). Le filtre de densité <50 reste basé sur le compte BRUT "
                              "(avant clustering), pour comparer sur les mêmes paires.")
+    parser.add_argument("--remove_tiny_clusters", action="store_true",
+                        help="Alternative plus douce à --cluster_baseline (2026-07-23) : "
+                             "supprime UNIQUEMENT les composantes connexes minuscules du "
+                             "masque baseline (bruit isolé, < MIN_CLUSTER_SIZE=10), sans "
+                             "forcer la sélection d'un seul cluster dominant -- garde tout "
+                             "sous-groupe légitime de la fracture même si non dominant. "
+                             "Motivé par phase7_mask_confusion_viz.py (amas isolés de faux "
+                             "positifs CNN, 5-30 points, vus dans la majorité des échecs "
+                             "étage 1). Mutuellement exclusif avec --cluster_baseline.")
     parser.add_argument("--max_icp_iters", type=int, default=50)
     parser.add_argument("--trim_ratio", type=float, default=0.7)
     parser.add_argument("--normal_dot_thresh", type=float, default=-0.3)
@@ -241,6 +250,11 @@ def main():
             # qui polluent le repère PCA -- pas seulement la localisation du zoom).
             cluster_mask0 = dominant_cluster_mask(raw0[mask0])
             cluster_mask1 = dominant_cluster_mask(raw1[mask1])
+            # ── Alternative plus douce (2026-07-23) : ne retire que le bruit
+            # isolé (composantes < MIN_CLUSTER_SIZE), pas de sélection d'un
+            # seul cluster dominant -- cf. remove_tiny_clusters_mask. ────────
+            tiny_mask0 = remove_tiny_clusters_mask(raw0[mask0])
+            tiny_mask1 = remove_tiny_clusters_mask(raw1[mask1])
 
             # Le filtre de densité reste basé sur le compte BRUT (avant clustering)
             # -- garde la même population de paires qu'avec --cluster_baseline
@@ -275,6 +289,11 @@ def main():
                 frac_j_base = raw1[mask1][cluster_mask1]
                 frac_i_nrm  = nrm0[mask0][cluster_mask0]
                 frac_j_nrm  = nrm1[mask1][cluster_mask1]
+            elif args.remove_tiny_clusters:
+                frac_i_base = raw0[mask0][tiny_mask0]
+                frac_j_base = raw1[mask1][tiny_mask1]
+                frac_i_nrm  = nrm0[mask0][tiny_mask0]
+                frac_j_nrm  = nrm1[mask1][tiny_mask1]
             else:
                 frac_i_base = raw0[mask0]
                 frac_j_base = raw1[mask1]
