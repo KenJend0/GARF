@@ -64,7 +64,21 @@ def _knn_indices(points: torch.Tensor, k: int) -> torch.Tensor:
     return idx
 
 
-def _knn_indices_batched(points: torch.Tensor, k: int) -> torch.Tensor:
+def _knn_indices_batched_chunk(points: torch.Tensor, k: int) -> torch.Tensor:
+    """Un-chunked (K, N, N) brute-force kNN — see _knn_indices_batched for the
+    chunking wrapper that keeps this call's memory bounded."""
+    sq = (points ** 2).sum(dim=-1, keepdim=True)              # (K, N, 1)
+    dist2 = sq + sq.transpose(1, 2) - 2.0 * (points @ points.transpose(1, 2))  # (K, N, N)
+    dist2 = dist2.clamp(min=0.0)
+    diag = torch.eye(points.shape[1], device=points.device, dtype=torch.bool)
+    dist2 = dist2.masked_fill(diag.unsqueeze(0), float("inf"))  # exclude self, per fragment
+    _, idx = dist2.topk(k, dim=-1, largest=False)               # (K, N, k)
+    return idx
+
+
+def _knn_indices_batched(
+    points: torch.Tensor, k: int, max_chunk_bytes: int = 300 * 1024 * 1024,
+) -> torch.Tensor:
     """
     Brute-force k nearest neighbor indices, batched over K fragments that all
     share the same point count N (the common case: sample_method=uniform).
@@ -78,14 +92,31 @@ def _knn_indices_batched(points: torch.Tensor, k: int) -> torch.Tensor:
                  fragment (never crosses fragment boundaries — each fragment's
                  (N, N) distance matrix is computed independently within the
                  batched dim, exactly like calling _knn_indices K times).
+
+    Chunked over K to bound peak GPU memory: the dense (K, N, N) distance
+    tensor this needs grows linearly with K and quadratically with N (with
+    this codebase's default num_points_to_sample=5000, that's ~100MB per
+    fragment) -- an un-chunked call on a validation/training batch with K in
+    the hundreds (batch_size=32 x up to max_parts=20 fragments/object) can
+    request tens of GB in one allocation, which overflows the lab's 7.6GB
+    GPUs even though no single fragment is large. Chunking bounds each call
+    to roughly max_chunk_bytes and processes chunks sequentially; the result
+    is identical to the un-chunked call since each fragment's kNN is
+    independent of every other fragment (same rationale as _batched_eigh's
+    chunking above, for an unrelated cusolver batch-size limit).
     """
-    sq = (points ** 2).sum(dim=-1, keepdim=True)              # (K, N, 1)
-    dist2 = sq + sq.transpose(1, 2) - 2.0 * (points @ points.transpose(1, 2))  # (K, N, N)
-    dist2 = dist2.clamp(min=0.0)
-    diag = torch.eye(points.shape[1], device=points.device, dtype=torch.bool)
-    dist2 = dist2.masked_fill(diag.unsqueeze(0), float("inf"))  # exclude self, per fragment
-    _, idx = dist2.topk(k, dim=-1, largest=False)               # (K, N, k)
-    return idx
+    K, N, _ = points.shape
+    bytes_per_frag = N * N * 4
+    chunk_size = max(1, min(K, max_chunk_bytes // bytes_per_frag))
+
+    if chunk_size >= K:
+        return _knn_indices_batched_chunk(points, k)
+
+    idx_chunks = [
+        _knn_indices_batched_chunk(points[start:start + chunk_size], k)
+        for start in range(0, K, chunk_size)
+    ]
+    return torch.cat(idx_chunks, dim=0)
 
 
 def _gather_neighbors(points: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
