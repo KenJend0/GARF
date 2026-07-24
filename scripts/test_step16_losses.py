@@ -10,6 +10,11 @@ Run on the remote lab (torch/lightning/scipy only need to be importable):
     CUDA_VISIBLE_DEVICES=1 python scripts/test_step16_losses.py
 """
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import torch
 
 from assembly.models.cnn_segmentation_model import (
