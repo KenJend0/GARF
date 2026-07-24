@@ -1,0 +1,97 @@
+# @package _global_
+# configs/experiment/cnn_step16_boundary_coherence.yaml
+#
+# Step 16 — Boundary loss + spatial coherence loss, fine-tuned depuis Step 15
+#
+# Motivation (AVANCEES_POST_PRESENTATION.md section 10, PLAN_REASSEMBLY_MODULE.md
+# Phase 7 diagnostic geometrique 2026-07-23) : le CNN Step 15 a un excellent F1
+# (96.7% everyday / 91.5% artifact) mais le pipeline de matching en aval est
+# beaucoup plus sensible aux petits defauts du masque que les metriques de
+# segmentation classiques ne le laissent penser. Deux causes distinctes,
+# poids tres inegal :
+#   1. Imprecision de frontiere (85.3% du volume de FP)      -> boundary_loss
+#   2. Amas isoles de faux positifs (14.7% du volume, mais
+#      56.1% des fragments touches, biaisent le repere PCA)  -> coherence_loss
+#
+# Fine-tuning DEPUIS Step 15 (pas from-scratch) : Step 15 a deja de bonnes
+# predictions sur lesquelles la notion de "composante isolee" (coherence_loss)
+# a du sens, contrairement a un modele naif en debut d'entrainement dont les
+# predictions sont quasi aleatoires. Le boundary_loss, lui, est base sur le
+# GT (stable des l'epoch 0) et n'a pas besoin de ce warm-start, mais on le
+# garde dans le meme run par simplicite -- les deux chantiers ciblent des
+# populations de points disjointes (cf. diagnostic), rien n'empeche de les
+# entrainer ensemble.
+#
+# Choix de conception (a documenter, pas evidents) :
+#   - boundary_weight = coherence_weight = 0.2 : poids modeste relatif a la
+#     loss de base (dice+focal, deja alpha=0.5/0.5), pour ne pas destabiliser
+#     l'optimum deja atteint par Step 15 -- a ajuster si le F1 pooled degrade
+#     ou si les deux nouveaux termes n'ont pas d'effet mesurable.
+#   - coherence_warmup_epochs = 2 : warmup court (pas 0) car le point_head et
+#     le reste du reseau doivent d'abord re-stabiliser leurs activations sous
+#     les nouveaux gradients de boundary_loss avant que le clustering de la
+#     prediction (isolated_fp_mask) devienne une notion fiable a penaliser.
+#     Fine-tuning depuis Step15 deja converge => 2 epochs suffisent, pas besoin
+#     des ~10-20 epochs qu'il faudrait from-scratch.
+#   - coherence_every_n_steps = 1 (pas de throttling) : le clustering tourne
+#     sur scipy/CPU par fragment (K par batch, generalement <= 8), cout
+#     negligeable au vu de la taille des batches CNN. A augmenter (ex. 4) si
+#     le profiling montre un ralentissement notable.
+#   - cluster_eps = 0.02, min_cluster_size = 10 : repris tels quels du
+#     diagnostic scripts/phase7_isolated_fp_prevalence_check.py, pour que la
+#     definition de "amas isole" pendant l'entrainement soit identique a
+#     celle du diagnostic qui a motive ce chantier.
+#   - k_boundary = 5 : repris tel quel de _boundary_mask() dans
+#     scripts/analyze_errors.py, pour que la loss d'entrainement cible
+#     exactement les memes points que la metrique Boundary F1 d'evaluation.
+
+defaults:
+  - cnn_ablation_shared
+  - _self_
+
+experiment_name: cnn_step16_boundary_coherence
+tags: ["cnn", "step16", "boundary_loss", "spatial_coherence"]
+
+model:
+  resolution: 128
+  use_normals: true
+  splat_sigma: 1.5
+  use_bilinear: true
+  use_global_context: true
+  use_view_attn: false
+  backbone: unet
+  unet_depth: 4
+  feature_fusion: "max"
+  use_geo_features: true
+  geo_k: 16
+  use_overlap_channels: false
+  use_focal_loss: true
+  focal_gamma: 2.0
+  focal_dice_alpha: 0.5
+  use_point_head: true
+  point_head_feat_dim: 64
+  point_head_hidden_dim: 128
+  lr_point_head_multiplier: 2.0
+  random_rotate: true
+  norm_type: instance
+
+  # Step 16 -- nouveaux termes de loss (cf. rationale ci-dessus)
+  use_boundary_loss: true
+  boundary_weight: 0.2
+  k_boundary: 5
+  use_coherence_loss: true
+  coherence_weight: 0.2
+  cluster_eps: 0.02
+  min_cluster_size: 10
+  coherence_warmup_epochs: 2
+  coherence_every_n_steps: 1
+
+  # Fine-tuning depuis Step 15 -- pas from-scratch (cf. rationale ci-dessus)
+  pretrained_ckpt: output/cnn_step15_final_model/last.ckpt
+
+data:
+  categories: ["everyday"]
+  weight_hard_examples: true
+
+trainer:
+  max_epochs: 30   # fine-tuning court depuis Step 15 deja converge

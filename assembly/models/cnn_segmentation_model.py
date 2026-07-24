@@ -34,11 +34,15 @@ The model has an identical LightningModule API to FracSeg and HybridFracSeg:
 
 from functools import partial
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import lightning as pl
 import torchmetrics
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial import cKDTree
 
 from assembly.models.pretraining.loss import dice_loss, tversky_loss, focal_loss, dice_focal_loss
 from assembly.models.projection_3d_to_2d import Project3DTo2D, _normalize_fragment
@@ -368,6 +372,153 @@ class UNetBackbone(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Step 16 — boundary loss + spatial coherence loss helpers
+# ---------------------------------------------------------------------------
+#
+# Both operate per-fragment (never mixing points across fragments) using the
+# frag_sizes / points_xyz_flat exposed by CNNFracSeg.forward(). Both are
+# no_grad: they only decide WHICH points get an extra BCE penalty, the
+# gradient still flows through the BCE term itself via `pred`.
+
+@torch.no_grad()
+def compute_boundary_mask(
+    points_xyz_flat: torch.Tensor,   # (N_sum, 3)
+    gt_flat: torch.Tensor,           # (N_sum,) float or long
+    frag_sizes: list,
+    k: int = 5,
+) -> torch.Tensor:
+    """
+    Per-fragment boundary mask, torch/GPU version of analyze_errors.py's
+    `_boundary_mask()`: a point is "boundary" if at least one of its k
+    nearest neighbours (Euclidean, same fragment only) carries a different
+    GT label. Kept numerically identical in definition (k=5 default) so the
+    training-time boundary loss targets the same points the Boundary-F1
+    evaluation metric already measures.
+    """
+    device = points_xyz_flat.device
+    masks = []
+    offset = 0
+    for n in frag_sizes:
+        n = int(n)
+        if n <= 1:
+            masks.append(torch.zeros(n, dtype=torch.bool, device=device))
+            offset += n
+            continue
+        xyz = points_xyz_flat[offset:offset + n]
+        gt  = gt_flat[offset:offset + n]
+        k_eff = min(k, n - 1)
+        dists = torch.cdist(xyz, xyz)
+        dists.fill_diagonal_(float("inf"))
+        knn_idx = dists.topk(k_eff, largest=False).indices        # (n, k_eff)
+        neighbor_labels = gt[knn_idx]                              # (n, k_eff)
+        boundary = (neighbor_labels != gt.unsqueeze(1)).any(dim=1)
+        masks.append(boundary)
+        offset += n
+    return torch.cat(masks, dim=0) if masks else torch.zeros(0, dtype=torch.bool, device=device)
+
+
+def boundary_bce_loss(
+    pred: torch.Tensor, gt: torch.Tensor, boundary_mask: torch.Tensor,
+    smooth: float = 1e-6,
+) -> torch.Tensor:
+    """BCE restricted to boundary points (cf. compute_boundary_mask)."""
+    if boundary_mask.sum() == 0:
+        return pred.new_zeros(())
+    p = pred[boundary_mask].clamp(smooth, 1.0 - smooth)
+    g = gt[boundary_mask]
+    bce = -(g * torch.log(p) + (1.0 - g) * torch.log(1.0 - p))
+    return bce.mean()
+
+
+@torch.no_grad()
+def _cluster_labels(points_np: np.ndarray, eps: float, min_cluster_size: int) -> np.ndarray:
+    """
+    Connected-components clustering via a radius proximity graph — identical
+    logic to `cluster_points()` in scripts/phase2d_interface_clustering_diagnostic.py
+    (same eps/min_cluster_size semantics as the isolated-FP diagnostic that
+    motivated this loss), reimplemented here to avoid importing a scripts/ file
+    as a package dependency. Returns a label per point: cluster id (>=0) or -1
+    for noise / undersized clusters.
+    """
+    n = len(points_np)
+    if n == 0:
+        return np.array([], dtype=int)
+    tree = cKDTree(points_np)
+    pairs = tree.query_pairs(eps, output_type="ndarray")
+    if len(pairs) == 0:
+        return -np.ones(n, dtype=int)
+    rows = np.concatenate([pairs[:, 0], pairs[:, 1]])
+    cols = np.concatenate([pairs[:, 1], pairs[:, 0]])
+    adj = coo_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n))
+    n_components, labels = connected_components(adj, directed=False)
+    sizes = np.bincount(labels, minlength=n_components)
+    small = np.where(sizes < min_cluster_size)[0]
+    labels = labels.copy()
+    labels[np.isin(labels, small)] = -1
+    return labels
+
+
+@torch.no_grad()
+def compute_isolated_fp_mask(
+    points_xyz_flat: torch.Tensor,     # (N_sum, 3)
+    pred_binary_flat: torch.Tensor,    # (N_sum,) bool
+    gt_flat: torch.Tensor,             # (N_sum,) float or long
+    frag_sizes: list,
+    eps: float = 0.02,
+    min_cluster_size: int = 10,
+) -> torch.Tensor:
+    """
+    Per-fragment: cluster the points currently predicted positive (radius
+    proximity graph, same clustering as the Phase 7 isolated-FP diagnostic),
+    then flag points that (a) belong to a small/isolated cluster (< min_cluster_size,
+    including singleton noise) AND (b) are actually false positives (GT
+    negative) -- i.e. exactly the "isolated amas de faux positifs" population
+    identified by the geometric diagnostic (56.1% of fragments affected).
+
+    Deliberately excludes small isolated clusters that ARE real (disjoint)
+    fracture surface -- those are legitimate GT-positive predictions and must
+    not be penalised, hence the GT-negative filter.
+
+    Clustering runs on the *prediction*, which is noisy early in training --
+    callers are expected to gate this behind a warmup / fine-tune-from-Step15
+    scheme (see CNNFracSeg.criteria, coherence_warmup_epochs) rather than
+    apply it from a randomly-initialised model.
+    """
+    device = points_xyz_flat.device
+    masks = []
+    offset = 0
+    for n in frag_sizes:
+        n = int(n)
+        pred_b = pred_binary_flat[offset:offset + n]
+        gt     = gt_flat[offset:offset + n]
+        flag = torch.zeros(n, dtype=torch.bool, device=device)
+        pos_idx = torch.where(pred_b)[0]
+        if pos_idx.numel() >= 2:
+            xyz_pos = points_xyz_flat[offset:offset + n][pos_idx].detach().cpu().numpy()
+            labels = _cluster_labels(xyz_pos, eps=eps, min_cluster_size=min_cluster_size)
+            is_isolated = torch.from_numpy(labels < 0).to(device)   # (n_pos,) bool
+            flag[pos_idx[is_isolated]] = True
+        flag = flag & (gt < 0.5)   # keep only true FPs -- never penalise real disjoint fracture
+        masks.append(flag)
+        offset += n
+    return torch.cat(masks, dim=0) if masks else torch.zeros(0, dtype=torch.bool, device=device)
+
+
+def coherence_bce_loss(
+    pred: torch.Tensor, isolated_fp_mask: torch.Tensor, smooth: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Extra BCE penalty pushing isolated-false-positive points (cf.
+    compute_isolated_fp_mask) toward 0. GT is 0 for every flagged point by
+    construction, so this reduces to -log(1 - p).
+    """
+    if isolated_fp_mask.sum() == 0:
+        return pred.new_zeros(())
+    p = pred[isolated_fp_mask].clamp(smooth, 1.0 - smooth)
+    return (-torch.log(1.0 - p)).mean()
+
+
+# ---------------------------------------------------------------------------
 # Main LightningModule
 # ---------------------------------------------------------------------------
 
@@ -451,6 +602,15 @@ class CNNFracSeg(pl.LightningModule):
         use_focal_loss: bool = False,
         focal_gamma: float = 2.0,
         focal_dice_alpha: float = 0.5,
+        use_boundary_loss: bool = False,
+        boundary_weight: float = 0.2,
+        k_boundary: int = 5,
+        use_coherence_loss: bool = False,
+        coherence_weight: float = 0.2,
+        cluster_eps: float = 0.02,
+        min_cluster_size: int = 10,
+        coherence_warmup_epochs: int = 2,
+        coherence_every_n_steps: int = 1,
         pretrained_ckpt: str = None,
         **kwargs,
     ):
@@ -476,6 +636,15 @@ class CNNFracSeg(pl.LightningModule):
         self.use_focal_loss       = use_focal_loss
         self.focal_gamma          = focal_gamma
         self.focal_dice_alpha     = focal_dice_alpha
+        self.use_boundary_loss        = use_boundary_loss
+        self.boundary_weight          = boundary_weight
+        self.k_boundary                = k_boundary
+        self.use_coherence_loss       = use_coherence_loss
+        self.coherence_weight         = coherence_weight
+        self.cluster_eps              = cluster_eps
+        self.min_cluster_size         = min_cluster_size
+        self.coherence_warmup_epochs  = coherence_warmup_epochs
+        self.coherence_every_n_steps  = coherence_every_n_steps
         self._optimizer           = optimizer
         self._lr_scheduler        = lr_scheduler
 
@@ -658,13 +827,52 @@ class CNNFracSeg(pl.LightningModule):
         precision = torchmetrics.functional.precision(pred_b, gt_long, task="binary")
         f1        = torchmetrics.functional.f1_score(pred_b, gt_long, task="binary")
 
-        return loss, {
+        metrics = {
             "coarse_seg_loss":      loss,
             "coarse_seg_acc":       acc,
             "coarse_seg_recall":    recall,
             "coarse_seg_precision": precision,
             "coarse_seg_f1":        f1,
         }
+
+        # -- Step 16: boundary loss (chantier 1 -- frontier imprecision) --
+        # GT-based, stable from step 0, no warmup needed.
+        if self.use_boundary_loss:
+            frag_sizes = output_dict["frag_sizes"]
+            xyz_flat   = output_dict["points_xyz_flat"]
+            boundary_mask = compute_boundary_mask(xyz_flat, gt, frag_sizes, k=self.k_boundary)
+            b_loss = boundary_bce_loss(pred, gt, boundary_mask)
+            loss = loss + self.boundary_weight * b_loss
+            metrics["coarse_seg_boundary_loss"] = b_loss.detach()
+            metrics["coarse_seg_boundary_frac"] = boundary_mask.float().mean()
+
+        # -- Step 16: spatial coherence loss (chantier 2 -- isolated FP clusters) --
+        # Prediction-based, noisy early in training: gated behind an epoch
+        # warmup (meant to be used together with pretrained_ckpt=Step15, whose
+        # predictions already have meaningful cluster structure at epoch 0)
+        # and optionally computed every N steps only to bound the per-fragment
+        # CPU clustering cost. Always computed at validation time (no
+        # step-throttling) so val/coherence_loss stays a stable, comparable
+        # metric across epochs.
+        if self.use_coherence_loss and self.current_epoch >= self.coherence_warmup_epochs:
+            do_compute = (not self.training) or (
+                self.coherence_every_n_steps <= 1
+                or self.global_step % self.coherence_every_n_steps == 0
+            )
+            if do_compute:
+                frag_sizes = output_dict["frag_sizes"]
+                xyz_flat   = output_dict["points_xyz_flat"]
+                isolated_fp_mask = compute_isolated_fp_mask(
+                    xyz_flat, pred_b, gt, frag_sizes,
+                    eps=self.cluster_eps, min_cluster_size=self.min_cluster_size,
+                )
+                c_loss = coherence_bce_loss(pred, isolated_fp_mask)
+                loss = loss + self.coherence_weight * c_loss
+                metrics["coarse_seg_coherence_loss"]    = c_loss.detach()
+                metrics["coarse_seg_isolated_fp_frac"]  = isolated_fp_mask.float().mean()
+
+        metrics["coarse_seg_loss"] = loss
+        return loss, metrics
 
     # ------------------------------------------------------------------
     # Forward
@@ -684,6 +892,11 @@ class CNNFracSeg(pl.LightningModule):
           coarse_seg_pred        : (N_sum_valid,) float  probabilities
           coarse_seg_pred_binary : (N_sum_valid,) bool   > 0.5 threshold
           coarse_seg_gt          : (N_sum_valid,) long   ground-truth labels
+          frag_sizes              : list of K ints, point count per fragment
+          points_xyz_flat         : (N_sum_valid, 3) float, xyz aligned with
+                                    coarse_seg_pred/gt (same K-fragment order) --
+                                    used by criteria() for per-fragment boundary
+                                    kNN / isolated-cluster detection (Step 16)
           point_features          : (N_sum_valid, point_head_hidden_dim // 2) float --
                                     ONLY when return_point_features=True AND
                                     use_point_head=True (cf. Phase 3 ablation C). The
@@ -708,7 +921,18 @@ class CNNFracSeg(pl.LightningModule):
             out["coarse_seg_pred"]        = dummy
             out["coarse_seg_pred_binary"] = dummy.bool()
             out["coarse_seg_gt"]          = dummy.long()
+            out["frag_sizes"]             = []
+            out["points_xyz_flat"]        = torch.zeros(0, 3, device=pointclouds.device)
             return out
+
+        # frag_sizes / points_xyz_flat: per-fragment point counts and their xyz,
+        # concatenated in the exact same K-fragment order as coarse_seg_pred/gt
+        # (both built by looping k in range(K) and torch.cat-ing). Exposed so
+        # criteria() can compute per-fragment kNN / connected-components
+        # (boundary loss, spatial coherence loss, Step 16) without mixing
+        # points across fragments.
+        out["frag_sizes"]      = [f.shape[0] for f in frag_list]
+        out["points_xyz_flat"] = torch.cat(frag_list, dim=0)   # (N_sum_valid, 3)
 
         # 2. Normal list (if available and requested)
         normal_list = None

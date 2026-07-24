@@ -3407,3 +3407,49 @@ segmentation du CNN elle-même, un levier différent (amélioration/retrain
 du CNN, pas du pipeline de matching). Prochaine décision à prendre avec
 l'utilisateur : visualisations succès/échec (point 3 du plan) ou pivot
 vers l'amélioration du CNN.
+
+## Step 16 CNN — boundary loss + spatial coherence loss (2026-07-24, EN COURS)
+
+Suite directe du pivot évoqué ci-dessus : le diagnostic géométrique du
+2026-07-23 (`phase7_isolated_fp_prevalence_check.py`, 7490 fragments) a
+confirmé que la limite restante sur `Pose@30 global = 14.7%` (vs 37.6% en
+GT) vient de la qualité intrinsèque du masque CNN Step 15, pas du pipeline
+de matching (trois tentatives de fix côté pipeline — `dominant_cluster_mask`,
+`compute_pca_frame_robust`, `remove_tiny_clusters_mask` — toutes net-négatives
+ou neutres). Décomposition des faux positifs en deux causes de poids très
+inégal : imprécision de frontière (85.3% du volume de FP) et amas isolés
+(14.7% du volume, mais 56.1% des fragments touchés — assez pour biaiser le
+repère PCA du matching même à faible volume). Détail complet du diagnostic
+et du raisonnement dans `AVANCEES_POST_PRESENTATION.md` section 10.
+
+**Implémentation (ce jour, code écrit, PAS encore entraîné/évalué) :**
+- `assembly/models/cnn_segmentation_model.py` : `forward()` expose
+  `frag_sizes`/`points_xyz_flat` (nécessaire pour du kNN/clustering par
+  fragment dans `criteria()`) ; deux nouveaux termes de loss ajoutés à
+  `criteria()` — `boundary_bce_loss` (GT-based, kNN k=5, même définition que
+  la métrique Boundary F1 de `analyze_errors.py`) et `coherence_bce_loss`
+  (prédiction-based, clustering par composantes connexes `eps=0.02`/
+  `min_cluster_size=10`, mêmes paramètres que le diagnostic ci-dessus, ne
+  pénalise que les points isolés ET GT-négatifs).
+- `configs/experiment/cnn_step16_boundary_coherence.yaml` : fine-tuning
+  DEPUIS Step 15 (`pretrained_ckpt`, pas from-scratch — la coherence loss a
+  besoin de prédictions déjà significatives pour que "composante isolée"
+  ait un sens), + `coherence_warmup_epochs=2`, poids `boundary_weight =
+  coherence_weight = 0.2`, 30 epochs.
+- `scripts/test_step16_losses.py` : smoke test synthétique (formes, cas
+  limites — fragment vide, fragment singleton, batch tout vide) des quatre
+  nouvelles fonctions, à faire tourner sur le serveur avant le run complet
+  (lightning/scipy pas installés en local).
+
+**Prochaines actions :**
+1. Lancer `scripts/test_step16_losses.py` sur le serveur (sanity check des
+   helpers avant d'investir 30 epochs).
+2. Lancer l'entraînement Step 16 (`experiment=cnn_step16_boundary_coherence`).
+3. Évaluer à deux niveaux (métriques de segmentation classiques ET le
+   pipeline de matching en aval, PAS juste le F1 — c'est tout l'enjeu de ce
+   chantier) : `analyze_errors.py --geometric --sweep_threshold` vs baseline
+   Step 15 (96.7%/83.2% everyday, 91.5%/75.5% artifact), re-mesure de la
+   prévalence d'amas isolés (`phase7_isolated_fp_prevalence_check.py`,
+   baseline 56.1% fragments touchés), et **le vrai test**
+   `phase6b_pipeline_thresh03_check.py` contre la baseline Step 15 à battre :
+   éligibilité 62.6%, Pose@30 global 14.7%, succès strict ≈6.8%.
