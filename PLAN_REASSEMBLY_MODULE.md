@@ -3337,3 +3337,30 @@ CLI passthrough à `phase6b_pipeline_check.py` (GT) et
 (GT, oracle-first) avec `--correspondence_mode nn`, comparer à la
 baseline `grid` du 2026-07-22 (éligibilité 80.7%, Pose@30 stage1+2
 38.7%), puis seulement si concluant, la version thresh0.3.
+
+**Résultat (2026-07-23), pipeline complet GT (zoom+cascade+nn), même
+population "facile" (1245 paires) que la baseline `grid` du 2026-07-22 :**
+```
+n_2frag_seen=1487, skip densité<50=242, zoom échoué=0, échec étage1=11
+n_pairs_stage2=1234 (éligibilité étage 1 = 1234/1245 = 99.1%)
+
+Parmi les 1234 paires ayant atteint l'étage 2 :
+                        étage 1 seul   étage 1+2
+Pose@30°/0.1                21.5%        37.9%
+Pose@15°/0.05                13.9%        32.6%
+Succès strict (5°/0.02)        —          23.4%
+```
+Rapporté à TOUTE la population facile (1245, dénominateur commun avec la
+baseline grid) : Pose@30 étage1+2 ≈ **37.6%** (vs 31.3% en grid), succès
+strict ≈ **23.2%** (vs 18.2% en grid).
+
+**Le fix referme quasiment tout l'écart d'éligibilité (240 échecs étage 1
+→ 11) SANS diluer la précision par paire éligible** (38.7%→37.9%
+Pose@30, 32.8%→32.6% Pose@15 -- quasi stable, contrairement au test isolé
+à R=64 où la précision par survivant chutait nettement). Le zoom+cascade
+absorbe apparemment la difficulté des paires nouvellement récupérées.
+Gain net sur toute la ligne : éligibilité ET précision absolue montent
+ensemble, pas de compromis. `nn` devient le mode par défaut recommandé
+pour la suite. Prochaine action : version thresh0.3 (CNN, condition
+réelle) avec `--correspondence_mode nn`, pour confirmer que ça tient hors
+oracle.
