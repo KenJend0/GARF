@@ -3364,3 +3364,46 @@ ensemble, pas de compromis. `nn` devient le mode par défaut recommandé
 pour la suite. Prochaine action : version thresh0.3 (CNN, condition
 réelle) avec `--correspondence_mode nn`, pour confirmer que ça tient hors
 oracle.
+
+**Résultat (2026-07-23), pipeline complet thresh0.3/CNN (zoom+cascade+nn),
+même population (1487 paires vues) que la baseline `grid` du 2026-07-22 :**
+```
+n_2frag_seen=1487, échec étage1=71, atteint étage2=931
+
+Parmi les 931 paires ayant atteint l'étage 2 :
+                        étage 1 seul   étage 1+2
+Pose@30°/0.1                 8.6%        23.5%
+Pose@15°/0.05                 4.0%        18.0%
+Succès strict (5°/0.02)        —          10.8%
+
+Précision/rappel masque CNN vs GT :
+                     N     Precision(min)   Recall(min)
+Étage 1 RÉUSSIT     931          79.6%          90.1%
+Étage 1 ÉCHOUE       71          63.0%          84.1%
+```
+Rapporté à TOUTES les 1487 paires (dénominateur commun avec la baseline
+grid) :
+```
+                     grid (2026-07-22)   nn (2026-07-23)
+Éligibilité               48.2%              62.6%
+Pose@30 global             11.6%              14.7%
+Succès strict global       ≈6.8%              ≈6.8%  (inchangé)
+```
+**Le fix aide nettement moins qu'en GT (99.1% d'éligibilité) -- confirme
+encore la conclusion du 2026-07-22 : l'écart d'éligibilité CNN vs GT vient
+de la qualité intrinsèque du masque CNN, pas du mécanisme de
+correspondance.** L'écart précision/rappel réussite-vs-échec est un peu
+moins marqué qu'avant (21.8pp→16.6pp de précision, 11.8pp→6.0pp de
+rappel) -- `nn` récupère une partie des cas à masque légèrement dégradé,
+mais pas les pires. Le succès strict global reste identique (≈6.8%) : les
+~215 paires nouvellement récupérées gagnent du Pose@30 (tolérance large)
+mais pas du succès strict -- cohérent avec l'effet de composition observé
+partout ailleurs (paires plus dures en moyenne).
+
+**Toujours sous le seuil des 20% fixé comme point d'arrêt (2026-07-22) :
+Pose@30 global = 14.7%.** Le fix de correspondance a fait ce qu'il
+pouvait sur ce levier -- la limite restante est la qualité de
+segmentation du CNN elle-même, un levier différent (amélioration/retrain
+du CNN, pas du pipeline de matching). Prochaine décision à prendre avec
+l'utilisateur : visualisations succès/échec (point 3 du plan) ou pivot
+vers l'amélioration du CNN.
