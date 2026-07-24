@@ -81,7 +81,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.analyze_errors import load_config_and_model
 from scripts.phase5a_weighted_gt_check import extract_gt_variable
 from scripts.phase5a_depthmap_matching import (
-    compute_pca_frame, quat_wxyz_to_rotmat, run_match_at_resolution,
+    compute_pca_frame, compute_pca_frame_robust, quat_wxyz_to_rotmat, run_match_at_resolution,
 )
 
 ABS_MIN_POINTS = 5
@@ -161,8 +161,24 @@ def run_cascade(frac_i, frac_j, R_ij_gt, t_ij_gt, args):
     if n_i < ABS_MIN_POINTS or n_j < ABS_MIN_POINTS:
         return {"reached_stage": "unusable_too_few", "n_frac_pts_min": min(n_i, n_j)}
 
-    c_i, u_i, v_i, n_i_ax, _ = compute_pca_frame(frac_i)
-    c_j, u_j, v_j, n_j_ax, _ = compute_pca_frame(frac_j)
+    # `robust_pca` (2026-07-23) : PCA standard (défaut, comportement historique
+    # inchangé) ou variante robuste (compute_pca_frame_robust -- rejet itératif
+    # des points les plus loin du plan avant de fixer le repère). Motivé par
+    # phase7_mask_confusion_viz.py : petits amas de faux positifs CNN isolés
+    # de la vraie fracture, trop peu nombreux pour dégrader précision/rappel
+    # mais suffisants pour biaiser le repère PCA. `getattr` rétrocompatible --
+    # les scripts qui n'exposent pas cette option gardent le comportement
+    # standard sans changement.
+    if getattr(args, "robust_pca", False):
+        c_i, u_i, v_i, n_i_ax, _ = compute_pca_frame_robust(
+            frac_i, n_iters=getattr(args, "robust_pca_iters", 3),
+            keep_frac=getattr(args, "robust_pca_keep_frac", 0.9))
+        c_j, u_j, v_j, n_j_ax, _ = compute_pca_frame_robust(
+            frac_j, n_iters=getattr(args, "robust_pca_iters", 3),
+            keep_frac=getattr(args, "robust_pca_keep_frac", 0.9))
+    else:
+        c_i, u_i, v_i, n_i_ax, _ = compute_pca_frame(frac_i)
+        c_j, u_j, v_j, n_j_ax, _ = compute_pca_frame(frac_j)
 
     ci, cj = frac_i - c_i, frac_j - c_j
     span_i = max(float((ci @ u_i).max() - (ci @ u_i).min()),

@@ -111,6 +111,13 @@ def main():
                              "l'objet args (aucun changement requis dans run_cascade).")
     parser.add_argument("--contact_eps", type=float, default=0.05,
                         help="Tolérance de proximité pour --correspondence_mode nn.")
+    parser.add_argument("--robust_pca", action="store_true",
+                        help="PCA robuste (compute_pca_frame_robust, 2026-07-23) au lieu du "
+                             "repère PCA standard -- rejette itérativement les points les plus "
+                             "loin du plan avant de fixer le repère, pour ne pas laisser un "
+                             "petit amas isolé (faux positifs CNN) biaiser le centre/les axes.")
+    parser.add_argument("--robust_pca_iters", type=int, default=3)
+    parser.add_argument("--robust_pca_keep_frac", type=float, default=0.9)
     parser.add_argument("--csv_out", default="")
     parser.add_argument("--summary_json", default="")
     args = parser.parse_args()

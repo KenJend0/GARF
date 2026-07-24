@@ -189,6 +189,44 @@ def compute_pca_frame(pts: np.ndarray):
     return centroid, u, v, n, planarity
 
 
+def compute_pca_frame_robust(pts: np.ndarray, n_iters: int = 3, keep_frac: float = 0.9):
+    """Variante robuste de `compute_pca_frame` (2026-07-23, phase7) -- rejette
+    itérativement les points les plus éloignés du plan avant de fixer le
+    repère final. Motivation : la visualisation confusion masque CNN vs GT
+    (phase7_mask_confusion_viz.py) a montré que le masque `thresh0.3` contient
+    souvent un petit amas de faux positifs (5-30 points) spatialement ISOLÉ de
+    la vraie fracture -- trop peu nombreux pour dégrader précision/rappel
+    globaux, mais suffisants pour biaiser le centre/les axes PCA (non robustes
+    aux valeurs aberrantes), surtout quand la vraie fracture est elle-même
+    petite. Alternative plus chirurgicale que `dominant_cluster_mask`
+    (2026-07-22, réfutée : le clustering tout-ou-rien peut choisir le MAUVAIS
+    cluster comme dominant si l'amas parasite est plus compact que la vraie
+    fracture, plus diffuse) -- ici on ne jette JAMAIS tout un groupe, on
+    resserre progressivement le plan autour de la majorité des points.
+
+    À chaque itération : calcule la PCA standard sur les points RESTANTS, mesure
+    la distance de CHAQUE point original au plan (|dot(centré, n)|), ne garde
+    que la fraction `keep_frac` la plus proche du plan pour l'itération
+    suivante. Le résultat final (centroid/u/v/n/planarity) vient de la
+    DERNIÈRE itération -- les points eux-mêmes ne sont jamais filtrés en
+    dehors de cette fonction (rasterisation/correspondances utilisent
+    toujours tous les points originaux, seul le repère change)."""
+    keep = np.ones(len(pts), dtype=bool)
+    centroid, u, v, n, planarity = compute_pca_frame(pts)
+    for _ in range(max(n_iters, 1)):
+        n_keep_target = max(3, int(round(keep_frac * keep.sum())))
+        if n_keep_target >= keep.sum():
+            break
+        centered = pts - centroid
+        dist_to_plane = np.abs(centered @ n)
+        order = np.argsort(dist_to_plane)
+        new_keep = np.zeros(len(pts), dtype=bool)
+        new_keep[order[:n_keep_target]] = True
+        keep = new_keep
+        centroid, u, v, n, planarity = compute_pca_frame(pts[keep])
+    return centroid, u, v, n, planarity
+
+
 def points_to_valid_mask(u_coords, v_coords, u_min, v_min, resolution, pixel_size,
                           dilate_px: int = 0, gaussian_sigma_px: float = 0.0):
     """Points (u,v) déjà projetés → masque `valid` (case couverte). Partagée
