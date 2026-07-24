@@ -3302,3 +3302,38 @@ avec `args` inchangé) — pas besoin de toucher au chemin principal
 `process_pair` ni d'écrire un nouveau script. Résultat pas encore lancé —
 prochaine action : comparer `--correspondence_mode grid` vs `nn` sur le
 même sweep de résolution, stratégie `gt` (oracle-first).
+
+**Résultat (2026-07-23), `--pose_resolution_sweep 64 --pose_resolution_sweep_strategies gt`,
+`grid` vs `nn`, mêmes paires (`gt.density_resolution_sweep.64_na36`) :**
+```
+                              grid        nn
+n (paires éligibles à R=64)   708        1195
+Pose@30 (parmi éligibles)   25.57%      16.99%
+cascade_union_eligibility   54.80%      92.49%
+```
+**Éligibilité : gain massif, +487 paires (54.8%→92.5%), quasiment le
+plafond continu ~100% trouvé au diagnostic 2b — à une SEULE résolution
+fixe, sans zoom ni clustering ni cascade.** Dépasse déjà, seul, ce que
+zoom+cascade+clustering combinés obtenaient (~70-80%) tout au long de la
+journée.
+
+Le `Pose@30` par survivant baisse (effet de composition attendu, déjà vu
+avec le zoom/budget : les ~487 paires nouvellement récupérées sont celles
+que `grid` ratait *complètement* par arrondi, plus dures en moyenne) —
+mais en nombre ABSOLU de poses correctes : `grid`≈181, `nn`≈203, soit
+**+12% net**, pas une simple dilution. Vérifié bin par bin
+(`n_frac_pts_min`) : `nn` augmente N dans TOUTES les tranches (75→348,
+297→436, 313→385, 23→26) avec une baisse de précision par tranche modeste,
+pas un effondrement.
+
+**Décision utilisateur : combiner `nn` avec le pipeline zoom+cascade déjà
+validé (Phase 6B), pour voir si les gains se cumulent.** Comme
+`run_cascade()`/`run_match_at_resolution()` transmettent déjà l'objet
+`args` complet, aucun changement de plomberie nécessaire — seuls
+`--correspondence_mode {grid,nn}` et `--contact_eps` ont été ajoutés en
+CLI passthrough à `phase6b_pipeline_check.py` (GT) et
+`phase6b_pipeline_thresh03_check.py` (CNN/thresh0.3), défaut `grid`
+(rétrocompatible). Prochaine action : relancer `phase6b_pipeline_check.py`
+(GT, oracle-first) avec `--correspondence_mode nn`, comparer à la
+baseline `grid` du 2026-07-22 (éligibilité 80.7%, Pose@30 stage1+2
+38.7%), puis seulement si concluant, la version thresh0.3.

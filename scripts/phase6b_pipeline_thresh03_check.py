@@ -94,6 +94,13 @@ def main():
     parser.add_argument("--normal_dot_thresh", type=float, default=-0.3)
     parser.add_argument("--success_rot_thresh", type=float, default=5.0)
     parser.add_argument("--success_trans_thresh", type=float, default=0.02)
+    parser.add_argument("--correspondence_mode", default="grid", choices=["grid", "nn"],
+                        help="'nn' = plus-proche-voisin continu (2026-07-23, "
+                             "build_correspondences_nn) au lieu de la coïncidence de grille "
+                             "après arrondi -- transmis tel quel à run_match_at_resolution via "
+                             "l'objet args (aucun changement requis dans run_cascade).")
+    parser.add_argument("--contact_eps", type=float, default=0.05,
+                        help="Tolérance de proximité pour --correspondence_mode nn.")
     parser.add_argument("--csv_out", default="")
     parser.add_argument("--summary_json", default="")
     parser.add_argument("--device",      default="cuda" if torch.cuda.is_available() else "cpu")
