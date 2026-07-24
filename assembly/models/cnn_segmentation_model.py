@@ -43,6 +43,7 @@ import torchmetrics
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
+from sklearn.neighbors import NearestNeighbors
 
 from assembly.models.pretraining.loss import dice_loss, tversky_loss, focal_loss, dice_focal_loss
 from assembly.models.projection_3d_to_2d import Project3DTo2D, _normalize_fragment
@@ -388,31 +389,38 @@ def compute_boundary_mask(
     k: int = 5,
 ) -> torch.Tensor:
     """
-    Per-fragment boundary mask, torch/GPU version of analyze_errors.py's
-    `_boundary_mask()`: a point is "boundary" if at least one of its k
-    nearest neighbours (Euclidean, same fragment only) carries a different
-    GT label. Kept numerically identical in definition (k=5 default) so the
-    training-time boundary loss targets the same points the Boundary-F1
-    evaluation metric already measures.
+    Per-fragment boundary mask -- direct port of analyze_errors.py's
+    `_boundary_mask()` (sklearn kd_tree kNN, k=5 default): a point is
+    "boundary" if at least one of its k nearest neighbours (Euclidean, same
+    fragment only) carries a different GT label. Kept bit-for-bit identical
+    in definition to the evaluation-time Boundary-F1 metric so the training
+    loss targets exactly the same points.
+
+    Runs on CPU via sklearn (no_grad, GT-based -- cheap relative to a
+    training step). A first version used torch.cdist on GPU for an O(n^2)
+    distance matrix per fragment; with num_points_to_sample=5000 and dozens
+    of fragments per batch this OOM'd on the lab's 7.6 GB GPUs (single
+    allocation attempts in the multi-GB range). kd_tree kNN avoids the dense
+    pairwise matrix entirely and is what the reference metric already uses.
     """
     device = points_xyz_flat.device
+    xyz_np_all = points_xyz_flat.detach().cpu().numpy()
+    gt_np_all  = gt_flat.detach().cpu().numpy()
     masks = []
     offset = 0
     for n in frag_sizes:
         n = int(n)
-        if n <= 1:
+        if n <= k:
             masks.append(torch.zeros(n, dtype=torch.bool, device=device))
             offset += n
             continue
-        xyz = points_xyz_flat[offset:offset + n]
-        gt  = gt_flat[offset:offset + n]
-        k_eff = min(k, n - 1)
-        dists = torch.cdist(xyz, xyz)
-        dists.fill_diagonal_(float("inf"))
-        knn_idx = dists.topk(k_eff, largest=False).indices        # (n, k_eff)
-        neighbor_labels = gt[knn_idx]                              # (n, k_eff)
-        boundary = (neighbor_labels != gt.unsqueeze(1)).any(dim=1)
-        masks.append(boundary)
+        xyz = xyz_np_all[offset:offset + n]
+        gt  = gt_np_all[offset:offset + n]
+        nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="kd_tree").fit(xyz)
+        _, idxs = nbrs.kneighbors(xyz)
+        neighbor_labels = gt[idxs[:, 1:]]                          # (n, k) -- drop self
+        boundary = (neighbor_labels != gt[:, None]).any(axis=1)
+        masks.append(torch.from_numpy(boundary).to(device))
         offset += n
     return torch.cat(masks, dim=0) if masks else torch.zeros(0, dtype=torch.bool, device=device)
 
