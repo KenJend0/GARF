@@ -382,6 +382,22 @@ def main():
 
     if args.summary_json:
         Path(args.summary_json).parent.mkdir(parents=True, exist_ok=True)
+        precision_recall = {}
+        if pr_rows:
+            succ = [r for r in pr_rows if r["stage1_success"]]
+            fail = [r for r in pr_rows if not r["stage1_success"]]
+            if succ:
+                precision_recall["stage1_success"] = {
+                    "n": len(succ),
+                    "precision_min_mean": float(np.mean([r["precision_min"] for r in succ])),
+                    "recall_min_mean": float(np.mean([r["recall_min"] for r in succ])),
+                }
+            if fail:
+                precision_recall["stage1_fail"] = {
+                    "n": len(fail),
+                    "precision_min_mean": float(np.mean([r["precision_min"] for r in fail])),
+                    "recall_min_mean": float(np.mean([r["recall_min"] for r in fail])),
+                }
         with open(args.summary_json, "w") as f:
             json.dump({
                 "config": vars(args), "n_pairs_stage2": n, "n_2frag_seen": n_seen_2frag,
@@ -389,6 +405,7 @@ def main():
                 "stage1_only": {"pose_30": 100*s1_p30/n, "pose_15": 100*s1_p15/n},
                 "stage1_plus_stage2": {"pose_30": 100*f_p30/n, "pose_15": 100*f_p15/n,
                                        "strict_success": 100*f_strict/n},
+                "precision_recall_cnn_vs_gt": precision_recall,
             }, f, indent=2)
         print(f"JSON résumé sauvegardé : {args.summary_json}")
 
