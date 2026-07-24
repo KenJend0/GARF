@@ -143,6 +143,7 @@ def main():
     model.to(device)
 
     rows = []
+    pr_rows = []
     n_seen_2frag = 0
     n_zoom_failed = 0
     n_stage1_failed = 0
@@ -234,6 +235,27 @@ def main():
             if n_min_raw < max(ABS_MIN_POINTS, 50):
                 continue   # tranche <50 mise de côté (2026-07-22), structurellement dure
 
+            # ── Précision/rappel du masque CNN vs GT (2026-07-22, suite au test
+            # --cluster_baseline négatif) : le clustering seul ne referme pas
+            # l'écart d'éligibilité CNN vs GT -- teste si c'est la qualité
+            # intrinsèque du masque (pas sa dispersion spatiale) qui est en cause.
+            # `fracture_surface_gt` est indexé DIRECTEMENT (pas via
+            # extract_fragment_list, qui suppose un tenseur (B,P,N,3) -- ce
+            # label est (B,P,N), pas de canal xyz), même convention que
+            # phase5a_zoom_resample_thresh03_check.py / phase6a. ─────────────
+            fracture_gt_np = batch["fracture_surface_gt"].numpy()   # (1, P, N)
+            true0 = fracture_gt_np[0, p0] == 1
+            true1 = fracture_gt_np[0, p1] == 1
+            tp0, tp1 = int(np.sum(mask0 & true0)), int(np.sum(mask1 & true1))
+            precision0 = tp0 / max(int(mask0.sum()), 1)
+            precision1 = tp1 / max(int(mask1.sum()), 1)
+            recall0 = tp0 / max(int(true0.sum()), 1)
+            recall1 = tp1 / max(int(true1.sum()), 1)
+            pr_precision_min = min(precision0, precision1)
+            pr_recall_min = min(recall0, recall1)
+            pr_precision_mean = (precision0 + precision1) / 2
+            pr_recall_mean = (recall0 + recall1) / 2
+
             if args.cluster_baseline:
                 frac_i_base = raw0[mask0][cluster_mask0]
                 frac_j_base = raw1[mask1][cluster_mask1]
@@ -269,6 +291,11 @@ def main():
             frac_j_zoom = np.concatenate([frac_j_base, new_j_input], axis=0)
 
             stage1_res = run_cascade(frac_i_zoom, frac_j_zoom, R_ij_gt, t_ij_gt, args)
+            pr_rows.append({
+                "precision_min": pr_precision_min, "recall_min": pr_recall_min,
+                "precision_mean": pr_precision_mean, "recall_mean": pr_recall_mean,
+                "stage1_success": stage1_res["reached_stage"] == "pose_computed",
+            })
             if stage1_res["reached_stage"] != "pose_computed":
                 n_stage1_failed += 1
                 continue
@@ -323,6 +350,27 @@ def main():
     print(f"  {'Succès strict (5°/0.02)':<30} {'—':>14} {100*f_strict/n:>11.1f}%")
     print(f"\n  Rappel : {n}/{n_total_attempted} objets 2-frags vus "
           f"({100*n/max(n_total_attempted,1):.1f}%) atteignent l'étage 2.")
+
+    # ── Précision/rappel du masque CNN vs GT, succès vs échec étage 1 (2026-07-22,
+    # suite au test --cluster_baseline négatif) : la qualité intrinsèque du
+    # masque discrimine-t-elle succès/échec, ou est-ce ailleurs ? ──────────────
+    if pr_rows:
+        succ = [r for r in pr_rows if r["stage1_success"]]
+        fail = [r for r in pr_rows if not r["stage1_success"]]
+        print("\nPRÉCISION/RAPPEL DU MASQUE CNN vs GT (succès vs échec étage 1) :")
+        header = f"  {'':<20} {'N':>6} {'Precision(min)':>15} {'Recall(min)':>13}"
+        print(header)
+        for label, group in [("Étage 1 RÉUSSIT", succ), ("Étage 1 ÉCHOUE", fail)]:
+            if not group:
+                print(f"  {label:<20} {'—':>6}")
+                continue
+            pmin = np.mean([r["precision_min"] for r in group])
+            rmin = np.mean([r["recall_min"] for r in group])
+            print(f"  {label:<20} {len(group):>6} {100*pmin:>14.1f}% {100*rmin:>12.1f}%")
+        print("(Lecture : si Precision/Recall sont nettement plus bas sur 'échoue' que sur\n"
+              " 'réussit', la qualité du masque CNN (pas sa dispersion spatiale, déjà écartée\n"
+              " par --cluster_baseline) explique l'écart d'éligibilité CNN vs GT. Si les deux\n"
+              " groupes sont proches, le problème est ailleurs -- pas le masque lui-même.)")
 
     if args.csv_out:
         Path(args.csv_out).parent.mkdir(parents=True, exist_ok=True)

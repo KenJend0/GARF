@@ -3181,3 +3181,26 @@ les mêmes paires qu'avec l'option désactivée. Résultat pas encore lancé —
 prochaine action : relancer avec `--cluster_baseline` et comparer
 l'éligibilité étage 1 (cible : se rapprocher de 80.7%, le niveau GT).
 Ensuite seulement : points 2a/2b du plan.
+
+**Résultat (2026-07-22, N=721 avec `--cluster_baseline`) — hypothèse
+RÉFUTÉE.** Éligibilité quasiment inchangée (721/1008 ≈ 71.5% contre 71.0%
+sans clustering du baseline — dans le bruit), et la précision **se
+dégrade** (`Pose@30` étage1+2 : 24.0%→17.1%, `Pose@15` : 19.7%→13.5%,
+succès strict : 14.1%→9.3%). Le clustering du masque baseline retire
+autant de vrais points utiles que de bruit dispersé, sans gain net — donc
+ce n'est PAS la dispersion spatiale des faux positifs qui explique l'écart
+CNN (71%) vs GT (80.7%) sur la même tranche `≥50`.
+
+**Diagnostic suivant, décidé avec l'utilisateur : précision/rappel du
+masque CNN vs GT (qualité intrinsèque, pas dispersion spatiale).**
+Implémenté directement dans `phase6b_pipeline_thresh03_check.py` (pas de
+nouveau script) : calcule `precision`/`recall` du masque `thresh0.3` par
+rapport au label `fracture_surface_gt` (déjà dans le batch `uniform`, tous
+deux alignés index-à-index), pour CHAQUE paire (succès ET échec étage 1,
+pas seulement celles atteignant l'étage 2 comme le reste du script).
+Nouvelle table **PRÉCISION/RAPPEL DU MASQUE CNN vs GT (succès vs échec
+étage 1)** — compare les moyennes de `precision_min`/`recall_min` (le côté
+le plus pauvre de la paire) entre le groupe qui réussit l'étage 1 et celui
+qui échoue. Résultat pas encore lancé — prochaine action : relancer et
+lire cette table (si les deux groupes ont une précision/rappel proches, le
+problème est ailleurs que la qualité du masque lui-même).
