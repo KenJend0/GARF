@@ -3243,3 +3243,39 @@ ou une vraie non-coïncidence géométrique du dataset (distinction à faire
 par un test de sensibilité à la densité, en suivi).
 
 **Prochaine action : lancer les deux diagnostics 2a et 2b sur le serveur.**
+
+**Résultat 2b (2026-07-22, N=1483) — CONCLUSIF, clarifie tout : le plafond
+~0.7 était un pur artefact de grille, pas un problème réel.**
+`overlap_frac_continuous` moyenne = **99.99%**, médiane = **100%**. Sans
+discrétisation en grille, les deux faces de la fracture coïncident quasiment
+parfaitement à la vraie pose — exactement ce qu'on attendait théoriquement.
+Ni bruit d'échantillonnage ni non-coïncidence géométrique du dataset : la
+perte venait de `build_correspondences()` qui exige une coïncidence de case
+de grille EXACTE après rotation/arrondi, perdant du signal qui existe
+pourtant réellement dans les données. **Piste d'amélioration concrète pour
+plus tard : remplacer la correspondance par case de grille par un
+appariement plus-proche-voisin direct sur les points** — récupérerait
+probablement des correspondances valides aujourd'hui perdues par
+arrondi/discrétisation, indépendamment de la résolution choisie.
+
+**Résultat 2a (2026-07-22, N=1475, N=488 dur / N=987 facile) — infirme
+l'hypothèse SOM, dans le sens INVERSE de ce qui était attendu.**
+```
+                    planarity_mean (médiane)
+Tranche difficile        0.023
+Reste du dataset         0.087
+```
+La tranche difficile est PLUS PLATE que le reste, pas plus courbée.
+Nuance méthodologique probable : avec très peu de points (définition même
+de la tranche `<50`), la planéité PCA est biaisée statistiquement vers
+"plat" (un petit échantillon a moins de chances de révéler une vraie
+courbure) — possiblement pas un vrai signal géométrique, un artefact de la
+sparsité elle-même. Dans tous les cas : **aucun argument pour investir dans
+la SOM** sur cette population — la difficulté de la tranche `<50` est liée
+à la sparsité, pas à la courbure.
+
+**Conclusion des points 2a/2b :** SOM écartée (pas justifiée par les
+données) ; piste overlap/correspondance (nearest-neighbor au lieu de
+coïncidence de grille) identifiée comme concrète et actionnable pour une
+prochaine itération. Prochaine étape à discuter avec l'utilisateur : point
+3 (visualisations) ou directement prototyper le fix de correspondance.
