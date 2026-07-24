@@ -454,13 +454,23 @@ Suite directe de l'ablation, déjà bien engagée (plan détaillé, tenu à jour
 
 ### Pistes secondaires sur le CNN seul (si on y revient)
 
-- **Step 16 — Boundary Loss**, si le gap de Boundary F1 doit encore être réduit :
-  ```python
-  Loss = 0.4 × Focal + 0.4 × Dice + 0.2 × Boundary
-  # Boundary : BCE uniquement sur les points frontière (kNN k=5)
-  ```
 - **Résolution adaptative**, critère basé sur l'analyse occupancy (proba ∈ [0.4, 0.6] + faible occupancy + forte courbure) — gain marginal probable après Step 15, pas prioritaire.
 - Reproduire Step 15 avec une seed différente pour vérifier la stabilité du résultat (un seul run pour l'instant).
+
+### Deux chantiers de fine-tuning identifiés (2026-07-23, motivés par le matching géométrique — Phase 7 de `PLAN_REASSEMBLY_MODULE.md`)
+
+Le pipeline de depth-map matching en aval (voir `PLAN_REASSEMBLY_MODULE.md`, Phase 7) a révélé un écart marqué entre GT et CNN (`thresh0.3`) : éligibilité étage 1 = 99.1% en GT contre 62.6% en CNN, Pose@30 global = 37.6% contre 14.7% — sur les MÊMES paires, avec le MÊME pipeline de matching. Trois tentatives de mitigation côté pipeline (`dominant_cluster_mask`, `compute_pca_frame_robust`, `remove_tiny_clusters_mask`) ont toutes échoué (net-négatif ou neutre) : l'écart n'est pas réparable en aval, il vient de la qualité du masque CNN lui-même. Diagnostic quantitatif sur tout le split val (`phase7_isolated_fp_prevalence_check.py`, 7490 fragments) : deux causes distinctes, de poids très inégal.
+
+1. **Précision de frontière** (85.3% du volume de faux positifs). Rejoint directement la piste "Step 16 — Boundary Loss" déjà envisagée mais jamais lancée :
+   ```python
+   Loss = 0.4 × Focal + 0.4 × Dice + 0.2 × Boundary
+   # Boundary : BCE uniquement sur les points frontière (kNN k=5)
+   ```
+   Le diagnostic géométrique (angle complètement différent, motivé par le matching plutôt que par le F1) confirme indépendamment que c'est le bon chantier.
+
+2. **Amas isolés de faux positifs** (14.7% du volume de FP seulement, mais 56.1% des fragments en ont au moins un, et leur précision est nettement plus basse : 60.4% pour le bruit isolé / 72.7% pour les clusters secondaires, contre 88.2% pour le cluster principal). C'est un angle mort des métriques de segmentation classiques (F1, Boundary F1 global) : un amas de 10 points sur 5000 ne bouge quasiment pas le F1 fragment-level, mais suffit à biaiser le repère PCA du matching géométrique en aval et faire échouer toute la cascade. Deux masques au même F1 peuvent donc avoir un comportement radicalement différent pour le réassemblage, selon que leurs erreurs sont concentrées en frontière (chantier 1, inoffensif pour le matching) ou dispersées en amas isolés (chantier 2, ce qui casse spécifiquement le matching). Piste concrète : un terme de loss de cohérence spatiale (pénaliser les composantes connexes prédites positives loin du reste de la fracture), en complément de la boundary loss — pas redondant, cible une population de points différente.
+
+**Ces deux chantiers ne sont pas interchangeables** : chacun cible une population de points distincte (frontière du cluster principal vs amas séparés), identifiée par un diagnostic géométrique que les métriques de segmentation seules n'auraient pas révélé.
 
 ---
 
