@@ -3201,6 +3201,23 @@ pas seulement celles atteignant l'étage 2 comme le reste du script).
 Nouvelle table **PRÉCISION/RAPPEL DU MASQUE CNN vs GT (succès vs échec
 étage 1)** — compare les moyennes de `precision_min`/`recall_min` (le côté
 le plus pauvre de la paire) entre le groupe qui réussit l'étage 1 et celui
-qui échoue. Résultat pas encore lancé — prochaine action : relancer et
-lire cette table (si les deux groupes ont une précision/rappel proches, le
-problème est ailleurs que la qualité du masque lui-même).
+qui échoue.
+
+**Résultat (2026-07-22, N=716 réussit / N=293 échoue) — hypothèse
+CONFIRMÉE, referme l'investigation sur l'écart d'éligibilité.**
+```
+                     N     Precision(min)   Recall(min)
+Étage 1 RÉUSSIT    716          83.9%          93.1%
+Étage 1 ÉCHOUE     293          62.1%          81.3%
+```
+Écart net et cohérent sur les deux métriques (-21.8pp précision, -11.8pp
+rappel). Confirme que l'écart d'éligibilité CNN (71%) vs GT (80.7%) vient
+de la QUALITÉ INTRINSÈQUE de la segmentation sur ces paires précises — pas
+de sa dispersion spatiale (déjà écartée par `--cluster_baseline`), pas du
+pipeline de matching en aval (clustering/zoom/résolution déjà validés).
+Pas catastrophique non plus (81.3% de rappel en échec, pas 20%) — une
+dégradation modérée mais suffisante pour faire basculer la cascade.
+**Implication : cet écart ne se corrige pas en retouchant le pipeline de
+matching — il faudrait améliorer la segmentation du CNN elle-même sur ces
+cas, ou accepter la limite.** Investigation refermée, retour au plan :
+points 2a/2b (courbure vs tranche difficile, overlap maillage-à-maillage).
