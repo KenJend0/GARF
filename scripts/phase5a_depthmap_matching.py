@@ -80,6 +80,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from scipy.ndimage import rotate as ndimage_rotate, binary_dilation, gaussian_filter
+from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation as R_scipy
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -436,6 +437,79 @@ def build_correspondences(
     return pts_i, pts_j
 
 
+def build_correspondences_nn(
+    frac_i, c_i, u_i, v_i,
+    frac_j, c_j, u_j, v_j,
+    u_min_i, v_min_i, u_min_j, v_min_j,
+    pixel_size, resolution, best_theta, best_shift,
+    contact_eps=0.05,
+):
+    """Construit les correspondances 3D à partir de l'alignement 2D trouvé par
+    `match_depthmaps`, via un appariement PLUS-PROCHE-VOISIN CONTINU dans le
+    plan (u,v) de j -- PAS une coïncidence de case de grille après arrondi
+    (`build_correspondences` ci-dessus).
+
+    Motivation (2026-07-22, `phase7_overlap_ceiling_check.py`) : à la VRAIE
+    pose GT, l'overlap continu (distance au plus proche voisin, sans grille)
+    est quasi parfait (moyenne 99.99%, médiane 100%, N=1483) -- alors que le
+    même overlap mesuré par rasterisation en grille plafonnait à ~0.7-0.76
+    (2026-07-20) et se dégradait encore avec la résolution (0.989 à R=24,
+    0.404 à R=128, 2026-07-21). Ce n'est donc PAS un problème réel du
+    dataset : `build_correspondences` original exige qu'après rotation/
+    translation, la case cible (arrondie à l'entier le plus proche) soit
+    occupée -- perdant tout point dont la vraie correspondance tombe à
+    quelques dixièmes de pixel d'une frontière de case. Cette version évite
+    l'arrondi entièrement : recherche du plus proche voisin CONTINU dans
+    le plan (u,v), avec une tolérance physique absolue (`contact_eps`,
+    même convention que Phase 0/2B) au lieu d'un seuil en pixels.
+
+    Le flip de normale (`best_flip`) n'affecte QUE l'interprétation de la
+    profondeur PENDANT LA RECHERCHE (`match_depthmaps`, pour corréler les
+    profondeurs) -- pas les coordonnées (u,v) utilisées ici. Comme cette
+    fonction travaille directement sur les VRAIS points 3D de `frac_i`/
+    `frac_j` (pas une reconstruction via profondeur+uv comme la version
+    grille), Kabsch retrouve la bonne transformation rigide sans traitement
+    spécial du flip -- les points 3D appariés sont réels, peu importe la
+    convention de signe de la normale utilisée pendant la recherche.
+
+    Retourne (pts_i_3d, pts_j_3d) ou (None, None) si moins de 3
+    correspondances dans la tolérance `contact_eps`.
+    """
+    sy, sx = best_shift
+    theta_rad = best_theta * np.pi / 180.0
+    cos_neg = np.cos(-theta_rad)
+    sin_neg = np.sin(-theta_rad)
+    half = resolution / 2.0
+
+    ci = frac_i - c_i
+    cols_i = ((ci @ u_i) - u_min_i) / pixel_size   # continu, PAS d'arrondi
+    rows_i = ((ci @ v_i) - v_min_i) / pixel_size
+
+    rows_jr = rows_i + sy
+    cols_jr = cols_i + sx
+    cx = cols_jr - half
+    cy = rows_jr - half
+    cols_j_orig = half + cos_neg * cx - sin_neg * cy
+    rows_j_orig = half + sin_neg * cx + cos_neg * cy
+
+    uc_j_pred = u_min_j + cols_j_orig * pixel_size
+    vc_j_pred = v_min_j + rows_j_orig * pixel_size
+
+    cj = frac_j - c_j
+    u_coord_j = cj @ u_j
+    v_coord_j = cj @ v_j
+
+    tree_j = cKDTree(np.stack([u_coord_j, v_coord_j], axis=1))
+    query = np.stack([uc_j_pred, vc_j_pred], axis=1)
+    dists, idx = tree_j.query(query)
+
+    keep = dists < contact_eps
+    if int(keep.sum()) < 3:
+        return None, None
+
+    return frac_i[keep], frac_j[idx[keep]]
+
+
 # ── Boucle principale ─────────────────────────────────────────────────────────
 
 def planarity_stratification(planarity, rot_err, pose30, pose15):
@@ -636,11 +710,26 @@ def run_match_at_resolution(frac_i, c_i, u_i, v_i, n_i,
     best_score, best_theta, best_shift, best_flip, best_overlap_frac = match_depthmaps(
         dmap_i, valid_i, dmap_j, valid_j, n_angles, score_mode=args.score_mode)
 
-    pts_i3, pts_j3 = build_correspondences(
-        dmap_i, valid_i, c_i, u_i, v_i, n_i, u_min_i, v_min_i,
-        dmap_j, valid_j, c_j, u_j, v_j, n_j, u_min_j, v_min_j,
-        pixel_size, best_theta, best_shift, best_flip,
-    )
+    # `correspondence_mode` (2026-07-22) : "grid" (défaut, comportement historique
+    # inchangé) ou "nn" (plus-proche-voisin continu, cf. build_correspondences_nn --
+    # corrige la perte de signal identifiée par phase7_overlap_ceiling_check.py :
+    # overlap continu ~100% à la vraie pose GT, contre ~0.7 mesuré par grille).
+    # `getattr` avec valeur par défaut : les scripts qui n'exposent pas ces
+    # options (tous les scripts Phase 7 existants) gardent le comportement
+    # "grid" sans aucun changement.
+    if getattr(args, "correspondence_mode", "grid") == "nn":
+        pts_i3, pts_j3 = build_correspondences_nn(
+            frac_i, c_i, u_i, v_i, frac_j, c_j, u_j, v_j,
+            u_min_i, v_min_i, u_min_j, v_min_j,
+            pixel_size, resolution, best_theta, best_shift,
+            contact_eps=getattr(args, "contact_eps", 0.05),
+        )
+    else:
+        pts_i3, pts_j3 = build_correspondences(
+            dmap_i, valid_i, c_i, u_i, v_i, n_i, u_min_i, v_min_i,
+            dmap_j, valid_j, c_j, u_j, v_j, n_j, u_min_j, v_min_j,
+            pixel_size, best_theta, best_shift, best_flip,
+        )
     if pts_i3 is None or len(pts_i3) < 3:
         return {"skip": "no_overlap_3d"}
 
@@ -921,6 +1010,16 @@ def main():
                         help="relief = formule d'origine (buggée, garde-fou overlap>0.5px) ; "
                              "overlap_only = contour seul, sans relief (teste l'hypothèse "
                              "contour-suffit) ; joint = fix, relief_score * overlap_frac.")
+    parser.add_argument("--correspondence_mode", default="grid", choices=["grid", "nn"],
+                        help="'grid' (défaut, historique) : build_correspondences original, "
+                             "coïncidence de case après arrondi. 'nn' (2026-07-22) : "
+                             "build_correspondences_nn, plus-proche-voisin CONTINU dans le "
+                             "plan (u,v) -- corrige la perte de signal identifiée par "
+                             "phase7_overlap_ceiling_check.py (overlap continu ~100% à la "
+                             "vraie pose GT, contre ~0.7 mesuré par grille).")
+    parser.add_argument("--contact_eps", type=float, default=0.05,
+                        help="Tolérance physique absolue pour accepter une correspondance en "
+                             "mode 'nn' (même convention que Phase 0/2B). Ignoré en mode 'grid'.")
     parser.add_argument("--dilate_px", type=int, default=0,
                         help="Dilate le masque `valid` de N pixels dans le pipeline réel "
                              "(recherche + score), pas seulement le diagnostic oracle. "

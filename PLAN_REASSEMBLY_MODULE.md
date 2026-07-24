@@ -3279,3 +3279,26 @@ données) ; piste overlap/correspondance (nearest-neighbor au lieu de
 coïncidence de grille) identifiée comme concrète et actionnable pour une
 prochaine itération. Prochaine étape à discuter avec l'utilisateur : point
 3 (visualisations) ou directement prototyper le fix de correspondance.
+
+**Décision utilisateur : prototyper le fix de correspondance maintenant.**
+Implémenté : `build_correspondences_nn()` dans `phase5a_depthmap_matching.py`
+— reproduit exactement la même transformation 2D (rotation + translation
+trouvée par `match_depthmaps`, inchangée) que `build_correspondences`
+original, mais résout la correspondance par **plus-proche-voisin continu**
+(`cKDTree` dans le plan (u,v) aligné, tolérance physique absolue
+`contact_eps`, même convention que Phase 0/2B) au lieu d'une coïncidence de
+case de grille après arrondi. Le flip de normale n'affecte que
+l'interprétation de profondeur PENDANT la recherche, pas les coordonnées
+(u,v) utilisées ici — pas de traitement spécial nécessaire, les points 3D
+appariés sont réels dans les deux cas.
+
+Câblé dans `run_match_at_resolution()` via `getattr(args, "correspondence_mode",
+"grid")` — rétrocompatible : tous les scripts existants (qui n'exposent pas
+cette option) gardent le comportement "grid" inchangé. Nouveaux flags
+`--correspondence_mode {grid,nn}` / `--contact_eps` ajoutés à
+`phase5a_depthmap_matching.py`. **Testable directement via l'infrastructure
+`--pose_resolution_sweep` déjà existante** (passe par `run_match_at_resolution`
+avec `args` inchangé) — pas besoin de toucher au chemin principal
+`process_pair` ni d'écrire un nouveau script. Résultat pas encore lancé —
+prochaine action : comparer `--correspondence_mode grid` vs `nn` sur le
+même sweep de résolution, stratégie `gt` (oracle-first).
