@@ -103,11 +103,23 @@ data:
   # le pic memoire depend de la COMPOSITION du batch (nombre de fragments par
   # objet, jusqu'a max_parts=20), donc un batch "malchanceux" avec beaucoup
   # d'objets multi-fragments peut arriver n'importe quand, pas seulement au
-  # step 1. Descendu a batch_size=8 + accumulate_grad_batches=4 (cf. trainer
-  # ci-dessous) pour retrouver le meme batch EFFECTIF que Step15 (32) au
-  # niveau du gradient, avec une marge de securite plus large sur le pic.
-  batch_size: 8
+  # step 1 -- confirme empiriquement : batch_size=16 a tenu 7 steps, puis
+  # batch_size=8 (+ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True) a tenu
+  # toute l'epoch 0 + validation + une partie de l'epoch 1 avant d'OOM en
+  # tout debut d'epoch 2 -- un batch "malchanceux" peut survenir n'importe
+  # quand, pas seulement en debut de run. Descendu a batch_size=4 +
+  # accumulate_grad_batches=8 (cf. trainer ci-dessous) pour retrouver le
+  # meme batch EFFECTIF que Step15 (32) au niveau du gradient.
+  #
+  # Limite theorique : un seul objet peut deja contenir jusqu'a max_parts=20
+  # fragments, donc meme batch_size=1 n'elimine pas totalement le risque
+  # (K=20 fragments dans un seul objet). Si l'OOM persiste a batch_size=4,
+  # la prochaine piste n'est PAS de redescendre encore (rendements
+  # decroissants) mais de chunker le forward CNN lui-meme sur la dimension K
+  # (comme _knn_indices_batched dans hybrid_geometry_features.py), plutot
+  # que de continuer a reduire le batch_size objet.
+  batch_size: 4
 
 trainer:
   max_epochs: 30   # fine-tuning court depuis Step 15 deja converge
-  accumulate_grad_batches: 4   # batch effectif 8x4=32, cf. rationale data.batch_size ci-dessus
+  accumulate_grad_batches: 8   # batch effectif 4x8=32, cf. rationale data.batch_size ci-dessus
