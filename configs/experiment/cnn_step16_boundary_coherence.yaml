@@ -95,16 +95,19 @@ data:
   categories: ["everyday"]
   weight_hard_examples: true
   # batch_size=32 (heritage de cnn_ablation_shared) OOM sur les GPU 7.6 Go du
-  # labo pendant la backward du decoder U-Net -- 7.44/7.61 Go deja utilises
-  # par le forward seul, meme AVANT tout ajout Step16 (boundary/coherence
-  # loss n'ajoutent que quelques Mo, cf. commits precedents). Ce n'est donc
-  # pas specifique a Step16 : Step15 a du tourner sur un GPU avec plus de
-  # VRAM, ou etre plus proche de la marge qu'on ne le pensait. Reduit ici a
-  # batch_size=16 + accumulate_grad_batches=2 pour retrouver le meme batch
-  # EFFECTIF que Step15 (32) au niveau du gradient, tout en divisant par ~2
-  # le pic de memoire d'activation du forward/backward.
-  batch_size: 16
+  # labo (Quadro RTX 4000, 8 Go, ~7.61 Go utilisables) pendant la backward du
+  # decoder U-Net. Pas specifique a Step16 : le forward CNN de base (identique
+  # a Step15) est deja a la limite sur ce GPU, mes ajouts (boundary/coherence
+  # loss, quelques Mo) n'ont fait que faire deborder une marge deja quasi
+  # nulle. Un premier essai a batch_size=16 a tenu 7 steps avant d'OOM --
+  # le pic memoire depend de la COMPOSITION du batch (nombre de fragments par
+  # objet, jusqu'a max_parts=20), donc un batch "malchanceux" avec beaucoup
+  # d'objets multi-fragments peut arriver n'importe quand, pas seulement au
+  # step 1. Descendu a batch_size=8 + accumulate_grad_batches=4 (cf. trainer
+  # ci-dessous) pour retrouver le meme batch EFFECTIF que Step15 (32) au
+  # niveau du gradient, avec une marge de securite plus large sur le pic.
+  batch_size: 8
 
 trainer:
   max_epochs: 30   # fine-tuning court depuis Step 15 deja converge
-  accumulate_grad_batches: 2   # batch effectif 16x2=32, cf. rationale data.batch_size ci-dessus
+  accumulate_grad_batches: 4   # batch effectif 8x4=32, cf. rationale data.batch_size ci-dessus
