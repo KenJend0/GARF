@@ -36,13 +36,15 @@ Usage (sur le serveur) :
         --categories everyday --split val --max_batches 3000 \\
         --out /tmp/student7/phase8_dataset_gt_val.npz
 
-    # Condition réelle (CNN thresh0.3), split train pour l'entraînement,
-    # val pour la validation -- lancer les deux :
+    # Condition réelle (CNN thresh0.3) -- les meshes ne sont conservés que
+    # dans val/test (pas train, supprimé pour la mémoire) : utiliser
+    # 'test' comme ensemble d'ENTRAÎNEMENT du régresseur et 'val' comme
+    # validation (pas de fuite, deux splits distincts) :
     CUDA_VISIBLE_DEVICES=1 python scripts/phase8_build_regressor_dataset.py \\
         --strategy thresh03 --ckpt output/cnn_step15_final_model/last.ckpt \\
         --data_root /storage/student7/teyssir/data/breaking_bad_vol.hdf5 \\
         --experiment cnn_step15_final_model \\
-        --categories everyday --split train --max_batches 0 \\
+        --categories everyday --split test --max_batches 0 \\
         --out /tmp/student7/phase8_dataset_thresh03_train.npz
 
     CUDA_VISIBLE_DEVICES=1 python scripts/phase8_build_regressor_dataset.py \\
@@ -139,7 +141,12 @@ def main():
     parser.add_argument("--data_root",   required=True)
     parser.add_argument("--experiment",  required=True)
     parser.add_argument("--categories",  default="everyday")
-    parser.add_argument("--split",       default="val", choices=["train", "val", "test"])
+    parser.add_argument("--split",       default="val", choices=["val", "test"],
+                        help="Nécessite les meshes (conservés en val/test, supprimés en "
+                             "train pour la mémoire) -- pas de choix 'train', cf. même "
+                             "convention que phase6b_pipeline_check.py. Utiliser 'test' "
+                             "comme ensemble d'ENTRAÎNEMENT du régresseur et 'val' comme "
+                             "validation (pas de fuite -- deux splits distincts).")
     parser.add_argument("--seed",        type=int, default=42)
     parser.add_argument("--threshold",   type=float, default=0.3)
     parser.add_argument("--extra_budget", type=int, default=1200)
@@ -169,9 +176,8 @@ def main():
         cfg = load_config_and_model(fake_args)
         cfg.data.num_points_to_sample = args.num_points_to_sample
         datamodule = instantiate(cfg.data)
-        datamodule.setup("fit" if args.split != "test" else "test")
-        dataset = datamodule.val_dataset if args.split == "val" else (
-            datamodule.train_dataset if args.split == "train" else datamodule.test_dataset)
+        datamodule.setup("fit" if args.split == "val" else "test")
+        dataset = datamodule.val_dataset if args.split == "val" else datamodule.test_dataset
 
         from torch.utils.data import DataLoader
         loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0,
@@ -232,9 +238,8 @@ def main():
         )
         cnn_cfg = load_config_and_model(cnn_fake_args)
         cnn_datamodule = instantiate(cnn_cfg.data)
-        cnn_datamodule.setup("fit" if args.split != "test" else "test")
-        cnn_dataset = cnn_datamodule.val_dataset if args.split == "val" else (
-            cnn_datamodule.train_dataset if args.split == "train" else cnn_datamodule.test_dataset)
+        cnn_datamodule.setup("fit" if args.split == "val" else "test")
+        cnn_dataset = cnn_datamodule.val_dataset if args.split == "val" else cnn_datamodule.test_dataset
 
         print("Chargement du dataset mesh (sample_method=weighted) -- meshes uniquement...")
         mesh_fake_args = argparse.Namespace(
@@ -243,9 +248,8 @@ def main():
         )
         mesh_cfg = load_config_and_model(mesh_fake_args)
         mesh_datamodule = instantiate(mesh_cfg.data)
-        mesh_datamodule.setup("fit" if args.split != "test" else "test")
-        mesh_dataset = mesh_datamodule.val_dataset if args.split == "val" else (
-            mesh_datamodule.train_dataset if args.split == "train" else mesh_datamodule.test_dataset)
+        mesh_datamodule.setup("fit" if args.split == "val" else "test")
+        mesh_dataset = mesh_datamodule.val_dataset if args.split == "val" else mesh_datamodule.test_dataset
 
         assert len(cnn_dataset) == len(mesh_dataset)
         cnn_loader = DataLoader(cnn_dataset, batch_size=1, shuffle=False, num_workers=0,
