@@ -3559,3 +3559,174 @@ toutes échoué — un modèle entraîné directement sur les depth maps issues
 du vrai masque CNN (bruité) peut apprendre à être robuste à ce bruit,
 contrairement à la PCA/FFT qui s'est montrée fragile à chaque tentative de
 la rendre plus tolérante.
+
+## Phase 8 — modèle appris sur les depth maps (2026-07-30, CADRAGE)
+
+### Motivation et périmètre
+
+Quatre tentatives consécutives d'améliorer la PRÉCISION DU MASQUE CNN pour
+que la recherche FFT (`match_depthmaps`) fonctionne mieux ont toutes
+échoué : `dominant_cluster_mask`, `compute_pca_frame_robust`,
+`remove_tiny_clusters_mask` (toutes net-négatives ou neutres côté
+pipeline), et Step 16 (boundary+coherence loss, régression confirmée).
+Décision (2026-07-30, avec l'utilisateur) : arrêter d'essayer de nettoyer
+le masque, et remplacer directement le mécanisme de matching fragile
+(recherche exhaustive par corrélation FFT sur `n_angles` rotations +
+score relief/overlap, `match_depthmaps`) par un **modèle appris qui prend
+les deux depth maps en entrée et régresse directement la pose grossière**
+(rotation + translation dans le plan). Motivation centrale : un modèle
+entraîné end-to-end sur les VRAIES depth maps issues du masque `thresh0.3`
+(bruité) peut apprendre à être robuste à ce bruit — chose qu'aucune
+méthode hand-crafted testée jusqu'ici n'a réussi à faire.
+
+**Ce qui NE change PAS** (réutilisé tel quel, déjà validé) :
+- Génération des depth maps : `compute_pca_frame()` (PAS la variante
+  robuste, réfutée) + `rasterize()`, `phase5a_depthmap_matching.py`.
+- Éligibilité en amont : zoom/rééchantillonnage local + cascade de
+  résolution (`phase5a_zoom_resample_check.py`) restent la bonne façon
+  d'obtenir assez de points de fracture — le modèle appris remplace
+  uniquement l'étape "trouver theta/shift", pas tout le pipeline.
+- Reconstruction 3D à partir de (theta, shift) : `build_correspondences_nn`
+  + `kabsch()` — réutilisés SANS modification (cf. ci-dessous, c'est
+  justement ce qui permet de garder ce chantier scopé).
+- Étage 2 (raffinement) : `trimmed_icp_normals`
+  (`phase6a_convergence_basin_check.py`), validé le 2026-07-22, chaîné
+  après la pose grossière exactement comme aujourd'hui.
+- Métriques : `rot_err_deg`, `trans_err`, seuils Pose@30/15/succès strict.
+
+**Ce qui change** : `match_depthmaps()` (recherche FFT + score
+relief/overlap sur `n_angles` rotations discrètes × 2 flips) est remplacé
+par un modèle appris qui prédit directement `(theta, shift_y, shift_x)`
+à partir de `(dmap_i, valid_i, dmap_j, valid_j)`.
+
+**Portée inchangée** (pas une extension) : comme le hand-crafted, ce
+chantier reste scopé aux objets à 2 fragments (`n_seen_2frag`) — un
+fragment touchant plusieurs voisins a ses points de fracture mélangés
+dans un seul masque, un problème de séparation d'interface non résolu ici
+(cf. conclusion Phase 2, section "Nouvelle direction" plus haut dans ce
+document).
+
+### Pourquoi pas de `flip` en sortie du modèle (simplification importante)
+
+Dans `match_depthmaps`, le `flip` (négation du canal profondeur de
+`dmap_j`) existe uniquement parce que la recherche ne connaît pas la
+vraie pose : elle a besoin d'essayer les deux orientations pour savoir si
+la corrélation de profondeur (`CC`) doit être maximisée en phase ou en
+opposition de phase (ambiguïté de signe des vecteurs propres de la PCA —
+`n_i`/`n_j` sont chacun définis à un signe arbitraire près). C'est un
+artefact de la MÉTHODE DE SCORE, pas une ambiguïté géométrique réelle une
+fois qu'on connaît la vraie pose 3D : `build_correspondences_nn` elle-même
+n'utilise JAMAIS le flip (elle ne travaille que sur les coordonnées (u,v),
+jamais sur la profondeur) — vérifié par lecture directe de son code
+(aucun paramètre `flip`). Donc le modèle appris n'a besoin de prédire QUE
+`(theta, shift_y, shift_x)` ; le réseau peut voir les deux canaux de
+profondeur en entrée et apprendre en interne à gérer l'ambiguïté de signe
+sans qu'on ait besoin de l'exposer comme une sortie binaire explicite.
+
+### Génération des labels GT (theta, shift) — dérivation exacte, pas une heuristique
+
+`build_correspondences_nn` applique, pour un point de `frac_i` à la
+position pixel `(cols_i, rows_i)` dans la grille de `i` :
+```
+p_i = (cols_i, rows_i)
+cx, cy = p_i + shift - half        # half = resolution / 2
+p_j = half + Rot(-theta) @ (cx, cy)
+```
+C'est une transformation AFFINE dans le plan pixel : `p_j = M @ p_i + b`
+avec `M = Rot(-theta)` (rotation pure) et
+`b = Rot(-theta) @ (shift - half) + half`.
+
+Pour générer le label GT d'une paire, sans passer par la recherche FFT :
+1. Calcule `(cols_i, rows_i)` = coordonnées pixel de `frac_i` dans SA
+   PROPRE grille (comme dans `build_correspondences_nn`, continu, pas
+   arrondi).
+2. Transforme `frac_i` par la VRAIE pose (`R_ij_gt`, `t_ij_gt`) dans le
+   repère de `j`, projette sur `(u_j, v_j)`, convertit en coordonnées
+   pixel de LA GRILLE DE `j` → `(cols_j_target, rows_j_target)`.
+3. Les deux jeux de points se correspondent point à point (ce sont les
+   mêmes points, juste exprimés différemment) — pas de recherche de
+   correspondance nécessaire. Résout `M, b` par un **Kabsch 2D**
+   (analogue au `kabsch()` 3D déjà dans le code, restreint à 2D,
+   contrainte `det(M)=+1` pour forcer une rotation pure) entre
+   `(cols_i,rows_i)` et `(cols_j_target,rows_j_target)`.
+4. Récupère `theta_gt` depuis `M` (`M = Rot(-theta)` implique
+   `theta_gt = -atan2(M[1,0], M[0,0])`), puis
+   `shift_gt = Rot(theta_gt) @ (b - half) + half` (inverse de la formule
+   ci-dessus).
+
+**Auto-test de cohérence (aller-retour), à faire tourner en LOCAL avant
+tout entraînement** (numpy/scipy pur, pas besoin du serveur) : générer un
+`(theta, shift)` connu, transformer un nuage de points synthétique via la
+formule directe de `build_correspondences_nn`, puis vérifier que l'étape
+ci-dessus retrouve exactement le même `(theta, shift)` à la précision
+numérique près. Si ce test ne passe pas, le modèle serait entraîné sur des
+labels faux — bloquant absolu avant d'écrire le moindre code
+d'entraînement.
+
+### Architecture du modèle
+
+Encodeur CNN siamois léger (poids PARTAGÉS entre les deux branches,
+cohérent avec la philosophie "petit modèle" du CNN de segmentation, 544K
+params) :
+```
+dmap_i, valid_i (2×R×R, depth + validity)  ─┐
+                                              ├─ encodeur CNN partagé (4 conv+pool)
+dmap_j, valid_j (2×R×R, depth + validity)  ─┘         ↓
+                                            f_i (D,), f_j (D,)
+                                                       ↓
+                          concat(f_i, f_j, f_i - f_j, f_i * f_j) ∈ R^(4D)
+                                                       ↓
+                                    MLP(4D → 128 → 64 → 4)
+                                                       ↓
+                          (sin θ, cos θ, shift_y, shift_x)
+```
+`sin`/`cos` plutôt que `theta` brut (évite la discontinuité de
+l'enroulement d'angle) — décodage par `atan2(sin, cos)`. Résolution fixe
+pour ce modèle (ex. 64, à trancher empiriquement, indépendante du
+multi-résolution du hand-crafted — un seul input size fixe pour le CNN).
+
+### Loss
+
+`loss = w_angle * (1 - cos(theta_pred - theta_gt)) + w_shift * MSE(shift_pred, shift_gt)`
+(perte angulaire bornée dans [0,2], pas de wraparound ; MSE simple sur le
+shift, en pixels — cohérent avec la convention pixel de `build_correspondences_nn`).
+
+### Protocole d'entraînement
+
+- Entraîner sur les VRAIES depth maps issues du masque `thresh0.3` du CNN
+  Step 15 (pas GT) — c'est tout l'intérêt : apprendre la robustesse au
+  bruit réel, pas à un cas idéal qui ne représente pas les conditions
+  réelles.
+- Réutiliser le même pipeline de graines/zoom/cascade que
+  `phase6b_pipeline_thresh03_check.py` pour construire `frac_i`/`frac_j`
+  avant rasterisation — pas de nouvelle logique de préparation de points.
+- Split train/val standard du datamodule existant (`everyday`).
+
+### Évaluation — même discipline que tout le reste de la Phase 7
+
+1. Smoke test synthétique (torch, formes/gradients, cas limites) AVANT
+   tout entraînement réel, même schéma que `test_step16_losses.py`.
+2. Comparaison stage-1-seul (Pose@30/15 du modèle appris seul, avant ICP)
+   contre le hand-crafted (`match_depthmaps` + `nn` correspondence) sur
+   les MÊMES paires.
+3. Chaînage avec `trimmed_icp_normals` (étage 2), comparaison finale au
+   meilleur résultat actuel (Step 15 + `nn`) : éligibilité 62.6%, Pose@30
+   global 14.7% (219 paires), succès strict 6.8% (101 paires) — c'est LA
+   barre à dépasser pour que ce chantier soit un succès.
+4. Oracle-first : valider d'abord sur masque GT avant `thresh0.3`, comme
+   toute la Phase 7.
+
+### Fichiers à créer
+
+- `scripts/phase8_depthmap_regressor_dataset.py` : `fit_theta_shift_from_gt()`
+  (dérivation des labels, Kabsch 2D) + auto-test aller-retour + génération
+  de paires (dmap_i, dmap_j, theta_gt, shift_gt) réutilisant
+  `compute_pca_frame`/`rasterize`.
+- `assembly/models/depthmap_pose_regressor.py` : le modèle (encodeur
+  siamois + tête MLP).
+- `scripts/train_depthmap_pose_regressor.py` : boucle d'entraînement.
+- `scripts/test_phase8_regressor.py` : smoke test synthétique du modèle
+  et de la loss (torch, exécutable en local).
+- `scripts/phase8_pipeline_learned_check.py` : évaluation bout-en-bout
+  (remplace `run_cascade` par le modèle appris dans le même squelette que
+  `phase6b_pipeline_thresh03_check.py`), chaînage ICP inclus.
