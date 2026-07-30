@@ -1,0 +1,88 @@
+# @package _global_
+# configs/experiment/cnn_step17_coherence_only.yaml
+#
+# Step 17 — Ablation de Step 16 : spatial coherence loss SEULE, sans boundary loss.
+#
+# Motivation directe : Step 16 (boundary_loss + coherence_loss ensemble,
+# cf. AVANCEES_POST_PRESENTATION.md section 10 / PLAN_REASSEMBLY_MODULE.md)
+# a donne un resultat net-negatif sur le pipeline de matching en aval
+# (Pose@30 absolu -22%, succes strict absolu -19% vs Step 15) MALGRE un
+# succes quasi total de la coherence loss sur sa propre metrique (amas
+# isoles : 56.1%->8.2% des fragments touches).
+#
+# Le signal qui a motive cette ablation : Precision(min) du masque sur les
+# paires qui reussissent l'etage 1 du pipeline de matching s'est effondree
+# (79.6%->65.6%, -14 points) alors que le F1 global et le Boundary F1
+# global sont restes stables/legerement meilleurs (83.2%->84.1%). Hypothese :
+# la coherence loss ne peut supprimer que des faux positifs ISOLES (petits
+# amas deconnectes) -- elle ne peut pas expliquer une degradation de
+# precision LOCALE aussi large. Le boundary_loss, lui, optimise une metrique
+# moyennee sur tous les points frontiere du dataset ; il peut tres bien
+# ameliorer le Boundary F1 GLOBAL tout en elargissant/floutant legerement
+# le masque pres des frontieres de facon locale -- invisible en moyenne,
+# mais couteux precisement la ou le depth-map matching a besoin de
+# frontieres nettes. Le suspect principal est donc boundary_loss, pas
+# coherence_loss.
+#
+# Ce run retire use_boundary_loss (false) et ne garde que use_coherence_loss,
+# tout le reste identique a Step 16 (meme fine-tuning depuis Step 15, memes
+# poids/warmup pour la coherence loss, meme config data/trainer -- deja
+# validee sans OOM sur ce GPU). Si Step 17 recupere une bonne partie du gain
+# du chantier 2 (amas isoles) SANS regresser sur Precision(min)/Pose@30,
+# ca confirme l'hypothese et donne un candidat pour remplacer Step 15.
+
+defaults:
+  - cnn_ablation_shared
+  - _self_
+
+experiment_name: cnn_step17_coherence_only
+tags: ["cnn", "step17", "spatial_coherence", "ablation_step16"]
+
+model:
+  resolution: 128
+  use_normals: true
+  splat_sigma: 1.5
+  use_bilinear: true
+  use_global_context: true
+  use_view_attn: false
+  backbone: unet
+  unet_depth: 4
+  feature_fusion: "max"
+  use_geo_features: true
+  geo_k: 16
+  use_overlap_channels: false
+  use_focal_loss: true
+  focal_gamma: 2.0
+  focal_dice_alpha: 0.5
+  use_point_head: true
+  point_head_feat_dim: 64
+  point_head_hidden_dim: 128
+  lr_point_head_multiplier: 2.0
+  random_rotate: true
+  norm_type: instance
+
+  # Step 17 -- coherence loss SEULE (boundary loss desactivee, cf. rationale ci-dessus)
+  use_boundary_loss: false
+  use_coherence_loss: true
+  coherence_weight: 0.2
+  cluster_eps: 0.02
+  min_cluster_size: 10
+  coherence_warmup_epochs: 2
+  coherence_every_n_steps: 1
+
+  # Fine-tuning depuis Step 15 -- pas from-scratch (meme rationale que Step 16)
+  pretrained_ckpt: output/cnn_step15_final_model/last.ckpt
+
+data:
+  categories: ["everyday"]
+  weight_hard_examples: true
+  # batch_size=4 + accumulate_grad_batches=8 : deja valide sans OOM sur ce
+  # GPU pour Step 16 (cf. rationale complete dans
+  # configs/experiment/cnn_step16_boundary_coherence.yaml). Coherence loss
+  # seule ne change pas le profil memoire (meme cout que dans Step 16), donc
+  # meme reglage repris tel quel plutot que retente a batch_size plus gros.
+  batch_size: 4
+
+trainer:
+  max_epochs: 30   # fine-tuning court depuis Step 15 deja converge
+  accumulate_grad_batches: 8   # batch effectif 4x8=32
