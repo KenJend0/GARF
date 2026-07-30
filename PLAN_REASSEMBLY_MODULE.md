@@ -3408,7 +3408,7 @@ du CNN, pas du pipeline de matching). Prochaine décision à prendre avec
 l'utilisateur : visualisations succès/échec (point 3 du plan) ou pivot
 vers l'amélioration du CNN.
 
-## Step 16 CNN — boundary loss + spatial coherence loss (2026-07-24, EN COURS)
+## Step 16 CNN — boundary loss + spatial coherence loss (2026-07-24 → 2026-07-28, TERMINÉ, résultat net-négatif)
 
 Suite directe du pivot évoqué ci-dessus : le diagnostic géométrique du
 2026-07-23 (`phase7_isolated_fp_prevalence_check.py`, 7490 fragments) a
@@ -3422,7 +3422,7 @@ inégal : imprécision de frontière (85.3% du volume de FP) et amas isolés
 repère PCA du matching même à faible volume). Détail complet du diagnostic
 et du raisonnement dans `AVANCEES_POST_PRESENTATION.md` section 10.
 
-**Implémentation (ce jour, code écrit, PAS encore entraîné/évalué) :**
+**Implémentation :**
 - `assembly/models/cnn_segmentation_model.py` : `forward()` expose
   `frag_sizes`/`points_xyz_flat` (nécessaire pour du kNN/clustering par
   fragment dans `criteria()`) ; deux nouveaux termes de loss ajoutés à
@@ -3432,24 +3432,66 @@ et du raisonnement dans `AVANCEES_POST_PRESENTATION.md` section 10.
   `min_cluster_size=10`, mêmes paramètres que le diagnostic ci-dessus, ne
   pénalise que les points isolés ET GT-négatifs).
 - `configs/experiment/cnn_step16_boundary_coherence.yaml` : fine-tuning
-  DEPUIS Step 15 (`pretrained_ckpt`, pas from-scratch — la coherence loss a
-  besoin de prédictions déjà significatives pour que "composante isolée"
-  ait un sens), + `coherence_warmup_epochs=2`, poids `boundary_weight =
-  coherence_weight = 0.2`, 30 epochs.
-- `scripts/test_step16_losses.py` : smoke test synthétique (formes, cas
-  limites — fragment vide, fragment singleton, batch tout vide) des quatre
-  nouvelles fonctions, à faire tourner sur le serveur avant le run complet
-  (lightning/scipy pas installés en local).
+  DEPUIS Step 15 (`pretrained_ckpt`), `coherence_warmup_epochs=2`, poids
+  `boundary_weight = coherence_weight = 0.2`, 30 epochs.
+- `scripts/test_step16_losses.py` : smoke test synthétique des quatre
+  nouvelles fonctions (formes, cas limites).
 
-**Prochaines actions :**
-1. Lancer `scripts/test_step16_losses.py` sur le serveur (sanity check des
-   helpers avant d'investir 30 epochs).
-2. Lancer l'entraînement Step 16 (`experiment=cnn_step16_boundary_coherence`).
-3. Évaluer à deux niveaux (métriques de segmentation classiques ET le
-   pipeline de matching en aval, PAS juste le F1 — c'est tout l'enjeu de ce
-   chantier) : `analyze_errors.py --geometric --sweep_threshold` vs baseline
-   Step 15 (96.7%/83.2% everyday, 91.5%/75.5% artifact), re-mesure de la
-   prévalence d'amas isolés (`phase7_isolated_fp_prevalence_check.py`,
-   baseline 56.1% fragments touchés), et **le vrai test**
-   `phase6b_pipeline_thresh03_check.py` contre la baseline Step 15 à battre :
-   éligibilité 62.6%, Pose@30 global 14.7%, succès strict ≈6.8%.
+**Trois OOM en cascade au lancement, tous corrigés (cf. commits
+`381059f`/`520b314`/`76cf183`/`09b28f3`/`8b5698c`) :**
+1. `compute_boundary_mask` en `torch.cdist` GPU par fragment (matrice O(n²))
+   → remplacé par `sklearn.neighbors.NearestNeighbors` CPU (même algo que
+   `analyze_errors.py`, plus sûr, kd_tree O(n log n)).
+2. Bug préexistant (Step 9, PAS causé par Step 16) dans `_knn_indices_batched`
+   (`hybrid_geometry_features.py`) : matrice dense `(K, N, N)` pour TOUS les
+   fragments du batch en un seul appel — jamais un problème pour Step 15
+   (batches "chanceux"), explosif ici (jusqu'à 15 Go pour un seul appel) sur
+   les GPU 7.6 Go du labo → chunké sur K, résultat vérifié identique
+   numériquement à la version non-chunkée.
+3. `batch_size=32` restait trop gros pour l'activation memory du
+   forward/backward du U-Net sur ce GPU (Quadro RTX 4000, 7.6 Go) même après
+   les deux fix précédents — descendu par paliers 32→16→8→4 (le pic mémoire
+   dépend de la composition du batch : nombre de fragments par objet, jusqu'à
+   `max_parts=20`, donc un batch malchanceux peut survenir n'importe quand
+   pendant le run, pas seulement au démarrage) avec `accumulate_grad_batches`
+   compensatoire (8) pour garder le même batch effectif (32) que Step 15.
+
+**Résultat final (30/30 epochs, confirmé identique au checkpoint
+intermédiaire epoch ~21 — pas un artefact de sous-entraînement) :**
+
+| | Step 15 | Step 16 |
+|---|---|---|
+| F1 pooled | 96.7% | 96.27% — quasi flat |
+| Boundary F1 | 83.2% | 84.10% — légèrement mieux |
+| Amas isolés (% volume FP) | 14.7% | **0.4%** — chute massive |
+| Fragments touchés par amas isolés | 56.1% | **8.2%** — chute massive |
+| Éligibilité étage 1 | 62.6% (931/1487) | 70.3% (1045/1487) — mieux |
+| **Pose@30 global, absolu** | **219 paires (14.7%)** | **171 paires (11.5%)** — **-22%** |
+| **Succès strict global, absolu** | **101 paires (6.8%)** | **82 paires (5.5%)** — **-19%** |
+
+**Conclusion : résultat net-négatif sur le vrai test (pipeline de matching
+en aval), malgré un succès quasi total du chantier 2 sur sa propre métrique
+diagnostique** (amas isolés : 56.1%→8.2% des fragments touchés). L'hypothèse
+de départ — que les amas isolés de faux positifs biaisent le repère PCA du
+matching et cassent la cascade — est **infirmée empiriquement** : les
+supprimer via la coherence loss n'améliore pas le matching, et semble même
+coûter en couverture utile du masque (le nombre absolu de poses réussies
+baisse malgré une éligibilité étage 1 en hausse). Hypothèse pour expliquer
+l'écart : la coherence loss, en pénalisant tout point prédit positif isolé
+ET GT-négatif, supprime probablement aussi des points de bord "bruyants
+mais utiles" qui contribuaient (même de façon imparfaite) à la stabilité du
+repère PCA/depth-map matching — la frontière entre "amas isolé nuisible" et
+"point de bord légitime mais isolé" n'est pas aussi nette dans la réalité
+du matching que dans le diagnostic F1/segmentation qui a motivé ce chantier.
+
+**Décision (2026-07-28, avec l'utilisateur) : Step 15 reste le modèle CNN
+final retenu.** Pas de nouvelle itération sur ce chantier (ablation
+boundary-seul vs coherence-seul envisagée pour isoler le coupable, poids
+réduits envisagés aussi, écartés faute de gain attendu clair vs le coût
+d'un nouveau run) — documenté comme résultat négatif informatif, même statut
+que Step 12 (overlap channels) dans `AVANCEES_POST_PRESENTATION.md`.
+L'écart CNN vs GT sur le pipeline de matching (14.7% vs 37.6% de Pose@30)
+reste donc ouvert ; la piste "amélioration du CNN par la loss" est
+maintenant explorée et écartée pour ces deux angles précis (frontière,
+cohérence spatiale) — un futur chantier devra soit cibler une cause
+différente, soit revenir au pipeline de matching lui-même avec un œil neuf.

@@ -472,16 +472,32 @@ Le pipeline de depth-map matching en aval (voir `PLAN_REASSEMBLY_MODULE.md`, Pha
 
 **Ces deux chantiers ne sont pas interchangeables** : chacun cible une population de points distincte (frontière du cluster principal vs amas séparés), identifiée par un diagnostic géométrique que les métriques de segmentation seules n'auraient pas révélé.
 
-### Step 16 — implémentation des deux chantiers (2026-07-24, EN COURS, pas encore entraîné)
+### Step 16 — boundary loss + spatial coherence loss (2026-07-28, TERMINÉ — résultat net-négatif, Step 15 reste le modèle final)
 
-Code écrit (`assembly/models/cnn_segmentation_model.py`), config créée (`configs/experiment/cnn_step16_boundary_coherence.yaml`), **pas encore lancé sur le serveur** — le tableau ci-dessous (baseline Step 15 à battre) reste la référence tant que le run n'a pas tourné.
+Implémentation : `assembly/models/cnn_segmentation_model.py` (`compute_boundary_mask`/`boundary_bce_loss`, `compute_isolated_fp_mask`/`coherence_bce_loss`), config `configs/experiment/cnn_step16_boundary_coherence.yaml`, fine-tuning depuis Step 15 sur 30 epochs (`batch_size=4`, `accumulate_grad_batches=8` — cf. note OOM ci-dessous).
 
-- **`forward()`** expose désormais `frag_sizes` (liste de K tailles) et `points_xyz_flat` ((N_sum, 3), même ordre K-fragments que `coarse_seg_pred`/`coarse_seg_gt`) — nécessaire pour que `criteria()` puisse faire du kNN / clustering *par fragment* sans mélanger les points de fragments différents. API des autres appelants (`training_step`, scripts `phase7_*`/`analyze_errors.py`) inchangée, ce sont des clés supplémentaires dans le dict `out`.
-- **Boundary loss** (`compute_boundary_mask` + `boundary_bce_loss`) : réimplémentation torch de `_boundary_mask()` (`scripts/analyze_errors.py`, kNN k=5, un point est frontière si ≥1 voisin GT diffère) — même définition que la métrique Boundary F1 d'évaluation, pour que la loss d'entraînement et la métrique mesurent la même chose. GT-based → `no_grad`, stable dès l'epoch 0, pas de warmup nécessaire.
-- **Spatial coherence loss** (`compute_isolated_fp_mask` + `coherence_bce_loss`) : clustering par composantes connexes (rayon `eps=0.02`, `min_cluster_size=10`, mêmes paramètres que le diagnostic `phase7_isolated_fp_prevalence_check.py`) sur les points *prédits* positifs, par fragment, en `no_grad` (scipy `cKDTree`/`connected_components`, aller-retour CPU — coût jugé négligeable vu la taille des batches CNN, K≤8 fragments/batch). Seuls les points isolés ET GT-négatifs (vrais faux positifs) sont pénalisés — un amas isolé mais GT-positif est une vraie zone de fracture disjointe légitime, jamais pénalisé.
-- **Stabilité / warmup** : la coherence loss se base sur la prédiction du modèle, bruitée en tout début d'entraînement — "composante isolée" n'a pas de sens sur des prédictions quasi aléatoires. Deux garde-fous : (1) fine-tuning **depuis le checkpoint Step 15** (`pretrained_ckpt`, pas from-scratch) plutôt qu'un warmup epoch très long ; (2) `coherence_warmup_epochs=2` en complément, le temps que le point_head se ré-stabilise sous les nouveaux gradients de boundary_loss avant d'activer la coherence loss. `coherence_every_n_steps` existe pour throttler le clustering si le profiling montre un coût non négligeable (défaut 1 = pas de throttling).
-- **Poids retenus** : `boundary_weight = coherence_weight = 0.2`, modeste par rapport à la loss de base (dice+focal, 0.5/0.5) pour ne pas déstabiliser l'optimum déjà atteint par Step 15 — à ajuster empiriquement si le F1 pooled dégrade ou si les nouveaux termes n'ont pas d'effet mesurable sur la prévalence des amas isolés / le pipeline de matching en aval.
-- **Le vrai test** n'est PAS le F1/Boundary F1 (cf. tableau GT vs CNN section Phase 7 de `PLAN_REASSEMBLY_MODULE.md`) mais le pipeline de matching géométrique en aval (`scripts/phase6b_pipeline_thresh03_check.py`) — baseline Step 15 à battre : éligibilité étage 1 = 62.6%, Pose@30 global = 14.7%, succès strict ≈6.8%.
+- **`forward()`** expose désormais `frag_sizes` (liste de K tailles) et `points_xyz_flat` ((N_sum, 3), même ordre K-fragments que `coarse_seg_pred`/`coarse_seg_gt`) — nécessaire pour que `criteria()` fasse du kNN/clustering *par fragment* sans mélanger les fragments. API des autres appelants inchangée.
+- **Boundary loss** : port direct de `_boundary_mask()` (`scripts/analyze_errors.py`, kNN k=5 sklearn CPU — pas torch/GPU, cf. note OOM) — même définition que la métrique Boundary F1 d'évaluation. GT-based, `no_grad`, stable dès l'epoch 0.
+- **Spatial coherence loss** : clustering par composantes connexes (`eps=0.02`, `min_cluster_size=10`, mêmes paramètres que `phase7_isolated_fp_prevalence_check.py`) sur les points *prédits* positifs, par fragment, `no_grad`. Seuls les points isolés ET GT-négatifs sont pénalisés.
+- Poids `boundary_weight = coherence_weight = 0.2`, `coherence_warmup_epochs=2`, fine-tuning depuis Step 15 (pas from-scratch).
+- **OOM en cascade pendant le lancement** (documenté dans les commits `381059f`/`520b314`/`76cf183`/`09b28f3`/`8b5698c`) : (1) `compute_boundary_mask` en `torch.cdist` GPU faisait une matrice O(n²) par fragment → déplacé sur CPU/sklearn ; (2) bug préexistant (Step 9, pas causé par Step 16) dans `_knn_indices_batched` (`hybrid_geometry_features.py`) — matrice dense `(K, N, N)` pour TOUS les fragments du batch en un seul appel, jamais un problème avec les batches "chanceux" de Step 15 mais explosif sur un GPU de 7.6 Go dès que K est grand → chunké sur K ; (3) même avec ces deux fix, `batch_size=32` restait trop gros pour l'activation memory du forward/backward du U-Net sur ce GPU (Quadro RTX 4000, 7.6 Go) — descendu par paliers (32→16→8→4) avec `accumulate_grad_batches` compensatoire pour garder le même batch effectif (32) que Step 15.
+
+**Résultat (checkpoint final, 30/30 epochs, confirmé identique au checkpoint intermédiaire epoch ~21 — pas un artefact de sous-entraînement) :**
+
+| | Step 15 | Step 16 |
+|---|---|---|
+| F1 pooled (meilleur seuil) | 96.7% | 96.27% (t=0.40) — quasi flat |
+| Boundary F1 | 83.2% | 84.10% — légèrement mieux |
+| Amas isolés (% volume FP) | 14.7% | **0.4%** — chute massive |
+| Fragments touchés par amas isolés | 56.1% | **8.2%** (441/5386) — chute massive |
+| Éligibilité étage 1 (pipeline matching) | 62.6% (931/1487) | 70.3% (1045/1487) — mieux |
+| Pose@30 parmi étage-2 | 23.5% | 16.4% — pire |
+| **Pose@30 global, en absolu** | **14.7% (219 paires)** | **11.5% (171 paires)** — **-48 paires (-22%)** |
+| **Succès strict global, en absolu** | **6.8% (101 paires)** | **5.5% (82 paires)** — **-19 paires (-19%)** |
+
+**Conclusion : résultat net-négatif sur le vrai test (pipeline de matching), malgré un succès quasi total sur sa propre métrique diagnostique.** La coherence loss élimine presque totalement les amas isolés (56.1%→8.2% des fragments touchés, 14.7%→0.4% du volume de FP) — chantier 2 réussi sur le papier. Mais ça ne se traduit PAS par un meilleur matching : au contraire, le nombre absolu de paires correctement posées baisse (-22% Pose@30, -19% succès strict), malgré une éligibilité étage 1 en hausse. **L'hypothèse de départ (les amas isolés biaisent le repère PCA du matching) est infirmée empiriquement** : les supprimer n'aide pas, et semble même coûter en couverture utile du masque — probablement parce que la coherence loss, en pénalisant tout point prédit positif isolé et GT-négatif, supprime aussi des points de bord légitimes qui contribuaient (même bruyamment) à la robustesse du repère PCA/depth-map matching.
+
+**Décision (2026-07-28, avec l'utilisateur) : Step 15 reste le modèle final retenu.** Pas de nouvelle itération sur ce chantier (ablation boundary-seul vs coherence-seul, ou poids réduits, envisagés mais écartés faute de gain attendu clair) — documenté comme résultat négatif informatif, même statut que Step 12 (overlap channels).
 
 ---
 
