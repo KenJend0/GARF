@@ -97,6 +97,20 @@ def analyze_fragment(raw, mask, true_gt):
     if n_secondary > 0:
         n_fp_secondary = int((~pred_true[(labels >= 0) & (labels != main_label)].astype(bool)).sum())
 
+    # ── Précision/rappel GLOBAUX du masque prédit (2026-07-30, diagnostic
+    # complémentaire post-Step16) : le succès de la coherence loss sur la
+    # prévalence des amas isolés (56.1%→8.2%) ne dit RIEN sur la qualité
+    # globale du masque -- si elle a aussi rendu le CNN plus timide partout
+    # (rappel global en baisse), ça expliquerait la régression du matching
+    # en aval sans invalider le diagnostic initial sur les amas isolés.
+    # Même seuil (0.3) que tout le reste de la Phase 7 -- comparable
+    # directement aux chiffres du pipeline de matching, pas au seuil 0.5
+    # utilisé par analyze_errors.py pour les métriques fragment-level.
+    n_true_total = int(true_gt.sum())
+    n_tp_total = n_pred - n_fp_total
+    precision_global = n_tp_total / max(n_pred, 1)
+    recall_global = n_tp_total / max(n_true_total, 1)
+
     return {
         "n_pred": n_pred, "n_main": n_main, "n_secondary": n_secondary, "n_noise": n_noise,
         "main_precision": main_precision, "secondary_precision": secondary_precision,
@@ -104,6 +118,9 @@ def analyze_fragment(raw, mask, true_gt):
         "n_fp_total": n_fp_total,
         "n_fp_isolated": n_fp_isolated + n_fp_secondary,   # "isolé" = hors cluster principal
         "has_isolated_fp_cluster": bool(n_noise > 0 or n_secondary > 0),
+        "n_true_total": n_true_total,
+        "precision_global": precision_global,
+        "recall_global": recall_global,
     }
 
 
@@ -209,12 +226,24 @@ def main():
     noise_prec = [r["noise_precision"] for r in rows if r["noise_precision"] is not None]
     secondary_prec = [r["secondary_precision"] for r in rows if r["secondary_precision"] is not None]
 
+    precision_global_mean = float(np.mean([r["precision_global"] for r in rows]))
+    recall_global_mean = float(np.mean([r["recall_global"] for r in rows]))
+
     print(f"AMPLEUR DU MOTIF (sur {n} fragments, {n_seen_2frag} objets 2-frags vus) :")
     print(f"  Fragments avec au moins un amas isolé (bruit ou cluster secondaire) : "
           f"{n_with_isolated}/{n} ({100*n_with_isolated/n:.1f}%)")
     print(f"  Fraction des FAUX POSITIFS totaux situés dans un amas isolé "
           f"(hors cluster principal) : {100*total_fp_isolated/max(total_fp,1):.1f}% "
           f"({total_fp_isolated}/{total_fp})")
+    print(f"\n  Précision GLOBALE du masque (seuil {args.threshold}, moyenne par fragment) : "
+          f"{100*precision_global_mean:.1f}%")
+    print(f"  Rappel GLOBAL du masque (seuil {args.threshold}, moyenne par fragment)    : "
+          f"{100*recall_global_mean:.1f}%")
+    print("  (Lecture : compare ces deux chiffres entre deux checkpoints (ex. Step 15 vs "
+          "Step 16) -- si le rappel global baisse en même temps que la prévalence d'amas "
+          "isolés, la loss testée rend le CNN plus timide PARTOUT, pas seulement sur les "
+          "amas isolés -- ça expliquerait une régression du matching en aval sans invalider "
+          "le diagnostic initial.)")
     print(f"\n  Precision (fraction de VRAIS positifs) par catégorie :")
     print(f"    Cluster principal   : N={len(main_prec):>5}  moyenne={100*np.mean(main_prec):.1f}%"
           if main_prec else "    Cluster principal   : —")
@@ -251,6 +280,8 @@ def main():
                 "main_precision_mean": float(np.mean(main_prec)) if main_prec else None,
                 "secondary_precision_mean": float(np.mean(secondary_prec)) if secondary_prec else None,
                 "noise_precision_mean": float(np.mean(noise_prec)) if noise_prec else None,
+                "precision_global_mean": precision_global_mean,
+                "recall_global_mean": recall_global_mean,
             }, f, indent=2)
         print(f"JSON résumé sauvegardé : {args.summary_json}")
 
