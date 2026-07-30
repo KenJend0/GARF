@@ -85,11 +85,14 @@ from scipy.spatial.transform import Rotation as R_scipy
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from hydra.utils import instantiate
-from scripts.analyze_errors import load_config_and_model
-from assembly.models.cnn_segmentation_model import CNNFracSeg
-from assembly.models.projection_mapping_utils import extract_fragment_list
-from torch.utils.data import DataLoader
+# `hydra`/`CNNFracSeg`/etc. ne sont utilisés QUE dans `main()` (chargement du
+# dataset/checkpoint pour le CLI) -- importés localement dans `main()`
+# (2026-07-30) plutôt qu'au niveau module, pour que les fonctions pures
+# (compute_pca_frame, rasterize, kabsch, build_correspondences_nn, ...),
+# déjà réutilisées telles quelles par de nombreux scripts Phase 7, restent
+# importables sans ces dépendances lourdes (utile pour tester en local,
+# cf. scripts/phase8_depthmap_regressor_dataset.py). Comportement de `main()`
+# inchangé -- mêmes imports, juste déplacés.
 
 
 # ── Hyperparamètres (overridables via CLI) ────────────────────────────────────
@@ -1124,6 +1127,12 @@ def main():
     parser.add_argument("--device",      default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--summary_json", default="")
     args = parser.parse_args()
+
+    from hydra.utils import instantiate
+    from scripts.analyze_errors import load_config_and_model
+    from assembly.models.cnn_segmentation_model import CNNFracSeg
+    from assembly.models.projection_mapping_utils import extract_fragment_list
+    from torch.utils.data import DataLoader
 
     device = torch.device(args.device)
     rng    = np.random.default_rng(args.seed)
