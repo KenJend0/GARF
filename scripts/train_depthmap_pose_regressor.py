@@ -162,15 +162,25 @@ def main():
         scheduler.step()
 
         train_loss = train_loss_sum / max(n_seen, 1)
+        # Métriques décodées sur le TRAIN (pas juste la loss) -- distingue un
+        # surapprentissage normal (train correct, val mauvais) d'un bug de
+        # fond (même le train ne décode pas correctement), cf.
+        # PLAN_REASSEMBLY_MODULE.md, Phase 8, diagnostic du 2026-07-30.
+        train_metrics = evaluate(model, train_loader, device)
         val_metrics = evaluate(model, val_loader, device)
         elapsed = time.time() - t0
-        print(f"epoch {epoch+1:>3}/{args.epochs} | train_loss={train_loss:.4f} | "
+        print(f"epoch {epoch+1:>3}/{args.epochs} | train_loss={train_loss:.4f} "
+              f"(angle={train_metrics['angle_err_mean_deg']:.1f}°, mirror={100*train_metrics['mirror_acc']:.0f}%) | "
               f"val_loss={val_metrics['loss']:.4f} | angle_err={val_metrics['angle_err_mean_deg']:.2f}° "
               f"(médiane {val_metrics['angle_err_median_deg']:.2f}°) | "
               f"shift_err={val_metrics['shift_err_mean_px']:.2f}px | "
               f"mirror_acc={100*val_metrics['mirror_acc']:.1f}% | {elapsed:.0f}s")
 
-        history.append({"epoch": epoch + 1, "train_loss": train_loss, **val_metrics})
+        history.append({
+            "epoch": epoch + 1, "train_loss": train_loss,
+            **{f"train_{k}": v for k, v in train_metrics.items()},
+            **val_metrics,
+        })
 
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]

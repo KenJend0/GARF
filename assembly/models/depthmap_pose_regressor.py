@@ -27,6 +27,23 @@ import torch
 import torch.nn as nn
 
 
+def _normalize_depth(dmap: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Normalise chaque depth map PAR ÉCHANTILLON (pas globalement) en
+    divisant par l'écart-type des profondeurs valides -- correctif
+    2026-07-30, suite à un premier entraînement infructueux
+    (angle_err/mirror_acc au niveau du hasard sur validation). Les
+    profondeurs sont en unités PHYSIQUES absolues (mètres), et l'échelle
+    varie énormément d'un fragment à l'autre (taille réelle différente) --
+    sans cette normalisation, le réseau voit des plages de valeurs
+    incohérentes d'un exemple à l'autre pour un même type de tâche
+    géométrique. `dmap`/`valid` : (B, R, R)."""
+    n_valid = valid.sum(dim=(1, 2), keepdim=True).clamp_min(1.0)
+    mean = (dmap * valid).sum(dim=(1, 2), keepdim=True) / n_valid
+    var = ((dmap - mean) ** 2 * valid).sum(dim=(1, 2), keepdim=True) / n_valid
+    std = var.clamp_min(1e-8).sqrt()
+    return (dmap - mean) / std * valid
+
+
 class _SiameseEncoder(nn.Module):
     """Encodeur CNN partagé (poids communs pour i, j-normal, j-miroir) --
     entrée (2, R, R) = depth + validity, sortie un vecteur (feat_dim,)."""
@@ -79,6 +96,9 @@ class DepthmapPoseRegressor(nn.Module):
         Le miroir = retourner `dmap_j`/`valid_j` selon l'axe des RANGÉES
         (`dim=-2`) -- équivalent à négater `v_j` avant rasterisation (cf.
         docstring module et PLAN_REASSEMBLY_MODULE.md, Phase 8)."""
+        dmap_i = _normalize_depth(dmap_i, valid_i)
+        dmap_j = _normalize_depth(dmap_j, valid_j)
+
         x_i = torch.stack([dmap_i, valid_i], dim=1)          # (B, 2, R, R)
         x_j_normal = torch.stack([dmap_j, valid_j], dim=1)
         x_j_mirror = torch.flip(x_j_normal, dims=[-2])        # flip des rangées = -v_j
