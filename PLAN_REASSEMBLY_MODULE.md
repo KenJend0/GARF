@@ -3730,3 +3730,40 @@ shift, en pixels — cohérent avec la convention pixel de `build_correspondence
 - `scripts/phase8_pipeline_learned_check.py` : évaluation bout-en-bout
   (remplace `run_cascade` par le modèle appris dans le même squelette que
   `phase6b_pipeline_thresh03_check.py`), chaînage ICP inclus.
+
+### CORRECTION (2026-07-30) — ambiguïté de réflexion (u,v) confirmée, fréquente (52.2%)
+
+En développant `phase8_depthmap_regressor_dataset.py`, l'auto-test
+`_test_3d_pipeline_roundtrip` a révélé une ambiguïté NON prévue dans le
+cadrage initial : au-delà de l'ambiguïté de signe 3D globale (corrigée par
+`canonical_pca_frame`, force `det([u,v,n])=+1`), il existe une SECONDE
+ambiguïté indépendante -- une vraie RÉFLEXION dans le plan (u,v) (un seul
+des deux axes in-plane s'inverse, pas les deux), que ni le Kabsch 2D
+(`fit_theta_shift`, contraint à une rotation pure) ni `match_depthmaps`
+(rotation + flip de PROFONDEUR seulement, jamais de miroir du plan) ne
+peuvent représenter.
+
+**Mesure sur les vraies paires GT** (`phase8_reflection_prevalence_check.py`,
+1251 paires, `everyday`/val) : **52.2% des paires ont besoin du miroir**
+-- quasiment un tirage à pile ou face, PAS un cas rare. Confirmé par les
+chiffres de contrôle : `rot_err` moyen = 2.18° sur les cas OK (la
+dérivation est correcte en l'absence de miroir), 172.7° sur les cas
+réflexion (confirme que c'est bien une réflexion pure, pas du bruit).
+Cohérent avec l'attente : les fragments Breaking Bad sont désassemblés à
+une orientation relative arbitraire, aucune raison que ce bit
+d'ambiguïté (indépendant par paire) soit rare.
+
+**Conséquence sur la conception (révise la section "Pourquoi pas de flip"
+ci-dessus, qui ne considérait que l'ambiguïté de profondeur) :**
+- **Génération des labels** : calcule le label normalement ; si le
+  `rot_err` de reconstruction est grand (réflexion probable), retente
+  avec `v_j` inversé (équivalent à retourner verticalement la depth map
+  de `j`) et stocke le label corrigé + un bit `mirror_gt`.
+- **Modèle** : doit tester DEUX hypothèses (plan (u,v) de `j` normal vs
+  miroir), symétriquement au `flip` déjà géré par `match_depthmaps` pour
+  la profondeur -- pas une extension isolée, un DEUXIÈME bit
+  d'ambiguïté indépendant du premier. Sortie du modèle : `(theta, shift)`
+  + une confiance par hypothèse (normal/miroir), on garde la plus
+  confiante -- toujours PAS de sortie "flip profondeur" (celui-là reste
+  sans effet sur `build_correspondences_nn`, confirmé par lecture de
+  code), seulement le miroir (u,v).
