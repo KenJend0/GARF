@@ -3767,3 +3767,48 @@ ci-dessus, qui ne considérait que l'ambiguïté de profondeur) :**
   confiante -- toujours PAS de sortie "flip profondeur" (celui-là reste
   sans effet sur `build_correspondences_nn`, confirmé par lecture de
   code), seulement le miroir (u,v).
+
+### Implémentation complète (2026-07-30) — prête à entraîner
+
+Tous les composants de la Phase 8 sont écrits, testés localement (auto-tests
+numpy/scipy/torch) et validés partiellement sur données réelles :
+
+| Fichier | Rôle | Validation |
+|---|---|---|
+| `scripts/phase8_depthmap_regressor_dataset.py` | `canonical_pca_frame`, `fit_theta_shift_mirror_from_gt` | Auto-tests locaux (30/30) + validé sur 1251 paires GT réelles (`phase8_reflection_prevalence_check.py`) |
+| `assembly/models/depthmap_pose_regressor.py` | `DepthmapPoseRegressor` (~90-100K params), `pose_regressor_loss` | Smoke test synthétique local (`test_phase8_regressor.py`, 5/5) |
+| `scripts/phase8_build_regressor_dataset.py` | Précalcule le `.npz` d'entraînement (`--strategy gt\|thresh03`) | Validé sur GT réel (1250 paires, mirror_gt=49.8%≈52.2% attendu, résidu <1px) |
+| `scripts/train_depthmap_pose_regressor.py` | Boucle d'entraînement (torch simple, pas Lightning) | Smoke test local avec `.npz` synthétique (bout-en-bout sans erreur) |
+| `scripts/phase8_pipeline_learned_check.py` | Évaluation bout-en-bout (étage 1 appris + `trimmed_icp_normals`) | Relu attentivement, pas exécutable en local (hydra + données + checkpoint entraîné requis) |
+
+**Prochaines actions (oracle-first, comme toute la Phase 7) :**
+1. Précalculer le dataset GT train + val (`--strategy gt`, splits `train`/`val`).
+2. Entraîner sur GT d'abord -- valider que l'architecture/la boucle
+   atteignent quelque chose de proche du plafond GT hand-crafted (99.1%
+   éligibilité, 37.6% Pose@30) avant d'investir dans le cas bruité.
+3. Si le round-trip GT est concluant, précalculer + entraîner sur
+   `thresh03` (le vrai objectif -- apprendre la robustesse au bruit du
+   masque CNN réel), comparer à la barre 62.6%/14.7%/6.8%.
+
+Commandes (serveur, après `git pull`) :
+```bash
+# 1. Dataset GT train + val
+CUDA_VISIBLE_DEVICES=1 python scripts/phase8_build_regressor_dataset.py \
+    --strategy gt --data_root /storage/student7/teyssir/data/breaking_bad_vol.hdf5 \
+    --experiment cnn_step15_final_model --categories everyday --split train --max_batches 0 \
+    --out /tmp/student7/phase8_dataset_gt_train.npz
+# (--split val --out .../phase8_dataset_gt_val.npz déjà généré le 2026-07-30)
+
+# 2. Entraînement GT
+CUDA_VISIBLE_DEVICES=1 python scripts/train_depthmap_pose_regressor.py \
+    --train_npz /tmp/student7/phase8_dataset_gt_train.npz \
+    --val_npz /tmp/student7/phase8_dataset_gt_val.npz \
+    --out_dir output/phase8_depthmap_regressor_gt --epochs 50 --batch_size 64
+
+# 3. Évaluation bout-en-bout GT (barre : éligibilité 99.1%, Pose@30 37.6%, strict 23.2%)
+CUDA_VISIBLE_DEVICES=1 python scripts/phase8_pipeline_learned_check.py \
+    --strategy gt --regressor_ckpt output/phase8_depthmap_regressor_gt/best.ckpt \
+    --data_root /storage/student7/teyssir/data/breaking_bad_vol.hdf5 \
+    --experiment cnn_step15_final_model --categories everyday --split val --max_batches 3000 \
+    --summary_json /tmp/student7/phase8_pipeline_learned_gt.json
+```
