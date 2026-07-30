@@ -499,6 +499,8 @@ Implémentation : `assembly/models/cnn_segmentation_model.py` (`compute_boundary
 
 **Décision (2026-07-28, avec l'utilisateur) : Step 15 reste le modèle final retenu.** Pas de nouvelle itération sur ce chantier (ablation boundary-seul vs coherence-seul, ou poids réduits, envisagés mais écartés faute de gain attendu clair) — documenté comme résultat négatif informatif, même statut que Step 12 (overlap channels).
 
+**CORRECTION (2026-07-30) :** le chiffre "amas isolés 56.1%→8.2%" ci-dessus était mesuré sur le mauvais checkpoint (`last.ckpt` = `epoch-0.ckpt`, pas le run complet — trois redémarrages OOM ont versionné les checkpoints Lightning, le vrai fichier final est `last-v1.ckpt` = `epoch-29.ckpt`, même piège que Step 12/13). Revérifié sur le bon fichier : les amas isolés ont en réalité **empiré** (55.8%→61.8% des fragments, 14.0%→21.1% du volume de FP), et la précision globale du masque s'est effondrée dans toutes les catégories (cluster principal 88.5%→83.3%, secondaires 73.1%→59.5%, bruit isolé 60.3%→41.1%) — une dégradation généralisée, pas ciblée aux frontières. La régression du matching en aval (confirmée réelle, chiffres cohérents sur le bon checkpoint) n'a donc PAS l'explication qu'on lui donnait ("coherence loss réussit, boundary loss est le seul coupable") — voir `PLAN_REASSEMBLY_MODULE.md` pour le détail complet et la décision de pivot qui en découle (modèle appris sur les depth maps, en cours de cadrage).
+
 ---
 
 ## 11. Messages clés pour la présentation

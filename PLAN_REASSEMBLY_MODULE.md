@@ -3495,3 +3495,67 @@ reste donc ouvert ; la piste "amélioration du CNN par la loss" est
 maintenant explorée et écartée pour ces deux angles précis (frontière,
 cohérence spatiale) — un futur chantier devra soit cibler une cause
 différente, soit revenir au pipeline de matching lui-même avec un œil neuf.
+
+### CORRECTION (2026-07-30) — le chiffre "amas isolés 56.1%→8.2%" ci-dessus était FAUX (mauvais checkpoint)
+
+En revérifiant Step 16 avant de lancer Step 17, `ls -la
+output/cnn_step16_boundary_coherence/*.ckpt` a révélé que le fichier
+`last.ckpt` (utilisé pour TOUTES les mesures ci-dessus) date du
+**28/07 14h15 — exactement l'horodatage d'`epoch-0.ckpt`**, pas du run
+complet à 30 epochs. Trois redémarrages OOM (`76cf183`/`09b28f3`/`8b5698c`)
+ont laissé Lightning versionner les checkpoints (`last.ckpt` = premier
+essai avorté, **`last-v1.ckpt`** daté du 30/07 08h30 = exactement
+`epoch-29.ckpt`, le VRAI run complet) — même piège que Step 12/13 déjà
+rencontré (`last-v1.ckpt`/`last-v3.ckpt`).
+
+**Revérification sur `last-v1.ckpt` (le bon fichier), deux niveaux :**
+
+1. **Pipeline de matching** (`phase6b_pipeline_thresh03_check.py`) — **CONFIRMÉ, cohérent avec le chiffre documenté** : éligibilité 68.5% (1018/1487, doc: 70.3%), Pose@30 absolu 175 paires/11.8% (doc: 171/11.5%), succès strict ~84 paires/5.6% (doc: 82/5.5%), Precision(min) réussite étage 1 = 65.9% (doc: 65.6%). Ces chiffres-là étaient donc bien mesurés sur le bon checkpoint — la régression du matching en aval est réelle.
+2. **Prévalence des amas isolés** (`phase7_isolated_fp_prevalence_check.py`, avec le nouveau calcul de précision/rappel globaux ajouté le 2026-07-30) — **CONTREDIT le chiffre documenté** :
+
+```
+                              Step 15    Step 16 documenté   Step 16 revérifié (last-v1.ckpt)
+Fragments avec amas isolé       55.8%          8.2%                  61.8%
+Volume FP dans amas isolés      14.0%          0.4%                  21.1%
+Précision globale (seuil 0.3)   82.7%           —                    74.2%
+Rappel global (seuil 0.3)       87.4%           —                    87.7%
+Précision cluster principal     88.5%           —                    83.3%
+Précision clusters secondaires  73.1%           —                    59.5%
+Précision bruit isolé           60.3%           —                    41.1%
+```
+
+**Les amas isolés ont EMPIRÉ (pas disparu), et la précision globale du
+masque s'est effondrée dans TOUTES les catégories** (pas seulement les
+amas isolés) — la chute n'est pas ciblée sur les frontières ni sur les
+composantes isolées spécifiquement, c'est une dégradation généralisée de
+la précision. **Le chiffre "56.1%→8.2%" était mesuré sur `epoch-0.ckpt`
+(quasi Step 15 non modifié), pas sur le modèle réellement entraîné.**
+
+**Conclusion révisée :** la régression du matching en aval (Pose@30 -20%,
+succès strict -17%) est réelle et confirmée, mais **la coherence loss n'a
+PAS atteint son objectif propre** (contrairement à ce qui était affirmé) —
+elle n'a pas supprimé les amas isolés, et la précision globale du masque
+s'est dégradée partout. L'explication "boundary_loss élargit le masque
+localement aux frontières" (qui motivait Step 17) n'est donc plus
+clairement supportée par les données : on ne sait plus si le coupable est
+`boundary_loss`, `coherence_loss`, ou les deux — la chute de précision est
+globale, pas un effet localisé aux frontières. Step 17 (coherence_loss
+seule, config déjà écrite) reste une expérience valable, mais pour une
+raison différente et plus ouverte : vérifier si `coherence_loss` seule
+cause déjà cette chute de précision généralisée, ou si c'est spécifique à
+la combinaison des deux loss.
+
+**Décision (2026-07-30, avec l'utilisateur) : Step 15 reste le modèle CNN
+final. Step 17 sera lancé une dernière fois** pour clore proprement ce
+chantier (résultat déjà attendu comme probablement négatif aussi, vu que
+la chute de précision documentée est généralisée et non spécifique aux
+frontières), sans nouvelle itération après ça quel que soit le résultat.
+Pivot de direction décidé en parallèle (voir section suivante) : passer
+du matching hand-crafted (PCA + FFT + Kabsch) à un **modèle appris qui
+prend directement les deux depth maps en entrée et régresse la pose
+grossière**, motivé par le fait que quatre tentatives consécutives
+d'améliorer la PRÉCISION DU MASQUE (3 filtrages pipeline + Step 16) ont
+toutes échoué — un modèle entraîné directement sur les depth maps issues
+du vrai masque CNN (bruité) peut apprendre à être robuste à ce bruit,
+contrairement à la PCA/FFT qui s'est montrée fragile à chaque tentative de
+la rendre plus tolérante.
