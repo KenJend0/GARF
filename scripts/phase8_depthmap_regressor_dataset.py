@@ -25,12 +25,21 @@ deux expressions) -- pas de recherche de correspondance nécessaire, un
 Kabsch 2D entre `p_i` et `p_j_target` retrouve exactement `(M, b)`, d'où
 `(theta_gt, shift_gt)`.
 
-IMPORTANT -- pas de `flip` : `build_correspondences_nn` n'utilise JAMAIS
-le flip (vérifié par lecture de son code -- elle ne travaille que sur les
-coordonnées (u,v), jamais sur la profondeur). Le flip n'existe dans
-`match_depthmaps` que comme artefact de la méthode de score (ambiguïté de
-signe des vecteurs propres PCA) -- il n'a pas de sens ici où la pose GT
-est connue.
+CORRECTION (2026-07-30, après les auto-tests ci-dessous) -- il existe
+une DEUXIÈME ambiguïté, indépendante du flip de profondeur de
+`match_depthmaps` : une vraie RÉFLEXION dans le plan (u,v) (un seul des
+deux axes in-plane s'inverse, pas les deux), que ni le Kabsch 2D
+(contraint à une rotation pure) ni `match_depthmaps` (rotation + flip de
+profondeur seulement, jamais de miroir du plan) ne peuvent représenter.
+Mesuré sur les vraies paires GT du dataset
+(`phase8_reflection_prevalence_check.py`) : **52.2% des paires ont besoin
+de ce miroir** -- pas un cas rare, quasiment un tirage à pile ou face
+(cohérent avec des fragments désassemblés à une orientation relative
+arbitraire). `fit_theta_shift_mirror_from_gt()` détecte et corrige ce
+bit en essayant les deux orientations de `v_j` et en gardant celle qui
+minimise le résidu du Kabsch 2D -- le modèle appris devra, de la même
+façon, tester les deux hypothèses (plan normal vs miroir) et choisir via
+une confiance apprise, symétriquement au `flip` existant.
 
 Auto-test exécutable en local (numpy/scipy purs, pas besoin du serveur) :
     python scripts/phase8_depthmap_regressor_dataset.py
@@ -135,6 +144,44 @@ def fit_theta_shift_from_gt(
     return fit_theta_shift(p_i, p_j_target, resolution)
 
 
+def _fit_residual(p_i: np.ndarray, p_j_target: np.ndarray, theta_deg: float, shift, resolution: int):
+    """RMS entre `p_j_target` et la reconstruction de `p_i` par
+    `(theta_deg, shift)` -- sert à décider, entre deux hypothèses (normal /
+    miroir), laquelle est correcte (résidu quasi nul) sans passer par la
+    reconstruction 3D complète (moins cher, même verdict -- cf.
+    `fit_theta_shift_mirror_from_gt`)."""
+    p_j_pred = _forward_transform_reference(p_i, theta_deg, shift, resolution)
+    return float(np.sqrt(np.mean(np.sum((p_j_pred - p_j_target) ** 2, axis=1))))
+
+
+def fit_theta_shift_mirror_from_gt(
+    frac_i, c_i, u_i, v_i, u_min_i, v_min_i,
+    c_j, u_j, v_j, u_min_j, v_min_j,
+    pixel_size, resolution, R_ij_gt, t_ij_gt,
+):
+    """Comme `fit_theta_shift_from_gt`, mais détecte et corrige la
+    RÉFLEXION (u,v) découverte le 2026-07-30 (52.2% des paires réelles,
+    cf. `phase8_reflection_prevalence_check.py`) : essaie `v_j` tel quel
+    (`mirror=False`) ET `-v_j` (`mirror=True`), garde l'hypothèse dont le
+    résidu de Kabsch 2D est le plus petit. Retourne
+    `(theta_deg, shift, mirror, residual)` -- `mirror` est le label que le
+    modèle appris devra aussi prédire (deuxième hypothèse binaire, en plus
+    de `theta`/`shift`, symétrique au `flip` de profondeur déjà géré par
+    `match_depthmaps`)."""
+    p_i = project_to_pixels(frac_i, c_i, u_i, v_i, u_min_i, v_min_i, pixel_size)
+    frac_i_in_j = (R_ij_gt @ frac_i.T).T + t_ij_gt
+
+    candidates = []
+    for mirror, v_j_use in ((False, v_j), (True, -v_j)):
+        p_j_target = project_to_pixels(frac_i_in_j, c_j, u_j, v_j_use, u_min_j, v_min_j, pixel_size)
+        theta_deg, shift = fit_theta_shift(p_i, p_j_target, resolution)
+        residual = _fit_residual(p_i, p_j_target, theta_deg, shift, resolution)
+        candidates.append((residual, theta_deg, shift, mirror))
+
+    residual, theta_deg, shift, mirror = min(candidates, key=lambda c: c[0])
+    return theta_deg, shift, mirror, residual
+
+
 # ── Auto-tests (numpy/scipy purs, exécutables en local) ────────────────────
 
 def _forward_transform_reference(p_i: np.ndarray, theta_deg: float, shift, resolution: int):
@@ -199,6 +246,7 @@ def _test_3d_pipeline_roundtrip():
 
     rng = np.random.default_rng(1)
     resolution = 64
+    n_mirror = 0
 
     for trial in range(10):
         # Fragment i : nuage quasi-plan (fracture) + un peu de bruit hors-plan.
@@ -225,14 +273,16 @@ def _test_3d_pipeline_roundtrip():
         u_min_j = float(((frac_j - c_j) @ u_j).min()) - 0.5 * pixel_size
         v_min_j = float(((frac_j - c_j) @ v_j).min()) - 0.5 * pixel_size
 
-        theta_gt, shift_gt = fit_theta_shift_from_gt(
+        theta_gt, shift_gt, mirror_gt, _residual = fit_theta_shift_mirror_from_gt(
             frac_i, c_i, u_i, v_i, u_min_i, v_min_i,
             c_j, u_j, v_j, u_min_j, v_min_j,
             pixel_size, resolution, R_ij_gt, t_ij_gt,
         )
+        v_j_used = -v_j if mirror_gt else v_j
+        n_mirror += int(mirror_gt)
 
         pts_i3, pts_j3 = build_correspondences_nn(
-            frac_i, c_i, u_i, v_i, frac_j, c_j, u_j, v_j,
+            frac_i, c_i, u_i, v_i, frac_j, c_j, u_j, v_j_used,
             u_min_i, v_min_i, u_min_j, v_min_j,
             pixel_size, resolution, theta_gt, shift_gt,
             contact_eps=5 * pixel_size,   # tolérance large : bruit hors-plan + arrondi pixel
@@ -245,11 +295,12 @@ def _test_3d_pipeline_roundtrip():
         R_est, t_est = kabsch(pts_i3, pts_j3)
         re = rot_err_deg(R_est, R_ij_gt)
         te = trans_err(t_est, t_ij_gt)
-        assert re < 5.0, f"trial {trial}: rot_err={re:.2f}° trop grand"
-        assert te < 0.05, f"trial {trial}: trans_err={te:.4f} trop grand"
+        assert re < 5.0, f"trial {trial}: rot_err={re:.2f}° trop grand (mirror={mirror_gt})"
+        assert te < 0.05, f"trial {trial}: trans_err={te:.4f} trop grand (mirror={mirror_gt})"
 
     print(f"  [OK] _test_3d_pipeline_roundtrip : 10 tirages, pose reconstruite "
-          f"à <5°/<0.05 de la vraie pose via le label GT dérivé")
+          f"à <5°/<0.05 de la vraie pose via le label GT dérivé (mirror détecté "
+          f"{n_mirror}/10 fois, cohérent avec ~50% attendu sur données réelles)")
 
 
 if __name__ == "__main__":
