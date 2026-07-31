@@ -415,6 +415,79 @@ def match_depthmaps(dmap_i, valid_i, dmap_j, valid_j, n_angles: int, score_mode:
     return best_score, best_theta, best_shift, best_flip, best_overlap_frac
 
 
+def angle_correlation_profile(dmap_i, valid_i, dmap_j, valid_j, n_angles: int,
+                               score_mode: str = "joint") -> np.ndarray:
+    """Phase 8 (2026-07-31) -- variante diagnostique de `match_depthmaps()` :
+    au lieu de ne garder que le meilleur (theta, shift, flip) global, renvoie
+    le MEILLEUR SCORE PAR ANGLE (max sur shift ET flip), soit un vecteur
+    (n_angles,). Sert de feature de "corrélation croisée explicite" injectée
+    dans `DepthmapPoseRegressor` (PLAN_REASSEMBLY_MODULE.md, Phase 8, section
+    architecture du 2026-07-31) : plutôt que de faire tout réapprendre à un
+    encodeur siamois nu (qui pool chaque depth map en un vecteur global AVANT
+    toute comparaison, perdant l'information spatiale), on donne au réseau le
+    même signal de corrélation par rotation que la recherche FFT hand-crafted
+    valide depuis la Phase 5A -- le réseau peut alors apprendre à affiner ce
+    signal (robustesse au bruit du masque CNN) plutôt qu'à le redécouvrir
+    depuis les pixels bruts.
+
+    AUCUNE réimplémentation du coeur FFT de `match_depthmaps` -- duplication
+    volontaire de la boucle rotation x flip (plutôt qu'un refactor partagé)
+    pour ne pas risquer de régression sur `match_depthmaps`, déjà validé sur
+    des milliers de paires dans les Phases 5A-7.
+
+    Utilisée pour DEUX hypothèses distinctes par l'appelant (normal / miroir
+    du plan (u,v) de j, cf. docstring `depthmap_pose_regressor.py`) : appeler
+    une fois avec `dmap_j`/`valid_j` tels quels, une deuxième fois avec
+    `np.flip(dmap_j, axis=0)`/`np.flip(valid_j, axis=0)` (miroir -- flip des
+    RANGÉES, même convention que le `torch.flip(..., dims=[-2])` du modèle)."""
+    R_sz = dmap_i.shape[0]
+    a = dmap_i * valid_i.astype(np.float64)
+    c = valid_i.astype(np.float64)
+    A_fft = np.fft.rfft2(a)
+    C_fft = np.fft.rfft2(c)
+    n_valid_i = float(valid_i.sum())
+
+    profile = np.full(n_angles, -np.inf, dtype=np.float64)
+
+    for flip in (False, True):
+        dmap_j_use = -dmap_j if flip else dmap_j
+
+        for k in range(n_angles):
+            theta = k * 360.0 / n_angles
+
+            dmap_j_rot  = ndimage_rotate(dmap_j_use, theta, reshape=False, order=1, cval=0.0)
+            valid_j_rot = ndimage_rotate(
+                valid_j.astype(np.float64), theta, reshape=False, order=1, cval=0.0) > 0.5
+
+            b = dmap_j_rot * valid_j_rot.astype(np.float64)
+            d = valid_j_rot.astype(np.float64)
+            B_fft = np.fft.rfft2(b)
+            D_fft = np.fft.rfft2(d)
+
+            CC      = np.real(np.fft.irfft2(A_fft * np.conj(B_fft), s=(R_sz, R_sz)))
+            overlap = np.real(np.fft.irfft2(C_fft * np.conj(D_fft), s=(R_sz, R_sz)))
+
+            n_valid_j_rot = float(valid_j_rot.sum())
+            denom = max(min(n_valid_i, n_valid_j_rot), 1.0)
+            overlap_frac = overlap / denom
+
+            with np.errstate(divide='ignore', invalid='ignore'):
+                if score_mode == "relief":
+                    score_map = np.where(overlap > 0.5, -CC / overlap, -np.inf)
+                elif score_mode == "overlap_only":
+                    score_map = overlap_frac
+                else:  # "joint"
+                    relief_score = np.where(overlap > 0.5, -CC / overlap, 0.0)
+                    score_map = relief_score * overlap_frac
+
+            best_at_angle = float(np.max(score_map))
+            if best_at_angle > profile[k]:
+                profile[k] = best_at_angle
+
+    profile[~np.isfinite(profile)] = 0.0
+    return profile
+
+
 def build_correspondences(
     dmap_i, valid_i, c_i, u_i, v_i, n_i, u_min_i, v_min_i,
     dmap_j, valid_j, c_j, u_j, v_j, n_j, u_min_j, v_min_j,

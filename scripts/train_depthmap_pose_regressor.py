@@ -33,6 +33,7 @@ from torch.utils.data import Dataset, DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from assembly.models.depthmap_pose_regressor import DepthmapPoseRegressor, pose_regressor_loss
+from scripts.phase5a_depthmap_matching import angle_correlation_profile, DEFAULT_N_ANGLES
 
 
 def _augment_rotate(dmap_i, valid_i, theta_gt, shift_y_gt, shift_x_gt, rng):
@@ -62,17 +63,20 @@ def _augment_rotate(dmap_i, valid_i, theta_gt, shift_y_gt, shift_x_gt, rng):
 
 
 class DepthmapPairDataset(Dataset):
-    def __init__(self, npz_path, augment=False, seed=0):
+    def __init__(self, npz_path, augment=False, seed=0, n_angles=DEFAULT_N_ANGLES):
         data = np.load(npz_path)
         self.dmap_i = data["dmap_i"]
         self.valid_i = data["valid_i"]
         self.dmap_j = data["dmap_j"]
         self.valid_j = data["valid_j"]
+        self.corr_profile_normal = data["corr_profile_normal"]
+        self.corr_profile_mirror = data["corr_profile_mirror"]
         self.theta_gt = data["theta_gt"]
         self.shift_y_gt = data["shift_y_gt"]
         self.shift_x_gt = data["shift_x_gt"]
         self.mirror_gt = data["mirror_gt"]
         self.augment = augment
+        self.n_angles = n_angles
         self.rng = np.random.default_rng(seed)
 
     def __len__(self):
@@ -80,18 +84,32 @@ class DepthmapPairDataset(Dataset):
 
     def __getitem__(self, idx):
         dmap_i, valid_i = self.dmap_i[idx], self.valid_i[idx]
+        dmap_j, valid_j = self.dmap_j[idx], self.valid_j[idx]
         theta_gt = float(self.theta_gt[idx])
         shift_y_gt, shift_x_gt = float(self.shift_y_gt[idx]), float(self.shift_x_gt[idx])
+        profile_normal = self.corr_profile_normal[idx]
+        profile_mirror = self.corr_profile_mirror[idx]
 
         if self.augment:
             dmap_i, valid_i, theta_gt, shift_y_gt, shift_x_gt = _augment_rotate(
                 dmap_i, valid_i, theta_gt, shift_y_gt, shift_x_gt, self.rng)
+            # dmap_i a changé (rotation aléatoire) -- le profil précalculé
+            # (calculé sur le dmap_i D'ORIGINE, cf. phase8_build_regressor_dataset.py)
+            # ne correspond plus. Recalcul exact via FFT (pas une approximation
+            # par décalage circulaire de l'indexation d'angle) -- coûte
+            # 2 x n_angles x 2-flips FFT (64x64) par exemple, dans les workers
+            # CPU du DataLoader (num_workers>0), pas dans la boucle GPU.
+            profile_normal = angle_correlation_profile(dmap_i, valid_i, dmap_j, valid_j, self.n_angles)
+            profile_mirror = angle_correlation_profile(
+                dmap_i, valid_i, np.flip(dmap_j, axis=0), np.flip(valid_j, axis=0), self.n_angles)
 
         return {
             "dmap_i": torch.from_numpy(dmap_i),
             "valid_i": torch.from_numpy(valid_i),
-            "dmap_j": torch.from_numpy(self.dmap_j[idx]),
-            "valid_j": torch.from_numpy(self.valid_j[idx]),
+            "dmap_j": torch.from_numpy(dmap_j),
+            "valid_j": torch.from_numpy(valid_j),
+            "profile_normal": torch.from_numpy(profile_normal.astype(np.float32)),
+            "profile_mirror": torch.from_numpy(profile_mirror.astype(np.float32)),
             "theta_gt": torch.tensor(theta_gt, dtype=torch.float32),
             "shift_y_gt": torch.tensor(shift_y_gt, dtype=torch.float32),
             "shift_x_gt": torch.tensor(shift_x_gt, dtype=torch.float32),
@@ -122,7 +140,8 @@ def evaluate(model, loader, device):
     angle_errs, shift_errs, mirror_correct = [], [], []
     for batch in loader:
         batch = {k: v.to(device) for k, v in batch.items()}
-        pred = model(batch["dmap_i"], batch["valid_i"], batch["dmap_j"], batch["valid_j"])
+        pred = model(batch["dmap_i"], batch["valid_i"], batch["dmap_j"], batch["valid_j"],
+                     batch["profile_normal"], batch["profile_mirror"])
         loss, _ = pose_regressor_loss(
             pred, batch["theta_gt"], batch["shift_y_gt"], batch["shift_x_gt"], batch["mirror_gt"])
         bs = batch["theta_gt"].shape[0]
@@ -203,7 +222,8 @@ def main():
         train_loss_sum, n_seen = 0.0, 0
         for batch in train_loader:
             batch = {k: v.to(device) for k, v in batch.items()}
-            pred = model(batch["dmap_i"], batch["valid_i"], batch["dmap_j"], batch["valid_j"])
+            pred = model(batch["dmap_i"], batch["valid_i"], batch["dmap_j"], batch["valid_j"],
+                         batch["profile_normal"], batch["profile_mirror"])
             loss, _ = pose_regressor_loss(
                 pred, batch["theta_gt"], batch["shift_y_gt"], batch["shift_x_gt"],
                 batch["mirror_gt"], w_angle=args.w_angle, w_shift=args.w_shift, w_conf=args.w_conf,

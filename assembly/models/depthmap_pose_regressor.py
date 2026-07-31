@@ -21,10 +21,35 @@ une ambiguïté différente.
 
 `sin`/`cos` pour l'angle (pas `theta` brut) : évite la discontinuité de
 l'enroulement d'angle à 360°/0°, décodage par `atan2(sin, cos)`.
-"""
+
+MISE À JOUR (2026-07-31, cadrage Phase 8 "corrélation croisée explicite") --
+le résultat thresh0.3 (2026-07-30) montrait un sur-apprentissage sévère que
+ni le volume de données, ni un split train/val cohérent, ni l'augmentation
+par rotation n'ont résolu. Hypothèse retenue : l'encodeur siamois pool
+chaque depth map en un vecteur global (`AdaptiveAvgPool2d(1)`) AVANT toute
+comparaison i/j -- toute l'information spatiale (où se trouve quoi) est
+détruite avant même la fusion, forçant le réseau à réapprendre depuis zéro
+un signal de corrélation que la recherche FFT hand-crafted (`match_depthmaps`,
+Phase 5A) calcule déjà explicitement et de façon validée. Plutôt qu'une
+refonte complète (volume de corrélation spatiale ou Fourier-Mellin
+différentiable, plus ambitieux et plus risqué), option choisie : injecter le
+profil de corrélation par angle (`angle_correlation_profile`,
+`scripts/phase5a_depthmap_matching.py`) comme feature auxiliaire dans la
+fusion, pour CHAQUE hypothèse (normal/miroir) séparément -- le réseau peut
+alors apprendre à pondérer/affiner ce signal plutôt qu'à le redécouvrir."""
 
 import torch
 import torch.nn as nn
+
+
+def _normalize_profile(profile: torch.Tensor) -> torch.Tensor:
+    """Normalise le profil de corrélation PAR ÉCHANTILLON (même logique que
+    `_normalize_depth`) -- l'échelle absolue du score (`relief * overlap_frac`)
+    varie avec la taille/densité du fragment, seule la FORME du profil
+    (où sont les pics) porte le signal de rotation. `profile` : (B, n_angles)."""
+    mean = profile.mean(dim=1, keepdim=True)
+    std = profile.std(dim=1, keepdim=True).clamp_min(1e-8)
+    return (profile - mean) / std
 
 
 def _normalize_depth(dmap: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
@@ -67,31 +92,48 @@ class _SiameseEncoder(nn.Module):
 
 
 class DepthmapPoseRegressor(nn.Module):
-    """Params par défaut : ~90K (feat_dim=64, hidden=128/64) -- cohérent
-    avec la philosophie "petit modèle" du CNN de segmentation (544K)."""
+    """Params par défaut : ~100K (feat_dim=64, hidden=128/64, n_angles=36,
+    profile_feat_dim=16) -- cohérent avec la philosophie "petit modèle" du
+    CNN de segmentation (544K)."""
 
-    def __init__(self, feat_dim: int = 64, hidden_dim: int = 128):
+    def __init__(self, feat_dim: int = 64, hidden_dim: int = 128,
+                 n_angles: int = 36, profile_feat_dim: int = 16):
         super().__init__()
         self.encoder = _SiameseEncoder(in_ch=2, feat_dim=feat_dim)
-        head_in = 4 * feat_dim   # concat(f_i, f_j, f_i - f_j, f_i * f_j)
+        self.n_angles = n_angles
+        # Encode le profil de corrélation FFT (angle_correlation_profile,
+        # phase5a_depthmap_matching.py) -- le mécanisme de "corrélation
+        # croisée explicite" (2026-07-31, cf. docstring module).
+        self.profile_encoder = nn.Sequential(
+            nn.Linear(n_angles, 32), nn.ReLU(inplace=True),
+            nn.Linear(32, profile_feat_dim), nn.ReLU(inplace=True),
+        )
+        head_in = 4 * feat_dim + profile_feat_dim   # concat(f_i, f_j, f_i - f_j, f_i * f_j, profile_emb)
         self.head = nn.Sequential(
             nn.Linear(head_in, hidden_dim), nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim // 2), nn.ReLU(inplace=True),
             nn.Linear(hidden_dim // 2, 5),   # sin, cos, shift_y, shift_x, confidence_logit
         )
 
-    def _fuse_and_predict(self, f_i: torch.Tensor, f_j: torch.Tensor) -> torch.Tensor:
-        fused = torch.cat([f_i, f_j, f_i - f_j, f_i * f_j], dim=1)
+    def _fuse_and_predict(self, f_i: torch.Tensor, f_j: torch.Tensor,
+                           profile_emb: torch.Tensor) -> torch.Tensor:
+        fused = torch.cat([f_i, f_j, f_i - f_j, f_i * f_j, profile_emb], dim=1)
         return self.head(fused)   # (B, 5)
 
     def forward(self, dmap_i: torch.Tensor, valid_i: torch.Tensor,
-                dmap_j: torch.Tensor, valid_j: torch.Tensor):
+                dmap_j: torch.Tensor, valid_j: torch.Tensor,
+                profile_normal: torch.Tensor, profile_mirror: torch.Tensor):
         """`dmap_*`/`valid_*` : (B, R, R) float -- `valid_i`/`valid_j` en
-        {0,1} (ou probabilités). Retourne un dict avec, pour chaque
-        hypothèse ("normal"/"mirror") : `sin`, `cos`, `shift_y`, `shift_x`,
-        `confidence_logit` -- (B,) chacun -- plus `mirror_prob` (B,)
-        (probabilité de l'hypothèse miroir, softmax des deux confidences)
-        pour le décodage/la perte.
+        {0,1} (ou probabilités). `profile_normal`/`profile_mirror` :
+        (B, n_angles) float -- sortie de `angle_correlation_profile()`
+        (`scripts/phase5a_depthmap_matching.py`), calculée une fois pour
+        `dmap_j` tel quel et une fois pour `dmap_j` mirroré (même convention
+        que le flip ci-dessous) -- PAS recalculée ici (coûteux, FFT
+        numpy/scipy, pas de version torch différentiable). Retourne un dict
+        avec, pour chaque hypothèse ("normal"/"mirror") : `sin`, `cos`,
+        `shift_y`, `shift_x`, `confidence_logit` -- (B,) chacun -- plus
+        `mirror_prob` (B,) (probabilité de l'hypothèse miroir, softmax des
+        deux confidences) pour le décodage/la perte.
 
         Le miroir = retourner `dmap_j`/`valid_j` selon l'axe des RANGÉES
         (`dim=-2`) -- équivalent à négater `v_j` avant rasterisation (cf.
@@ -107,8 +149,11 @@ class DepthmapPoseRegressor(nn.Module):
         f_j_normal = self.encoder(x_j_normal)
         f_j_mirror = self.encoder(x_j_mirror)
 
-        out_normal = self._fuse_and_predict(f_i, f_j_normal)
-        out_mirror = self._fuse_and_predict(f_i, f_j_mirror)
+        prof_n = self.profile_encoder(_normalize_profile(profile_normal))
+        prof_m = self.profile_encoder(_normalize_profile(profile_mirror))
+
+        out_normal = self._fuse_and_predict(f_i, f_j_normal, prof_n)
+        out_mirror = self._fuse_and_predict(f_i, f_j_mirror, prof_m)
 
         conf = torch.stack([out_normal[:, 4], out_mirror[:, 4]], dim=1)   # (B, 2)
         mirror_prob = torch.softmax(conf, dim=1)[:, 1]                   # (B,)

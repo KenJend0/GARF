@@ -3920,3 +3920,86 @@ Le résultat thresh0.3 reste un échec après plusieurs tentatives
 raisonnables (volume, cohérence train/val, augmentation). Pas de nouvelle
 itération pour l'instant sans un changement d'architecture plus réfléchi
 (mécanisme de corrélation) -- à reprendre dans une prochaine session.
+
+## Phase 8, reprise (2026-07-31) — mécanisme de corrélation croisée explicite
+
+Trois architectures possibles pour réintroduire un mécanisme de corrélation
+(discutées avec l'utilisateur) :
+1. **Feature FFT en entrée** (retenue) : réutilise `match_depthmaps()` pour
+   calculer un vecteur de scores par angle candidat, injecté comme feature
+   auxiliaire dans le MLP existant.
+2. Volume de corrélation spatiale (type PWC-Net) sur des feature maps non
+   poolées + têtes CNN/MLP -- end-to-end différentiable, plus lourd.
+3. Fourier-Mellin différentiable (log-polaire + corrélation de phase) --
+   le plus élégant mathématiquement, le plus complexe à implémenter/valider.
+
+**Décision : option 1**, cohérente avec la méthode "diagnostic simple avant
+architecture lourde" qui a marché tout au long du projet (cf. rejets
+dilation/gaussian-splat/PCA robuste, toujours testés en isolé avant d'être
+câblés). Coût faible (réutilise du code déjà validé), teste directement
+l'hypothèse motivant ce chantier (sur-apprentissage thresh0.3 = absence de
+signal de corrélation explicite ?) avant d'investir dans 2 ou 3.
+
+**Diagnostic du problème actuel** : l'encodeur siamois (`_SiameseEncoder`,
+`assembly/models/depthmap_pose_regressor.py`) réduit chaque depth map à un
+vecteur global via `AdaptiveAvgPool2d(1)` — toute l'information spatiale
+(où se trouve quoi) est détruite AVANT la fusion i/j. `match_depthmaps`,
+lui, calcule une vraie corrélation 2D explicite (FFT) entre les cartes.
+Le pooling global empêche structurellement le réseau de faire la même chose
+en interne à partir des seuls pixels bruts.
+
+**Implémenté :**
+- `angle_correlation_profile()` (`scripts/phase5a_depthmap_matching.py`,
+  après `match_depthmaps`) : même boucle FFT rotation × flip que
+  `match_depthmaps`, mais retourne le MEILLEUR SCORE PAR ANGLE (vecteur
+  `(n_angles,)`, max sur shift ET flip), pas juste le meilleur global.
+  Dupliquée intentionnellement (pas de refactor partagé) pour ne pas
+  risquer de régression sur `match_depthmaps`, déjà validé sur des milliers
+  de paires Phase 5A-7. Vérifiée localement (`KMP_DUPLICATE_LIB_OK=TRUE
+  python -c "..."` sur une paire synthétique) : le pic du profil tombe
+  exactement sur le même angle que `best_theta` de `match_depthmaps`.
+- `DepthmapPoseRegressor` (`assembly/models/depthmap_pose_regressor.py`) :
+  nouveau `profile_encoder` (MLP `n_angles→32→16`), profil normalisé par
+  échantillon (`_normalize_profile`, même logique que `_normalize_depth` --
+  seule la FORME du profil porte le signal, pas son échelle absolue qui
+  varie avec la taille/densité du fragment). Concaténé à la fusion
+  `(f_i, f_j, f_i-f_j, f_i*f_j)` avant la tête MLP (`head_in` : 4×feat_dim
+  → 4×feat_dim + 16). **Deux profils distincts** (`profile_normal`/
+  `profile_mirror`), un par hypothèse d'orientation (u,v) de j — cohérent
+  avec l'architecture existante à deux branches (normal/miroir).
+- `phase8_build_regressor_dataset.py` : précalcule les deux profils par
+  paire (coûteux : FFT, une fois pour toutes, pas à chaque epoch) via
+  `angle_correlation_profile(dmap_i, valid_i, dmap_j, valid_j, ...)` (normal)
+  et la même chose avec `dmap_j`/`valid_j` mirroré (`np.flip(..., axis=0)`,
+  même convention que le flip du modèle). Stockés dans le `.npz`.
+- `train_depthmap_pose_regressor.py` : `DepthmapPairDataset` charge les
+  profils précalculés. Si `--augment` (défaut), `dmap_i` est tourné
+  aléatoirement (`_augment_rotate`, existant) — les profils précalculés
+  (calculés sur le `dmap_i` d'ORIGINE) ne sont alors plus valides,
+  **recalculés exactement via FFT dans `__getitem__`** (pas une
+  approximation par décalage circulaire de l'indexation d'angle) — coût
+  additionnel non négligeable mais fait dans les workers CPU du
+  DataLoader, pas dans la boucle GPU. À surveiller au premier run (temps
+  par epoch).
+- `phase8_pipeline_learned_check.py` (éval bout-en-bout) : calcule les deux
+  profils à la volée dans `run_learned_stage1()`, même logique qu'à
+  l'entraînement.
+- `test_phase8_regressor.py` : smoke test mis à jour (tenseurs de profil
+  aléatoires en plus des depth maps) — 5/5 passent en local.
+
+**Compatibilité checkpoints** : signature de `forward()` changée (2 arguments
+en plus) et `state_dict` changé (nouveau `profile_encoder`, `head` élargi)
+— les checkpoints `output/phase8_depthmap_regressor_gt_v3/` et les runs
+thresh0.3 du 2026-07-30 ne sont PAS compatibles, retraining complet
+nécessaire (attendu, pas un problème).
+
+**Prochaines actions (oracle-first, comme toute la Phase 7-8) :**
+1. Regénérer les `.npz` GT (train + val) avec `phase8_build_regressor_dataset.py`
+   (format changé : `corr_profile_normal`/`corr_profile_mirror` ajoutés).
+2. Réentraîner sur GT — vérifier au moins la non-régression par rapport au
+   résultat déjà acquis (55.3%/39.7%), avant d'aller sur thresh0.3.
+3. Regénérer les `.npz` thresh0.3 (train + val) et réentraîner — c'est le
+   vrai test : est-ce que le profil de corrélation explicite suffit à
+   corriger le sur-apprentissage sévère observé le 2026-07-30 ?
+4. Si non concluant, réévaluer les options 2/3 (volume spatial /
+   Fourier-Mellin) en connaissance de cause.

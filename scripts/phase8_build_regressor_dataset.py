@@ -66,7 +66,9 @@ from hydra.utils import instantiate
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.analyze_errors import load_config_and_model
-from scripts.phase5a_depthmap_matching import quat_wxyz_to_rotmat, rasterize
+from scripts.phase5a_depthmap_matching import (
+    quat_wxyz_to_rotmat, rasterize, angle_correlation_profile, DEFAULT_N_ANGLES,
+)
 from scripts.phase5a_zoom_resample_check import zoom_resample, to_input_frame
 from scripts.phase5a_zoom_resample_thresh03_check import dominant_cluster_mask
 from scripts.phase8_depthmap_regressor_dataset import canonical_pca_frame, fit_theta_shift_mirror_from_gt
@@ -115,9 +117,21 @@ def process_pair(frac_i, frac_j, R_ij_gt, t_ij_gt):
         frame["pixel_size"], RESOLUTION, R_ij_gt, t_ij_gt,
     )
     sy, sx = shift_gt
+
+    # Profil de corrélation FFT par angle (2026-07-31, "corrélation croisée
+    # explicite", cf. assembly/models/depthmap_pose_regressor.py) -- une
+    # hypothèse par orientation de j (normal / miroir des rangées, même
+    # convention que le flip du modèle), précalculé UNE fois ici (coûteux :
+    # 2 x n_angles x 2-flips FFT par paire), pas à chaque epoch.
+    profile_normal = angle_correlation_profile(dmap_i, valid_i, dmap_j, valid_j, DEFAULT_N_ANGLES)
+    profile_mirror = angle_correlation_profile(
+        dmap_i, valid_i, np.flip(dmap_j, axis=0), np.flip(valid_j, axis=0), DEFAULT_N_ANGLES)
+
     return {
         "dmap_i": dmap_i.astype(np.float32), "valid_i": valid_i.astype(np.float32),
         "dmap_j": dmap_j.astype(np.float32), "valid_j": valid_j.astype(np.float32),
+        "corr_profile_normal": profile_normal.astype(np.float32),
+        "corr_profile_mirror": profile_mirror.astype(np.float32),
         "theta_gt": np.float32(theta_gt), "shift_y_gt": np.float32(sy), "shift_x_gt": np.float32(sx),
         "mirror_gt": bool(mirror_gt), "residual": np.float32(residual),
         "n_frac_pts_min": int(n_min),
@@ -125,8 +139,8 @@ def process_pair(frac_i, frac_j, R_ij_gt, t_ij_gt):
 
 
 def save_npz(rows, out_path):
-    keys = ["dmap_i", "valid_i", "dmap_j", "valid_j", "theta_gt", "shift_y_gt",
-            "shift_x_gt", "mirror_gt", "residual", "n_frac_pts_min"]
+    keys = ["dmap_i", "valid_i", "dmap_j", "valid_j", "corr_profile_normal", "corr_profile_mirror",
+            "theta_gt", "shift_y_gt", "shift_x_gt", "mirror_gt", "residual", "n_frac_pts_min"]
     arrays = {k: np.stack([r[k] for r in rows]) for k in keys}
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out_path, **arrays)

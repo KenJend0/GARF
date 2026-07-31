@@ -58,6 +58,7 @@ from scripts.analyze_errors import load_config_and_model
 from scripts.phase5a_weighted_gt_check import extract_gt_variable
 from scripts.phase5a_depthmap_matching import (
     quat_wxyz_to_rotmat, rasterize, kabsch, rot_err_deg, trans_err, build_correspondences_nn,
+    angle_correlation_profile, DEFAULT_N_ANGLES,
 )
 from scripts.phase5a_zoom_resample_check import zoom_resample, to_input_frame
 from scripts.phase5a_zoom_resample_thresh03_check import dominant_cluster_mask
@@ -92,12 +93,21 @@ def run_learned_stage1(model, frac_i, frac_j, R_ij_gt, t_ij_gt, device):
 
     dmap_i, valid_i, dmap_j, valid_j, frame = build_frame_and_rasterize(frac_i, frac_j)
 
+    # Profil de corrélation FFT (2026-07-31, "corrélation croisée explicite")
+    # -- calculé à la volée ici, comme à l'entraînement (pas de version
+    # torch différentiable, coût négligeable : 2 x 36 x 2-flips FFT 64x64).
+    profile_normal = angle_correlation_profile(dmap_i, valid_i, dmap_j, valid_j, DEFAULT_N_ANGLES)
+    profile_mirror = angle_correlation_profile(
+        dmap_i, valid_i, np.flip(dmap_j, axis=0), np.flip(valid_j, axis=0), DEFAULT_N_ANGLES)
+
     t_dmap_i = torch.from_numpy(dmap_i[None]).float().to(device)
     t_valid_i = torch.from_numpy(valid_i[None]).float().to(device)
     t_dmap_j = torch.from_numpy(dmap_j[None]).float().to(device)
     t_valid_j = torch.from_numpy(valid_j[None]).float().to(device)
+    t_profile_normal = torch.from_numpy(profile_normal[None].astype(np.float32)).to(device)
+    t_profile_mirror = torch.from_numpy(profile_mirror[None].astype(np.float32)).to(device)
 
-    pred = model(t_dmap_i, t_valid_i, t_dmap_j, t_valid_j)
+    pred = model(t_dmap_i, t_valid_i, t_dmap_j, t_valid_j, t_profile_normal, t_profile_mirror)
     theta_t, sy_t, sx_t, mirror_t = DepthmapPoseRegressor.decode(pred)
     theta = float(theta_t.item())
     shift = (float(sy_t.item()), float(sx_t.item()))
