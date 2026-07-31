@@ -27,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy.ndimage import rotate as ndimage_rotate
 from torch.utils.data import Dataset, DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -34,8 +35,34 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from assembly.models.depthmap_pose_regressor import DepthmapPoseRegressor, pose_regressor_loss
 
 
+def _augment_rotate(dmap_i, valid_i, theta_gt, shift_y_gt, shift_x_gt, rng):
+    """Rotation aléatoire de `dmap_i`/`valid_i` (augmentation, 2026-07-30 --
+    diagnostic thresh0.3 : surapprentissage sévère, angle_err/mirror_acc au
+    niveau du hasard sur validation malgré un volume comparable au run GT
+    qui, lui, généralisait). Ajustement EXACT des labels -- PAS une
+    approximation : `theta_new = theta_gt - alpha`, le vecteur `shift`
+    tourne de `Rot(-alpha)`. Convention vérifiée EMPIRIQUEMENT en local
+    (suivi d'un pixel isolé à travers `scipy.ndimage.rotate`) puis la
+    formule complète validée par un round-trip sur
+    `_forward_transform_reference` (20/20 tirages, phase8_depthmap_regressor_dataset.py)
+    avant intégration ici -- `ndimage_rotate(img, alpha)` déplace le
+    contenu selon `Rot(-alpha)` en coordonnées (col,row), PAS `Rot(+alpha)`
+    comme l'intuition mathématique naïve le suggérerait (axe des rangées
+    orienté vers le bas)."""
+    alpha = float(rng.uniform(0, 360))
+    dmap_i_rot = ndimage_rotate(dmap_i, alpha, reshape=False, order=1, cval=0.0)
+    valid_i_rot = (ndimage_rotate(valid_i, alpha, reshape=False, order=1, cval=0.0) > 0.5).astype(np.float32)
+
+    a = np.radians(alpha)
+    c, s = np.cos(-a), np.sin(-a)
+    theta_new = (theta_gt - alpha) % 360.0
+    shift_x_new = c * shift_x_gt - s * shift_y_gt
+    shift_y_new = s * shift_x_gt + c * shift_y_gt
+    return dmap_i_rot.astype(np.float32), valid_i_rot, theta_new, shift_y_new, shift_x_new
+
+
 class DepthmapPairDataset(Dataset):
-    def __init__(self, npz_path):
+    def __init__(self, npz_path, augment=False, seed=0):
         data = np.load(npz_path)
         self.dmap_i = data["dmap_i"]
         self.valid_i = data["valid_i"]
@@ -45,21 +72,42 @@ class DepthmapPairDataset(Dataset):
         self.shift_y_gt = data["shift_y_gt"]
         self.shift_x_gt = data["shift_x_gt"]
         self.mirror_gt = data["mirror_gt"]
+        self.augment = augment
+        self.rng = np.random.default_rng(seed)
 
     def __len__(self):
         return len(self.theta_gt)
 
     def __getitem__(self, idx):
+        dmap_i, valid_i = self.dmap_i[idx], self.valid_i[idx]
+        theta_gt = float(self.theta_gt[idx])
+        shift_y_gt, shift_x_gt = float(self.shift_y_gt[idx]), float(self.shift_x_gt[idx])
+
+        if self.augment:
+            dmap_i, valid_i, theta_gt, shift_y_gt, shift_x_gt = _augment_rotate(
+                dmap_i, valid_i, theta_gt, shift_y_gt, shift_x_gt, self.rng)
+
         return {
-            "dmap_i": torch.from_numpy(self.dmap_i[idx]),
-            "valid_i": torch.from_numpy(self.valid_i[idx]),
+            "dmap_i": torch.from_numpy(dmap_i),
+            "valid_i": torch.from_numpy(valid_i),
             "dmap_j": torch.from_numpy(self.dmap_j[idx]),
             "valid_j": torch.from_numpy(self.valid_j[idx]),
-            "theta_gt": torch.tensor(self.theta_gt[idx], dtype=torch.float32),
-            "shift_y_gt": torch.tensor(self.shift_y_gt[idx], dtype=torch.float32),
-            "shift_x_gt": torch.tensor(self.shift_x_gt[idx], dtype=torch.float32),
+            "theta_gt": torch.tensor(theta_gt, dtype=torch.float32),
+            "shift_y_gt": torch.tensor(shift_y_gt, dtype=torch.float32),
+            "shift_x_gt": torch.tensor(shift_x_gt, dtype=torch.float32),
             "mirror_gt": torch.tensor(bool(self.mirror_gt[idx])),
         }
+
+
+def _reseed_worker(worker_id):
+    """`worker_init_fn` -- sans ça, chaque worker DataLoader hérite d'une
+    copie du Dataset avec le MÊME état de `rng` (augmentation corrélée
+    entre workers). Fonction au niveau MODULE (pas imbriquée dans `main()`)
+    -- nécessaire pour être picklable sous le contexte multiprocessing
+    `spawn` (Windows notamment) ; `worker_info.seed` est un seed déjà
+    unique par worker fourni par torch, pas besoin de le dériver nous-mêmes."""
+    worker_info = torch.utils.data.get_worker_info()
+    worker_info.dataset.rng = np.random.default_rng(worker_info.seed % (2**32))
 
 
 def _angular_error_deg(theta_pred, theta_gt):
@@ -114,6 +162,12 @@ def main():
     parser.add_argument("--w_shift", type=float, default=0.01)
     parser.add_argument("--w_conf",  type=float, default=1.0)
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--no_augment", action="store_true",
+                        help="Désactive l'augmentation par rotation aléatoire de dmap_i "
+                             "(activée par défaut depuis le 2026-07-30 -- diagnostic "
+                             "thresh0.3 : surapprentissage sévère sans elle, val au niveau "
+                             "du hasard malgré un volume comparable au run GT qui "
+                             "généralisait). Jamais appliquée à la validation.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -123,12 +177,13 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    train_ds = DepthmapPairDataset(args.train_npz)
-    val_ds = DepthmapPairDataset(args.val_npz)
-    print(f"train: {len(train_ds)} paires | val: {len(val_ds)} paires")
+    train_ds = DepthmapPairDataset(args.train_npz, augment=not args.no_augment, seed=args.seed)
+    val_ds = DepthmapPairDataset(args.val_npz, augment=False)
+    print(f"train: {len(train_ds)} paires (augment={not args.no_augment}) | val: {len(val_ds)} paires")
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                               num_workers=args.num_workers, drop_last=True)
+                               num_workers=args.num_workers, drop_last=True,
+                               worker_init_fn=_reseed_worker if args.num_workers > 0 else None)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                              num_workers=args.num_workers)
 
