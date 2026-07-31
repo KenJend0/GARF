@@ -66,7 +66,6 @@ from hydra.utils import instantiate
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.analyze_errors import load_config_and_model
-from scripts.phase5a_weighted_gt_check import extract_gt_variable
 from scripts.phase5a_depthmap_matching import quat_wxyz_to_rotmat, rasterize
 from scripts.phase5a_zoom_resample_check import zoom_resample, to_input_frame
 from scripts.phase5a_zoom_resample_thresh03_check import dominant_cluster_mask
@@ -151,7 +150,6 @@ def main():
     parser.add_argument("--threshold",   type=float, default=0.3)
     parser.add_argument("--extra_budget", type=int, default=1200)
     parser.add_argument("--expand_rings", type=int, default=0)
-    parser.add_argument("--num_points_to_sample", type=int, default=10000)
     parser.add_argument("--max_batches", type=int, default=0, help="0 = tout le split")
     parser.add_argument("--out", required=True)
     parser.add_argument("--device",      default="cuda" if torch.cuda.is_available() else "cpu")
@@ -182,13 +180,13 @@ def main():
             batch_size=1, num_workers=4, categories=args.categories, model_type="cnn",
         )
         cfg = load_config_and_model(fake_args)
-        cfg.data.num_points_to_sample = args.num_points_to_sample
         datamodule = instantiate(cfg.data)
         datamodule.setup("fit" if args.split != "test" else "test")
         dataset = {"train": datamodule.train_dataset, "val": datamodule.val_dataset,
                    "test": datamodule.test_dataset}[args.split]
 
         from torch.utils.data import DataLoader
+        from assembly.models.projection_mapping_utils import extract_fragment_list
         loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0,
                              collate_fn=datamodule.dataset_cls.collate_fn)
 
@@ -199,37 +197,47 @@ def main():
                 print(f"  objet {idx} | 2-frags vus={n_seen_2frag} | paires générées="
                       f"{len(rows)} | {time.time()-t0:.0f}s écoulées")
 
-            points_per_part = batch["points_per_part"][0].numpy()
-            valid_slots = [p for p in range(len(points_per_part)) if points_per_part[p] > 0]
-            if len(valid_slots) != 2:
+            # Format "cnn"/uniform (PAS le format "weighted"/extract_gt_variable
+            # utilisé avant le 2026-07-30, qui suppose des tailles de fragment
+            # variables -- bug corrigé, cf. AVANCEES_POST_PRESENTATION.md
+            # section 7 et phase7_isolated_fp_prevalence_check.py pour le
+            # même motif déjà validé) : `pointclouds` s'extrait via
+            # `extract_fragment_list` (tailles égales par fragment, indexé par
+            # k = position parmi les fragments valides) ; `fracture_surface_gt`
+            # est déjà (B, P, N) et s'indexe DIRECTEMENT par p = slot réel
+            # (PAS par k -- ce sont deux indexations différentes).
+            frag_list, valid_pcs, K = extract_fragment_list(
+                batch["pointclouds"], batch["points_per_part"])
+            if K != 2:
                 continue
             n_seen_2frag += 1
 
-            pointclouds = batch["pointclouds"][0].numpy()
-            fracture_gt = batch["fracture_surface_gt"][0].numpy()
-            frag_pts = extract_gt_variable(pointclouds, points_per_part)
-            frag_gt  = extract_gt_variable(fracture_gt, points_per_part)
-            if len(frag_pts) != 2:
+            valid_pcs_np = valid_pcs.numpy()
+            p_slots = [p for p in range(valid_pcs_np.shape[1]) if valid_pcs_np[0, p]]
+            if len(p_slots) != 2:
                 continue
+            p0, p1 = p_slots
 
-            p0, p1 = valid_slots[0], valid_slots[1]
-            scale_np = batch["scale"][0].numpy()
-            if scale_np.ndim == 1:
-                scale_np = scale_np[:, None]
-            quats_np = batch["quaternions"][0].numpy()
-            trans_np = batch["translations"][0].numpy()
+            pc_per_k = [frag_list[k].numpy() for k in range(K)]
+            scale_np = batch["scale"].numpy()
+            if scale_np.ndim == 2:
+                scale_np = scale_np[:, :, None]
+            quats_np = batch["quaternions"].numpy()
+            trans_np = batch["translations"].numpy()
+            fracture_gt_np = batch["fracture_surface_gt"].numpy()   # (1, P, N)
 
-            raw_i = frag_pts[0] * scale_np[p0]
-            raw_j = frag_pts[1] * scale_np[p1]
-            gt_i, gt_j = frag_gt[0], frag_gt[1]
+            raw_i = pc_per_k[0] * scale_np[0, p0]
+            raw_j = pc_per_k[1] * scale_np[0, p1]
+            gt_i = fracture_gt_np[0, p0] == 1
+            gt_j = fracture_gt_np[0, p1] == 1
 
-            frac_i = raw_i[gt_i == 1]
-            frac_j = raw_j[gt_j == 1]
+            frac_i = raw_i[gt_i]
+            frac_j = raw_j[gt_j]
 
-            R0 = quat_wxyz_to_rotmat(quats_np[p0])
-            R1 = quat_wxyz_to_rotmat(quats_np[p1])
+            R0 = quat_wxyz_to_rotmat(quats_np[0, p0])
+            R1 = quat_wxyz_to_rotmat(quats_np[0, p1])
             R_ij_gt = R1.T @ R0
-            t_ij_gt = R1.T @ (trans_np[p0] - trans_np[p1])
+            t_ij_gt = R1.T @ (trans_np[0, p0] - trans_np[0, p1])
 
             row = process_pair(frac_i, frac_j, R_ij_gt, t_ij_gt)
             if row is not None:
