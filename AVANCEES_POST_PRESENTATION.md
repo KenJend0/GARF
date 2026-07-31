@@ -499,7 +499,24 @@ Implémentation : `assembly/models/cnn_segmentation_model.py` (`compute_boundary
 
 **Décision (2026-07-28, avec l'utilisateur) : Step 15 reste le modèle final retenu.** Pas de nouvelle itération sur ce chantier (ablation boundary-seul vs coherence-seul, ou poids réduits, envisagés mais écartés faute de gain attendu clair) — documenté comme résultat négatif informatif, même statut que Step 12 (overlap channels).
 
-**CORRECTION (2026-07-30) :** le chiffre "amas isolés 56.1%→8.2%" ci-dessus était mesuré sur le mauvais checkpoint (`last.ckpt` = `epoch-0.ckpt`, pas le run complet — trois redémarrages OOM ont versionné les checkpoints Lightning, le vrai fichier final est `last-v1.ckpt` = `epoch-29.ckpt`, même piège que Step 12/13). Revérifié sur le bon fichier : les amas isolés ont en réalité **empiré** (55.8%→61.8% des fragments, 14.0%→21.1% du volume de FP), et la précision globale du masque s'est effondrée dans toutes les catégories (cluster principal 88.5%→83.3%, secondaires 73.1%→59.5%, bruit isolé 60.3%→41.1%) — une dégradation généralisée, pas ciblée aux frontières. La régression du matching en aval (confirmée réelle, chiffres cohérents sur le bon checkpoint) n'a donc PAS l'explication qu'on lui donnait ("coherence loss réussit, boundary loss est le seul coupable") — voir `PLAN_REASSEMBLY_MODULE.md` pour le détail complet et la décision de pivot qui en découle (modèle appris sur les depth maps, en cours de cadrage).
+**CORRECTION (2026-07-30) :** le chiffre "amas isolés 56.1%→8.2%" ci-dessus était mesuré sur le mauvais checkpoint (`last.ckpt` = `epoch-0.ckpt`, pas le run complet — trois redémarrages OOM ont versionné les checkpoints Lightning, le vrai fichier final est `last-v1.ckpt` = `epoch-29.ckpt`, même piège que Step 12/13). Revérifié sur le bon fichier : les amas isolés ont en réalité **empiré** (55.8%→61.8% des fragments, 14.0%→21.1% du volume de FP), et la précision globale du masque s'est effondrée dans toutes les catégories (cluster principal 88.5%→83.3%, secondaires 73.1%→59.5%, bruit isolé 60.3%→41.1%) — une dégradation généralisée, pas ciblée aux frontières. La régression du matching en aval (confirmée réelle, chiffres cohérents sur le bon checkpoint) n'a donc PAS l'explication qu'on lui donnait ("coherence loss réussit, boundary loss est le seul coupable") — voir `PLAN_REASSEMBLY_MODULE.md` pour le détail complet et la décision de pivot qui en découle (modèle appris sur les depth maps).
+
+**Suite (2026-07-30, même jour) : le modèle appris (`DepthmapPoseRegressor`,
+`PLAN_REASSEMBLY_MODULE.md` Phase 8) est implémenté, entraîné et évalué.
+Résultat mitigé** : sur GT (oracle-first), il **dépasse le hand-crafted**
+(Pose@30 global 55.3% vs 37.6%, succès strict 39.7% vs 23.2%) — un vrai
+succès, malgré une classification du miroir imparfaite (72.4%) qui limite
+l'éligibilité (83.8% vs 99.1%). Sur `thresh0.3` (le vrai objectif, masque
+CNN réel), trois tentatives (volume de données, cohérence train/val,
+augmentation par rotation) échouent toutes à faire généraliser le modèle
+— surapprentissage sévère persistant, y compris quand l'augmentation
+dégrade même la performance sur le train lui-même. Hypothèse retenue :
+l'architecture (encodeur siamois + concaténation, sans corrélation
+croisée explicite entre les deux depth maps) manque du bon biais inductif
+pour généraliser sur des données bruitées, contrairement au hand-crafted
+qui calcule une corrélation FFT explicite. Chantier mis en pause, à
+reprendre avec un mécanisme de corrélation explicite plutôt qu'un réglage
+d'hyperparamètres.
 
 ---
 

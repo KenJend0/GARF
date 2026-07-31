@@ -3812,3 +3812,111 @@ CUDA_VISIBLE_DEVICES=1 python scripts/phase8_pipeline_learned_check.py \
     --experiment cnn_step15_final_model --categories everyday --split val --max_batches 3000 \
     --summary_json /tmp/student7/phase8_pipeline_learned_gt.json
 ```
+
+## Bilan Phase 8 (2026-07-30, fin de session) — succès sur GT, échec sur thresh0.3, hypothèse retenue pour la suite
+
+### Ce qui a été construit (récap, tout committé)
+
+- `scripts/phase8_depthmap_regressor_dataset.py` : dérivation exacte des
+  labels `(theta, shift, mirror)` à partir de la vraie pose 3D (Kabsch 2D,
+  pas une recherche), `canonical_pca_frame` (élimine l'ambiguïté de
+  chiralité 3D globale), `fit_theta_shift_mirror_from_gt` (détecte/corrige
+  la réflexion (u,v), confirmée à 52.2% des paires réelles -- pas un cas
+  rare).
+- `assembly/models/depthmap_pose_regressor.py` : `DepthmapPoseRegressor`
+  (~102K params, encodeur siamois + tête MLP, deux hypothèses
+  normal/miroir avec confiance apprise), `pose_regressor_loss`,
+  normalisation par échantillon des depth maps (`_normalize_depth`).
+- `scripts/phase8_build_regressor_dataset.py` : précalcul du dataset
+  (`--strategy gt|thresh03`, `--split train|val|test`) -- corrigé deux
+  fois en cours de route (format `cnn`/uniform vs `weighted` pour
+  supporter `--split train`, bug d'extraction GT qui donnait 0 paires).
+- `scripts/train_depthmap_pose_regressor.py` : boucle d'entraînement +
+  augmentation par rotation aléatoire (`_augment_rotate`, formule vérifiée
+  empiriquement et par round-trip avant intégration).
+- `scripts/phase8_pipeline_learned_check.py` : évaluation bout-en-bout
+  (étage 1 appris + `trimmed_icp_normals`), comparaison à la barre
+  hand-crafted.
+- `scripts/phase8_reflection_prevalence_check.py` : mesure de l'ampleur de
+  l'ambiguïté de réflexion sur données réelles.
+- `scripts/phase8_split_npz.py` : découpe un `.npz` en train/val internes
+  (contournement pour `everyday`, qui n'a pas de split `test` et dont le
+  split `train` n'a pas les meshes en format `weighted`).
+
+### Résultat GT (oracle-first) — SUCCÈS, dépasse le hand-crafted
+
+Parcours : premier entraînement (1000 paires, `--split val` uniquement)
+bloqué au niveau du hasard sur validation → diagnostic (métriques
+décodées sur train ajoutées) → normalisation des depth maps ajoutée →
+toujours bloqué → volume augmenté via `--split train` (9404 paires, bug
+d'extraction GT découvert et corrigé en cours de route, 0 paires
+générées au premier essai) → 50 epochs insuffisant (train progresse,
+val reste au hasard) → **200 epochs : décollage net**.
+
+**Résultat final (`output/phase8_depthmap_regressor_gt_v3/best.ckpt`,
+`phase8_pipeline_learned_check.py --strategy gt`, 1487 objets 2-frags,
+`everyday`/val) :**
+```
+                        Hand-crafted (Step15+nn)   Modèle appris (GT)
+Éligibilité étage 1            99.1%                    83.8%
+Pose@30 global            37.6% (219 paires)      55.3% (823 paires)
+Succès strict global      23.2% (101 paires)      39.7% (590 paires)
+```
+Comparaison plutôt CONSERVATRICE en faveur du hand-crafted (dénominateur
+1487 pour le modèle appris vs 1245 pour le hand-crafted, cf. discussion
+avec l'utilisateur -- l'écart réel est probablement encore plus net).
+**Le modèle appris bat le hand-crafted en absolu sur Pose@30 et succès
+strict, malgré une éligibilité plus basse** -- expliquée par une
+classification miroir imparfaite (72.4% de précision sur validation, le
+maillon faible identifié : un mauvais choix de miroir donne une pose
+incohérente, rejetée par `build_correspondences_nn` faute de
+correspondances suffisantes).
+
+### Résultat thresh0.3 (condition réelle) — ÉCHEC, pas encore concluant
+
+Trois tentatives, toutes négatives ou ambiguës :
+
+1. **Train (sans zoom, masque brut) + val (avec zoom) du même run** :
+   surapprentissage sévère (`val_loss`=8.6 à l'epoch 106, métriques au
+   niveau du hasard) -- diagnostiqué comme un **décalage de distribution**
+   train/val (zoom actif seulement sur val), pas du surapprentissage pur.
+2. **Train/val découpés du MÊME fichier** (donc même distribution,
+   `phase8_split_npz.py`) : le décalage de distribution est éliminé, mais
+   le surapprentissage sévère PERSISTE (`val_loss` grimpe à 9.97 en fin de
+   course, métriques toujours au niveau du hasard) -- donc pas (que) un
+   problème de distribution, un vrai surapprentissage face à des données
+   plus bruitées que GT.
+3. **Augmentation par rotation aléatoire** (hypothèse : manque de
+   diversité d'orientation) : formule vérifiée rigoureusement (empirique +
+   round-trip) avant intégration, mais **empire les deux** -- train
+   lui-même ne progresse presque plus (angle=68.5°, mirror=55% à l'epoch
+   200, contre 15.5°/100% sans augmentation). Le modèle n'arrive plus à
+   bien fitter, même sur ses propres données d'entraînement.
+
+### Interprétation retenue
+
+Le sur-apprentissage sur `thresh0.3` n'est pas résolu par plus de données,
+un dataset train/val cohérent, ni par l'augmentation classique. Le fait
+que forcer une vraie invariance à la rotation (augmentation) dégrade même
+la performance sur le TRAIN suggère que l'architecture actuelle (encodeur
+siamois + concaténation, sans mécanisme de corrélation croisée explicite)
+n'a pas le bon biais inductif pour cette tâche sur des données bruitées --
+elle peut mémoriser des raccourcis spécifiques à un dataset propre (GT)
+mais ne semble pas apprendre une vraie compétence géométrique
+généralisable. Le hand-crafted, lui, calcule une corrélation FFT
+explicite entre les deux depth maps -- rien d'équivalent dans le modèle
+appris actuel.
+
+**Piste retenue pour une prochaine itération (pas commencée)** : ajouter
+un mécanisme de corrélation croisée explicite entre les deux depth maps
+(par ex. une carte de corrélation calculée directement, en entrée
+supplémentaire du réseau, plutôt que de tout lui faire réapprendre from
+scratch) -- un changement d'architecture, pas un réglage d'hyperparamètres.
+
+### Décision (2026-07-30, avec l'utilisateur) : pause sur ce chantier
+
+Le résultat GT est un succès réel et documenté (dépasse le hand-crafted).
+Le résultat thresh0.3 reste un échec après plusieurs tentatives
+raisonnables (volume, cohérence train/val, augmentation). Pas de nouvelle
+itération pour l'instant sans un changement d'architecture plus réfléchi
+(mécanisme de corrélation) -- à reprendre dans une prochaine session.
