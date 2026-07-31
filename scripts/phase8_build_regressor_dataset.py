@@ -36,15 +36,14 @@ Usage (sur le serveur) :
         --categories everyday --split val --max_batches 3000 \\
         --out /tmp/student7/phase8_dataset_gt_val.npz
 
-    # Condition réelle (CNN thresh0.3) -- les meshes ne sont conservés que
-    # dans val/test (pas train, supprimé pour la mémoire) : utiliser
-    # 'test' comme ensemble d'ENTRAÎNEMENT du régresseur et 'val' comme
-    # validation (pas de fuite, deux splits distincts) :
+    # Condition réelle (CNN thresh0.3) -- --split train donne BEAUCOUP plus
+    # de paires que val/test, mais SANS zoom (meshes indisponibles en train
+    # -- désactivé automatiquement, masque brut utilisé directement) :
     CUDA_VISIBLE_DEVICES=1 python scripts/phase8_build_regressor_dataset.py \\
         --strategy thresh03 --ckpt output/cnn_step15_final_model/last.ckpt \\
         --data_root /storage/student7/teyssir/data/breaking_bad_vol.hdf5 \\
         --experiment cnn_step15_final_model \\
-        --categories everyday --split test --max_batches 0 \\
+        --categories everyday --split train --max_batches 0 \\
         --out /tmp/student7/phase8_dataset_thresh03_train.npz
 
     CUDA_VISIBLE_DEVICES=1 python scripts/phase8_build_regressor_dataset.py \\
@@ -141,12 +140,13 @@ def main():
     parser.add_argument("--data_root",   required=True)
     parser.add_argument("--experiment",  required=True)
     parser.add_argument("--categories",  default="everyday")
-    parser.add_argument("--split",       default="val", choices=["val", "test"],
-                        help="Nécessite les meshes (conservés en val/test, supprimés en "
-                             "train pour la mémoire) -- pas de choix 'train', cf. même "
-                             "convention que phase6b_pipeline_check.py. Utiliser 'test' "
-                             "comme ensemble d'ENTRAÎNEMENT du régresseur et 'val' comme "
-                             "validation (pas de fuite -- deux splits distincts).")
+    parser.add_argument("--split",       default="val", choices=["train", "val", "test"],
+                        help="'train' -- BEAUCOUP plus de paires que val/test, mais SANS "
+                             "zoom (meshes indisponibles en train pour la variante "
+                             "weighted, `BreakingBadWeighted.transform()` plante même sans "
+                             "les utiliser explicitement -- vérifié le 2026-07-30). Le zoom "
+                             "est donc désactivé AUTOMATIQUEMENT pour 'train' (utilise le "
+                             "masque brut directement) ; 'val'/'test' gardent le zoom.")
     parser.add_argument("--seed",        type=int, default=42)
     parser.add_argument("--threshold",   type=float, default=0.3)
     parser.add_argument("--extra_budget", type=int, default=1200)
@@ -167,17 +167,26 @@ def main():
     t0 = time.time()
 
     if args.strategy == "gt":
-        print("Chargement du datamodule -- sample_method=weighted, AUCUN CNN chargé "
-              "(stratégie GT, oracle-first)")
+        # `model_type="cnn"` (sample_method=uniform) plutôt que "garf"
+        # (weighted) -- cette branche n'a JAMAIS utilisé le zoom/les meshes
+        # (juste le masque GT brut), donc rien ne justifie le dataset
+        # weighted, qui en plus PLANTE sur --split train (son transform()
+        # essaie d'attacher les meshes inconditionnellement, même si
+        # l'appelant ne les utilise pas). "cnn" fonctionne sur les 3 splits
+        # et expose les mêmes champs GT (fracture_surface_gt, quaternions,
+        # etc.) -- aucun compromis, juste un bug évité.
+        print("Chargement du dataset CNN (sample_method=uniform), AUCUN CNN chargé "
+              "(juste le format de données -- stratégie GT, oracle-first)")
         fake_args = argparse.Namespace(
             experiment=args.experiment, data_root=args.data_root,
-            batch_size=1, num_workers=4, categories=args.categories, model_type="garf",
+            batch_size=1, num_workers=4, categories=args.categories, model_type="cnn",
         )
         cfg = load_config_and_model(fake_args)
         cfg.data.num_points_to_sample = args.num_points_to_sample
         datamodule = instantiate(cfg.data)
-        datamodule.setup("fit" if args.split == "val" else "test")
-        dataset = datamodule.val_dataset if args.split == "val" else datamodule.test_dataset
+        datamodule.setup("fit" if args.split != "test" else "test")
+        dataset = {"train": datamodule.train_dataset, "val": datamodule.val_dataset,
+                   "test": datamodule.test_dataset}[args.split]
 
         from torch.utils.data import DataLoader
         loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0,
@@ -231,6 +240,12 @@ def main():
         from assembly.models.cnn_segmentation_model import CNNFracSeg
         from assembly.models.projection_mapping_utils import extract_fragment_list
 
+        # Zoom désactivé automatiquement sur --split train : le dataset mesh
+        # (weighted) plante sur ce split (meshes indisponibles, cf. --split
+        # help ci-dessus) -- 'train' utilise donc le masque thresh0.3 BRUT
+        # directement, sans rééchantillonnage sur maillage.
+        use_zoom = args.split != "train"
+
         print("Chargement du dataset CNN (sample_method=uniform)...")
         cnn_fake_args = argparse.Namespace(
             experiment=args.experiment, data_root=args.data_root,
@@ -238,20 +253,25 @@ def main():
         )
         cnn_cfg = load_config_and_model(cnn_fake_args)
         cnn_datamodule = instantiate(cnn_cfg.data)
-        cnn_datamodule.setup("fit" if args.split == "val" else "test")
-        cnn_dataset = cnn_datamodule.val_dataset if args.split == "val" else cnn_datamodule.test_dataset
+        cnn_datamodule.setup("fit" if args.split != "test" else "test")
+        cnn_dataset = {"train": cnn_datamodule.train_dataset, "val": cnn_datamodule.val_dataset,
+                       "test": cnn_datamodule.test_dataset}[args.split]
 
-        print("Chargement du dataset mesh (sample_method=weighted) -- meshes uniquement...")
-        mesh_fake_args = argparse.Namespace(
-            experiment=args.experiment, data_root=args.data_root,
-            batch_size=1, num_workers=4, categories=args.categories, model_type="garf",
-        )
-        mesh_cfg = load_config_and_model(mesh_fake_args)
-        mesh_datamodule = instantiate(mesh_cfg.data)
-        mesh_datamodule.setup("fit" if args.split == "val" else "test")
-        mesh_dataset = mesh_datamodule.val_dataset if args.split == "val" else mesh_datamodule.test_dataset
+        mesh_dataset = None
+        if use_zoom:
+            print("Chargement du dataset mesh (sample_method=weighted) -- meshes uniquement...")
+            mesh_fake_args = argparse.Namespace(
+                experiment=args.experiment, data_root=args.data_root,
+                batch_size=1, num_workers=4, categories=args.categories, model_type="garf",
+            )
+            mesh_cfg = load_config_and_model(mesh_fake_args)
+            mesh_datamodule = instantiate(mesh_cfg.data)
+            mesh_datamodule.setup("fit" if args.split == "val" else "test")
+            mesh_dataset = mesh_datamodule.val_dataset if args.split == "val" else mesh_datamodule.test_dataset
+            assert len(cnn_dataset) == len(mesh_dataset)
+        else:
+            print("--split train : zoom désactivé (meshes indisponibles), masque brut utilisé directement.")
 
-        assert len(cnn_dataset) == len(mesh_dataset)
         cnn_loader = DataLoader(cnn_dataset, batch_size=1, shuffle=False, num_workers=0,
                                  collate_fn=cnn_datamodule.dataset_cls.collate_fn)
 
@@ -268,8 +288,10 @@ def main():
                     print(f"  objet {idx} | 2-frags vus={n_seen_2frag} | paires générées="
                           f"{len(rows)} | {time.time()-t0:.0f}s écoulées")
 
-                mesh_data = mesh_dataset[idx]
-                assert batch["name"][0] == mesh_data["name"]
+                mesh_data = None
+                if use_zoom:
+                    mesh_data = mesh_dataset[idx]
+                    assert batch["name"][0] == mesh_data["name"]
 
                 batch_gpu = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                              for k, v in batch.items()}
@@ -318,25 +340,30 @@ def main():
                 if n_min_raw < ABS_MIN_POINTS:
                     continue
 
-                cluster_mask0 = dominant_cluster_mask(raw0[mask0])
-                cluster_mask1 = dominant_cluster_mask(raw1[mask1])
-                R_init_rot = quat_wxyz_to_rotmat(batch["init_rot"].numpy()[0])
-                seed_i_gt = (gtgt0[mask0][cluster_mask0]) @ R_init_rot.T
-                seed_j_gt = (gtgt1[mask1][cluster_mask1]) @ R_init_rot.T
-                meshes = mesh_data["meshes"]
-                new_i_gt = zoom_resample(meshes[p0], seed_i_gt, args.extra_budget,
-                                          args.expand_rings, rng)
-                new_j_gt = zoom_resample(meshes[p1], seed_j_gt, args.extra_budget,
-                                          args.expand_rings, rng)
-                if new_i_gt is None or new_j_gt is None:
-                    n_zoom_failed += 1
-                    continue
-                new_i_rotated = new_i_gt @ R_init_rot
-                new_j_rotated = new_j_gt @ R_init_rot
-                new_i_input = to_input_frame(new_i_rotated, quats_np[0, p0], trans_np[0, p0])
-                new_j_input = to_input_frame(new_j_rotated, quats_np[0, p1], trans_np[0, p1])
-                frac_i = np.concatenate([raw0[mask0], new_i_input], axis=0)
-                frac_j = np.concatenate([raw1[mask1], new_j_input], axis=0)
+                if use_zoom:
+                    cluster_mask0 = dominant_cluster_mask(raw0[mask0])
+                    cluster_mask1 = dominant_cluster_mask(raw1[mask1])
+                    R_init_rot = quat_wxyz_to_rotmat(batch["init_rot"].numpy()[0])
+                    seed_i_gt = (gtgt0[mask0][cluster_mask0]) @ R_init_rot.T
+                    seed_j_gt = (gtgt1[mask1][cluster_mask1]) @ R_init_rot.T
+                    meshes = mesh_data["meshes"]
+                    new_i_gt = zoom_resample(meshes[p0], seed_i_gt, args.extra_budget,
+                                              args.expand_rings, rng)
+                    new_j_gt = zoom_resample(meshes[p1], seed_j_gt, args.extra_budget,
+                                              args.expand_rings, rng)
+                    if new_i_gt is None or new_j_gt is None:
+                        n_zoom_failed += 1
+                        continue
+                    new_i_rotated = new_i_gt @ R_init_rot
+                    new_j_rotated = new_j_gt @ R_init_rot
+                    new_i_input = to_input_frame(new_i_rotated, quats_np[0, p0], trans_np[0, p0])
+                    new_j_input = to_input_frame(new_j_rotated, quats_np[0, p1], trans_np[0, p1])
+                    frac_i = np.concatenate([raw0[mask0], new_i_input], axis=0)
+                    frac_j = np.concatenate([raw1[mask1], new_j_input], axis=0)
+                else:
+                    # --split train : pas de meshes -- masque thresh0.3 brut directement.
+                    frac_i = raw0[mask0]
+                    frac_j = raw1[mask1]
 
                 row = process_pair(frac_i, frac_j, R_ij_gt, t_ij_gt)
                 if row is not None:
