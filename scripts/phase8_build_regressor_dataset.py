@@ -154,12 +154,16 @@ def main():
     parser.add_argument("--experiment",  required=True)
     parser.add_argument("--categories",  default="everyday")
     parser.add_argument("--split",       default="val", choices=["train", "val", "test"],
-                        help="'train' -- BEAUCOUP plus de paires que val/test, mais SANS "
-                             "zoom (meshes indisponibles en train pour la variante "
-                             "weighted, `BreakingBadWeighted.transform()` plante même sans "
-                             "les utiliser explicitement -- vérifié le 2026-07-30). Le zoom "
-                             "est donc désactivé AUTOMATIQUEMENT pour 'train' (utilise le "
-                             "masque brut directement) ; 'val'/'test' gardent le zoom.")
+                        help="'train' -- BEAUCOUP plus de paires que val/test. Zoom "
+                             "disponible sur les 3 splits depuis le 2026-07-31 : "
+                             "`BreakingBadBase.get_data()` supprime `data['meshes']` "
+                             "uniquement si `self.split == 'train'` (économie mémoire pour "
+                             "les VRAIS entraînements CNN/GARF à grande échelle, sans "
+                             "rapport avec ce script qui traite un objet à la fois) -- "
+                             "`self.split` n'a aucun autre effet une fois la liste "
+                             "d'objets figée à la construction (vérifié dans base.py/"
+                             "weighted.py), donc le réassigner après coup sur le dataset "
+                             "'train' (cf. plus bas) contourne la suppression sans risque.")
     parser.add_argument("--seed",        type=int, default=42)
     parser.add_argument("--threshold",   type=float, default=0.3)
     parser.add_argument("--extra_budget", type=int, default=1200)
@@ -262,12 +266,6 @@ def main():
         from assembly.models.cnn_segmentation_model import CNNFracSeg
         from assembly.models.projection_mapping_utils import extract_fragment_list
 
-        # Zoom désactivé automatiquement sur --split train : le dataset mesh
-        # (weighted) plante sur ce split (meshes indisponibles, cf. --split
-        # help ci-dessus) -- 'train' utilise donc le masque thresh0.3 BRUT
-        # directement, sans rééchantillonnage sur maillage.
-        use_zoom = args.split != "train"
-
         print("Chargement du dataset CNN (sample_method=uniform)...")
         cnn_fake_args = argparse.Namespace(
             experiment=args.experiment, data_root=args.data_root,
@@ -279,20 +277,29 @@ def main():
         cnn_dataset = {"train": cnn_datamodule.train_dataset, "val": cnn_datamodule.val_dataset,
                        "test": cnn_datamodule.test_dataset}[args.split]
 
-        mesh_dataset = None
-        if use_zoom:
-            print("Chargement du dataset mesh (sample_method=weighted) -- meshes uniquement...")
-            mesh_fake_args = argparse.Namespace(
-                experiment=args.experiment, data_root=args.data_root,
-                batch_size=1, num_workers=4, categories=args.categories, model_type="garf",
-            )
-            mesh_cfg = load_config_and_model(mesh_fake_args)
-            mesh_datamodule = instantiate(mesh_cfg.data)
-            mesh_datamodule.setup("fit" if args.split == "val" else "test")
-            mesh_dataset = mesh_datamodule.val_dataset if args.split == "val" else mesh_datamodule.test_dataset
-            assert len(cnn_dataset) == len(mesh_dataset)
-        else:
-            print("--split train : zoom désactivé (meshes indisponibles), masque brut utilisé directement.")
+        print("Chargement du dataset mesh (sample_method=weighted) -- meshes uniquement...")
+        mesh_fake_args = argparse.Namespace(
+            experiment=args.experiment, data_root=args.data_root,
+            batch_size=1, num_workers=4, categories=args.categories, model_type="garf",
+        )
+        mesh_cfg = load_config_and_model(mesh_fake_args)
+        mesh_datamodule = instantiate(mesh_cfg.data)
+        mesh_datamodule.setup("fit" if args.split != "test" else "test")
+        mesh_dataset = {"train": mesh_datamodule.train_dataset, "val": mesh_datamodule.val_dataset,
+                        "test": mesh_datamodule.test_dataset}[args.split]
+        if args.split == "train":
+            # Contourne `BreakingBadBase.get_data()` (base.py:350-352) qui
+            # supprime `data["meshes"]` uniquement si `self.split == "train"`
+            # (économie mémoire pour les entraînements CNN/GARF réels, sans
+            # rapport avec ce script) -- `self.split` n'a aucun autre effet
+            # une fois la liste d'objets figée (vérifié dans base.py/
+            # weighted.py : la seule autre lecture sert à choisir data_list à
+            # la construction). Réassigner à "val" APRÈS setup() garde les
+            # bons objets (déjà figés) mais désactive la suppression.
+            for ds in mesh_dataset.datasets:
+                ds.split = "val"
+        assert len(cnn_dataset) == len(mesh_dataset)
+        use_zoom = True
 
         cnn_loader = DataLoader(cnn_dataset, batch_size=1, shuffle=False, num_workers=0,
                                  collate_fn=cnn_datamodule.dataset_cls.collate_fn)

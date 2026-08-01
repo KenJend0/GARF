@@ -3994,12 +3994,39 @@ thresh0.3 du 2026-07-30 ne sont PAS compatibles, retraining complet
 nécessaire (attendu, pas un problème).
 
 **Prochaines actions (oracle-first, comme toute la Phase 7-8) :**
-1. Regénérer les `.npz` GT (train + val) avec `phase8_build_regressor_dataset.py`
-   (format changé : `corr_profile_normal`/`corr_profile_mirror` ajoutés).
-2. Réentraîner sur GT — vérifier au moins la non-régression par rapport au
-   résultat déjà acquis (55.3%/39.7%), avant d'aller sur thresh0.3.
-3. Regénérer les `.npz` thresh0.3 (train + val) et réentraîner — c'est le
-   vrai test : est-ce que le profil de corrélation explicite suffit à
-   corriger le sur-apprentissage sévère observé le 2026-07-30 ?
+1. ~~Regénérer les `.npz` GT (train + val)~~ FAIT.
+2. ~~Réentraîner sur GT~~ FAIT — **résultat GT (2026-07-31, `best.ckpt` de
+   `output/phase8_depthmap_regressor_gt_corr/`) : succès net, le profil de
+   corrélation aide massivement.** Éval bout-en-bout
+   (`phase8_pipeline_learned_check.py --strategy gt`, N=1487) :
+   éligibilité 83.2% (vs 83.8% sans profil, 99.1% hand-crafted),
+   **Pose@30 global 76.0% (1130 paires)** (vs 55.3%/823 sans profil,
+   37.6%/219 hand-crafted), **succès strict global 55.1% (820 paires)**
+   (vs 39.7%/590 sans profil, 23.2%/101 hand-crafted). Plus du double du
+   hand-crafted en succès strict.
+3. Regénérer les `.npz` thresh0.3 et réentraîner — le vrai test (le
+   sur-apprentissage sévère du 2026-07-30 était sur cette condition).
+
+   **Bug trouvé et corrigé en route (2026-07-31) : le zoom (mesh
+   `weighted`) était désactivé sur `--split train`** de
+   `phase8_build_regressor_dataset.py`, obligeant à entraîner sur du
+   masque brut puis évaluer sur des cartes zoomées (plus denses) — un
+   nouveau décalage de distribution train/eval, repéré par l'utilisateur
+   avant de relancer. Root cause : `BreakingBadBase.get_data()`
+   (`assembly/data/breaking_bad/base.py:350-352`) supprime
+   `data["meshes"]` si `self.split == "train"` -- **une pure économie
+   mémoire pour les entraînements CNN/GARF réels (gros batch/beaucoup de
+   workers), sans rapport avec ce script qui traite un objet à la fois**.
+   `self.split` n'a aucun autre effet une fois la liste d'objets figée à
+   la construction (vérifié : la seule autre lecture choisit `data_list`
+   à l'`__init__`). Fix : dans `phase8_build_regressor_dataset.py`,
+   réassigner `ds.split = "val"` sur chaque dataset sous-jacent (`.datasets`
+   du `ConcatDataset`) APRÈS `mesh_datamodule.setup("fit")` pour `--split
+   train` — contourne la suppression sans toucher au comportement par
+   défaut du reste du codebase. Le zoom est donc maintenant disponible sur
+   les 3 splits ; **plus besoin de `phase8_split_npz.py`** pour ce
+   chantier : `--split train` (zoomé, gros volume) sert directement
+   l'entraînement, `--split val` (zoomé) sert directement la validation --
+   même distribution partout, y compris à l'éval bout-en-bout finale.
 4. Si non concluant, réévaluer les options 2/3 (volume spatial /
    Fourier-Mellin) en connaissance de cause.
