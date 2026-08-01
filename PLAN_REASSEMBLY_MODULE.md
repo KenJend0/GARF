@@ -4068,3 +4068,85 @@ pousser plus loin avec les features 3D suggérées par l'utilisateur
 (normales projetées en canaux supplémentaires de la depth map, cf.
 discussion du 2026-07-31 -- non testé, mis de côté pour ne pas empiler
 deux changements avant d'avoir isolé l'effet du profil de corrélation).
+
+## Diagnostic d'éligibilité (2026-07-31) — le miroir confirmé comme goulot, avec une nuance
+
+`scripts/phase8_eligibility_diagnostic.py` : compare, paire par paire (pas
+seulement les succès), la prédiction du modèle au vrai label dérivé de la
+pose GT -- même esprit que `phase5a_skip_audit.py`. Résultat (N=990,
+`thresh03`, `regressor_thresh03_corr/best.ckpt`) :
+
+```
+                     N     Éligible   Erreur angle (moy/méd)   n_corr moyen
+Miroir CORRECT      723     91.4%          30.1°/6.1°             1235.6
+Miroir INCORRECT    267     79.8%         87.5°/88.6°              877.8
+```
+
+Précision miroir globale : 73.0%. Quand le miroir est faux, l'angle prédit
+est quasi aléatoire (88.6° médian) -- **mais 79.8% de ces paires passent
+quand même l'éligibilité**, `build_correspondences_nn` trouvant ≥3
+correspondances par pur hasard sur des nuages denses (zoom) même à pose
+fausse. **L'éligibilité seule surestime donc la qualité réelle** -- une
+partie de l'écart entre 88% d'éligibilité et 33.6%/22.7% de Pose@30/succès
+strict s'explique par ces paires "éligibles à tort". Confiance moyenne du
+modèle sur son choix de miroir : correct=0.775, incorrect=0.583 -- écart
+réel, exploitable comme filtre bon marché (pas encore testé en pipeline).
+
+**Conclusion : le miroir est LE levier prioritaire**, à la fois pour
+l'éligibilité et pour la précision finale.
+
+## Features 3D — canaux de normale (2026-07-31, cadrage + implémentation)
+
+Justification empirique (pas juste intuitive) : sur une fracture quasi
+plane (planéité médiane 0.043), le relief seul porte peu de signal pour
+distinguer une orientation (u,v) de son miroir, alors qu'une réflexion
+inverse directement le sens des normales dans le plan -- contrairement au
+relief, invariant à une réflexion in-plane pure.
+
+**Implémenté :**
+- `rasterize_normal_channels()` (`phase5a_depthmap_matching.py`) : moyenne
+  par case des 3 composantes de la normale `(n_u, n_v, n_n)` dans le repère
+  local -- même structure que `rasterize()` (dupliquée, pas de refactor
+  partagé, pour ne rien risquer sur une fonction très réutilisée), reçoit
+  `u_min`/`v_min` déjà calculés pour un alignement pixel-exact avec `dmap`.
+- `zoom_resample_with_normals()` (`phase5a_zoom_resample_check.py`) : comme
+  `zoom_resample()` mais retourne aussi `mesh.face_normals[face_idx]` pour
+  les points de zoom (dupliquée pour la même raison -- `zoom_resample`
+  reste utilisée telle quelle par plusieurs scripts déjà validés).
+  `normals_to_input_frame()` : équivalent de `to_input_frame()` pour des
+  normales (rotation seule, pas de translation).
+- `DepthmapPoseRegressor` : `in_ch` 2→5 (depth, valid, n_u, n_v, n_n).
+
+**Deux conventions non triviales, VÉRIFIÉES EMPIRIQUEMENT en local avant
+intégration (pas déduites "à l'intuition") :**
+- **Miroir** : le flip spatial des rangées (déjà en place) suffit pour
+  `n_u`/`n_n`, mais `n_v` doit EN PLUS être négatée en valeur -- sans cette
+  négation, corrélation avec le vrai miroir = **-1.0 exactement** (testé
+  sur point synthétiques) ; avec, **+1.0 exactement**.
+- **Augmentation par rotation** : une image-rotation de `dmap_i` par
+  `+alpha` (convention déjà établie, `theta_new = theta_gt - alpha`)
+  correspond à une rotation PHYSIQUE du nuage de `-alpha` -- donc les
+  composantes `(n_u, n_v)` (contrairement à `depth`, scalaire invariant à
+  une rotation in-plane) doivent tourner de `-alpha` en plus du
+  repositionnement spatial. Vérifié : corrélation 0.82 pour `-alpha` contre
+  0.03 pour `+alpha` sur un champ de normales synthétique structuré.
+
+**Fichiers mis à jour en conséquence** : `phase8_build_regressor_dataset.py`
+(normales extraites via `pointclouds_normals`/`extract_fragment_list` pour
+les points bruts, `zoom_resample_with_normals` pour les points de zoom ;
+nouveau `nmap_i`/`nmap_j` dans le `.npz`), `train_depthmap_pose_regressor.py`
+(`_augment_rotate` fait maintenant tourner `nmap_i` en plus de `dmap_i`),
+`phase8_pipeline_learned_check.py`/`phase8_eligibility_diagnostic.py`
+(calcul de `nmap_i`/`nmap_j` à la volée à l'inférence, même logique que le
+profil de corrélation). **Casse la compatibilité des checkpoints existants**
+(`phase8_depthmap_regressor_gt_corr/`, `_thresh03_corr/`) -- retraining
+complet nécessaire des deux côtés (GT d'abord, oracle-first).
+
+**Prochaines actions :**
+1. Regénérer les `.npz` GT et thresh0.3 (nouveau format avec `nmap_i`/`nmap_j`).
+2. Réentraîner GT d'abord -- vérifier au moins la non-régression vs
+   76.0%/55.1% (Pose@30/succès strict) avant thresh0.3.
+3. Réentraîner thresh0.3, comparer à la barre actuelle avec profil seul :
+   éligibilité 57.8%, Pose@30 global 33.6%, succès strict 22.7%. Regarder
+   en particulier si la précision miroir (73.0%) et l'écart de confiance
+   correct/incorrect (0.775/0.583) s'améliorent.

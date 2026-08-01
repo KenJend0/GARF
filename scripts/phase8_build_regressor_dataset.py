@@ -67,9 +67,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.analyze_errors import load_config_and_model
 from scripts.phase5a_depthmap_matching import (
-    quat_wxyz_to_rotmat, rasterize, angle_correlation_profile, DEFAULT_N_ANGLES,
+    quat_wxyz_to_rotmat, rasterize, rasterize_normal_channels,
+    angle_correlation_profile, DEFAULT_N_ANGLES,
 )
-from scripts.phase5a_zoom_resample_check import zoom_resample, to_input_frame
+from scripts.phase5a_zoom_resample_check import (
+    zoom_resample, zoom_resample_with_normals, to_input_frame, normals_to_input_frame,
+)
 from scripts.phase5a_zoom_resample_thresh03_check import dominant_cluster_mask
 from scripts.phase8_depthmap_regressor_dataset import canonical_pca_frame, fit_theta_shift_mirror_from_gt
 
@@ -95,16 +98,18 @@ def build_frame_and_rasterize(frac_i, frac_j):
     dmap_j, valid_j, u_min_j, v_min_j = rasterize(frac_j, c_j, u_j, v_j, n_j, RESOLUTION, pixel_size)
 
     frame = {
-        "c_i": c_i, "u_i": u_i, "v_i": v_i, "u_min_i": u_min_i, "v_min_i": v_min_i,
-        "c_j": c_j, "u_j": u_j, "v_j": v_j, "u_min_j": u_min_j, "v_min_j": v_min_j,
+        "c_i": c_i, "u_i": u_i, "v_i": v_i, "n_i": n_i, "u_min_i": u_min_i, "v_min_i": v_min_i,
+        "c_j": c_j, "u_j": u_j, "v_j": v_j, "n_j": n_j, "u_min_j": u_min_j, "v_min_j": v_min_j,
         "pixel_size": pixel_size,
     }
     return dmap_i, valid_i, dmap_j, valid_j, frame
 
 
-def process_pair(frac_i, frac_j, R_ij_gt, t_ij_gt):
+def process_pair(frac_i, frac_j, nrm_i, nrm_j, R_ij_gt, t_ij_gt):
     """Retourne un dict prêt à empiler dans le `.npz`, ou None si la paire
-    n'est pas exploitable (masque trop épars)."""
+    n'est pas exploitable (masque trop épars). `nrm_i`/`nrm_j` : normales
+    PAR POINT (même ordre/longueur que `frac_i`/`frac_j`), repère input
+    (même repère que les points -- cf. appelants)."""
     n_min = min(len(frac_i), len(frac_j))
     if n_min < ABS_MIN_POINTS:
         return None
@@ -127,9 +132,21 @@ def process_pair(frac_i, frac_j, R_ij_gt, t_ij_gt):
     profile_mirror = angle_correlation_profile(
         dmap_i, valid_i, np.flip(dmap_j, axis=0), np.flip(valid_j, axis=0), DEFAULT_N_ANGLES)
 
+    # Canaux de normale (2026-07-31, "features 3D" -- cf.
+    # phase8_eligibility_diagnostic.py, mirror = LE goulot de l'étage 1
+    # appris). `u_min`/`v_min` viennent du MÊME `build_frame_and_rasterize`
+    # (alignement pixel-à-pixel garanti avec dmap_i/dmap_j).
+    nmap_i = rasterize_normal_channels(
+        frac_i, nrm_i, frame["c_i"], frame["u_i"], frame["v_i"], frame["n_i"],
+        RESOLUTION, frame["pixel_size"], frame["u_min_i"], frame["v_min_i"])
+    nmap_j = rasterize_normal_channels(
+        frac_j, nrm_j, frame["c_j"], frame["u_j"], frame["v_j"], frame["n_j"],
+        RESOLUTION, frame["pixel_size"], frame["u_min_j"], frame["v_min_j"])
+
     return {
         "dmap_i": dmap_i.astype(np.float32), "valid_i": valid_i.astype(np.float32),
         "dmap_j": dmap_j.astype(np.float32), "valid_j": valid_j.astype(np.float32),
+        "nmap_i": nmap_i.astype(np.float32), "nmap_j": nmap_j.astype(np.float32),
         "corr_profile_normal": profile_normal.astype(np.float32),
         "corr_profile_mirror": profile_mirror.astype(np.float32),
         "theta_gt": np.float32(theta_gt), "shift_y_gt": np.float32(sy), "shift_x_gt": np.float32(sx),
@@ -139,7 +156,8 @@ def process_pair(frac_i, frac_j, R_ij_gt, t_ij_gt):
 
 
 def save_npz(rows, out_path):
-    keys = ["dmap_i", "valid_i", "dmap_j", "valid_j", "corr_profile_normal", "corr_profile_mirror",
+    keys = ["dmap_i", "valid_i", "dmap_j", "valid_j", "nmap_i", "nmap_j",
+            "corr_profile_normal", "corr_profile_mirror",
             "theta_gt", "shift_y_gt", "shift_x_gt", "mirror_gt", "residual", "n_frac_pts_min"]
     arrays = {k: np.stack([r[k] for r in rows]) for k in keys}
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -230,6 +248,9 @@ def main():
                 continue
             n_seen_2frag += 1
 
+            nrm_frag_list, _, _ = extract_fragment_list(
+                batch["pointclouds_normals"], batch["points_per_part"])
+
             valid_pcs_np = valid_pcs.numpy()
             p_slots = [p for p in range(valid_pcs_np.shape[1]) if valid_pcs_np[0, p]]
             if len(p_slots) != 2:
@@ -237,6 +258,7 @@ def main():
             p0, p1 = p_slots
 
             pc_per_k = [frag_list[k].numpy() for k in range(K)]
+            nrm_per_k = [nrm_frag_list[k].numpy() for k in range(K)]
             scale_np = batch["scale"].numpy()
             if scale_np.ndim == 2:
                 scale_np = scale_np[:, :, None]
@@ -251,13 +273,15 @@ def main():
 
             frac_i = raw_i[gt_i]
             frac_j = raw_j[gt_j]
+            nrm_i = nrm_per_k[0][gt_i]
+            nrm_j = nrm_per_k[1][gt_j]
 
             R0 = quat_wxyz_to_rotmat(quats_np[0, p0])
             R1 = quat_wxyz_to_rotmat(quats_np[0, p1])
             R_ij_gt = R1.T @ R0
             t_ij_gt = R1.T @ (trans_np[0, p0] - trans_np[0, p1])
 
-            row = process_pair(frac_i, frac_j, R_ij_gt, t_ij_gt)
+            row = process_pair(frac_i, frac_j, nrm_i, nrm_j, R_ij_gt, t_ij_gt)
             if row is not None:
                 rows.append(row)
 
@@ -332,6 +356,8 @@ def main():
 
                 gt_frag_list, _, _ = extract_fragment_list(
                     batch_gpu["pointclouds_gt"], batch_gpu["points_per_part"])
+                nrm_frag_list, _, _ = extract_fragment_list(
+                    batch_gpu["pointclouds_normals"], batch_gpu["points_per_part"])
 
                 out = model(batch_gpu)
                 pred_flat = out["coarse_seg_pred"].float().cpu().numpy()
@@ -340,6 +366,7 @@ def main():
                 score_per_k = [pred_flat[offsets[k]:offsets[k + 1]] for k in range(K)]
                 pc_per_k    = [frag_list[k].cpu().numpy()    for k in range(K)]
                 gt_per_k    = [gt_frag_list[k].cpu().numpy() for k in range(K)]
+                nrm_per_k   = [nrm_frag_list[k].cpu().numpy() for k in range(K)]
 
                 valid_pcs_np = valid_pcs.cpu().numpy()
                 p_slots = [p for p in range(valid_pcs_np.shape[1]) if valid_pcs_np[0, p]]
@@ -357,6 +384,7 @@ def main():
                 raw1 = pc_per_k[1] * scale_np[0, p1]
                 sc0, sc1 = score_per_k[0], score_per_k[1]
                 gtgt0, gtgt1 = gt_per_k[0], gt_per_k[1]
+                nrm0, nrm1 = nrm_per_k[0], nrm_per_k[1]
 
                 R0 = quat_wxyz_to_rotmat(quats_np[0, p0])
                 R1 = quat_wxyz_to_rotmat(quats_np[0, p1])
@@ -376,25 +404,33 @@ def main():
                     seed_i_gt = (gtgt0[mask0][cluster_mask0]) @ R_init_rot.T
                     seed_j_gt = (gtgt1[mask1][cluster_mask1]) @ R_init_rot.T
                     meshes = mesh_data["meshes"]
-                    new_i_gt = zoom_resample(meshes[p0], seed_i_gt, args.extra_budget,
-                                              args.expand_rings, rng)
-                    new_j_gt = zoom_resample(meshes[p1], seed_j_gt, args.extra_budget,
-                                              args.expand_rings, rng)
+                    new_i_gt, new_i_nrm_gt = zoom_resample_with_normals(
+                        meshes[p0], seed_i_gt, args.extra_budget, args.expand_rings, rng)
+                    new_j_gt, new_j_nrm_gt = zoom_resample_with_normals(
+                        meshes[p1], seed_j_gt, args.extra_budget, args.expand_rings, rng)
                     if new_i_gt is None or new_j_gt is None:
                         n_zoom_failed += 1
                         continue
                     new_i_rotated = new_i_gt @ R_init_rot
                     new_j_rotated = new_j_gt @ R_init_rot
+                    new_i_nrm_rotated = new_i_nrm_gt @ R_init_rot
+                    new_j_nrm_rotated = new_j_nrm_gt @ R_init_rot
                     new_i_input = to_input_frame(new_i_rotated, quats_np[0, p0], trans_np[0, p0])
                     new_j_input = to_input_frame(new_j_rotated, quats_np[0, p1], trans_np[0, p1])
+                    new_i_nrm_input = normals_to_input_frame(new_i_nrm_rotated, quats_np[0, p0])
+                    new_j_nrm_input = normals_to_input_frame(new_j_nrm_rotated, quats_np[0, p1])
                     frac_i = np.concatenate([raw0[mask0], new_i_input], axis=0)
                     frac_j = np.concatenate([raw1[mask1], new_j_input], axis=0)
+                    nrm_i = np.concatenate([nrm0[mask0], new_i_nrm_input], axis=0)
+                    nrm_j = np.concatenate([nrm1[mask1], new_j_nrm_input], axis=0)
                 else:
                     # --split train : pas de meshes -- masque thresh0.3 brut directement.
                     frac_i = raw0[mask0]
                     frac_j = raw1[mask1]
+                    nrm_i = nrm0[mask0]
+                    nrm_j = nrm1[mask1]
 
-                row = process_pair(frac_i, frac_j, R_ij_gt, t_ij_gt)
+                row = process_pair(frac_i, frac_j, nrm_i, nrm_j, R_ij_gt, t_ij_gt)
                 if row is not None:
                     rows.append(row)
 

@@ -36,30 +36,52 @@ from assembly.models.depthmap_pose_regressor import DepthmapPoseRegressor, pose_
 from scripts.phase5a_depthmap_matching import angle_correlation_profile, DEFAULT_N_ANGLES
 
 
-def _augment_rotate(dmap_i, valid_i, theta_gt, shift_y_gt, shift_x_gt, rng):
-    """Rotation aléatoire de `dmap_i`/`valid_i` (augmentation, 2026-07-30 --
-    diagnostic thresh0.3 : surapprentissage sévère, angle_err/mirror_acc au
-    niveau du hasard sur validation malgré un volume comparable au run GT
-    qui, lui, généralisait). Ajustement EXACT des labels -- PAS une
-    approximation : `theta_new = theta_gt - alpha`, le vecteur `shift`
-    tourne de `Rot(-alpha)`. Convention vérifiée EMPIRIQUEMENT en local
-    (suivi d'un pixel isolé à travers `scipy.ndimage.rotate`) puis la
-    formule complète validée par un round-trip sur
-    `_forward_transform_reference` (20/20 tirages, phase8_depthmap_regressor_dataset.py)
-    avant intégration ici -- `ndimage_rotate(img, alpha)` déplace le
-    contenu selon `Rot(-alpha)` en coordonnées (col,row), PAS `Rot(+alpha)`
-    comme l'intuition mathématique naïve le suggérerait (axe des rangées
-    orienté vers le bas)."""
+def _augment_rotate(dmap_i, valid_i, nmap_i, theta_gt, shift_y_gt, shift_x_gt, rng):
+    """Rotation aléatoire de `dmap_i`/`valid_i`/`nmap_i` (augmentation,
+    2026-07-30 -- diagnostic thresh0.3 : surapprentissage sévère,
+    angle_err/mirror_acc au niveau du hasard sur validation malgré un volume
+    comparable au run GT qui, lui, généralisait). Ajustement EXACT des
+    labels -- PAS une approximation : `theta_new = theta_gt - alpha`, le
+    vecteur `shift` tourne de `Rot(-alpha)`. Convention vérifiée
+    EMPIRIQUEMENT en local (suivi d'un pixel isolé à travers
+    `scipy.ndimage.rotate`) puis la formule complète validée par un
+    round-trip sur `_forward_transform_reference` (20/20 tirages,
+    phase8_depthmap_regressor_dataset.py) avant intégration ici --
+    `ndimage_rotate(img, alpha)` déplace le contenu selon `Rot(-alpha)` en
+    coordonnées (col,row), PAS `Rot(+alpha)` comme l'intuition
+    mathématique naïve le suggérerait (axe des rangées orienté vers le bas).
+
+    `nmap_i` (3, R, R) = canaux (n_u, n_v, n_n) -- en plus du repositionnement
+    spatial (`ndimage_rotate`, comme `dmap_i`), les COMPOSANTES `(n_u, n_v)`
+    doivent aussi tourner de `-alpha` (vérifié empiriquement en local,
+    2026-07-31 : corrélation 0.82 avec la rotation physique de référence
+    pour `-alpha`, contre 0.03 pour `+alpha`) -- une image-rotation de
+    `+alpha` correspond à une rotation PHYSIQUE du nuage de `-alpha` (même
+    convention que `theta_new = theta_gt - alpha` ci-dessus), donc toute
+    grandeur VECTORIELLE (contrairement à `depth`, un scalaire invariant à
+    une rotation in-plane) doit suivre cette même rotation de `-alpha`.
+    `n_n` (composante hors-plan, comme `depth`) n'a besoin que du
+    repositionnement spatial, pas de rotation de valeur."""
     alpha = float(rng.uniform(0, 360))
     dmap_i_rot = ndimage_rotate(dmap_i, alpha, reshape=False, order=1, cval=0.0)
     valid_i_rot = (ndimage_rotate(valid_i, alpha, reshape=False, order=1, cval=0.0) > 0.5).astype(np.float32)
+
+    nmap_i_imgrot = np.stack([
+        ndimage_rotate(nmap_i[ch], alpha, reshape=False, order=1, cval=0.0)
+        for ch in range(3)
+    ])
+    nu_imgrot, nv_imgrot, nn_imgrot = nmap_i_imgrot[0], nmap_i_imgrot[1], nmap_i_imgrot[2]
+    cb, sb = np.cos(np.radians(-alpha)), np.sin(np.radians(-alpha))
+    nu_new = cb * nu_imgrot - sb * nv_imgrot
+    nv_new = sb * nu_imgrot + cb * nv_imgrot
+    nmap_i_rot = np.stack([nu_new, nv_new, nn_imgrot]).astype(np.float32)
 
     a = np.radians(alpha)
     c, s = np.cos(-a), np.sin(-a)
     theta_new = (theta_gt - alpha) % 360.0
     shift_x_new = c * shift_x_gt - s * shift_y_gt
     shift_y_new = s * shift_x_gt + c * shift_y_gt
-    return dmap_i_rot.astype(np.float32), valid_i_rot, theta_new, shift_y_new, shift_x_new
+    return dmap_i_rot.astype(np.float32), valid_i_rot, nmap_i_rot, theta_new, shift_y_new, shift_x_new
 
 
 class DepthmapPairDataset(Dataset):
@@ -69,6 +91,8 @@ class DepthmapPairDataset(Dataset):
         self.valid_i = data["valid_i"]
         self.dmap_j = data["dmap_j"]
         self.valid_j = data["valid_j"]
+        self.nmap_i = data["nmap_i"]
+        self.nmap_j = data["nmap_j"]
         self.corr_profile_normal = data["corr_profile_normal"]
         self.corr_profile_mirror = data["corr_profile_mirror"]
         self.theta_gt = data["theta_gt"]
@@ -85,14 +109,15 @@ class DepthmapPairDataset(Dataset):
     def __getitem__(self, idx):
         dmap_i, valid_i = self.dmap_i[idx], self.valid_i[idx]
         dmap_j, valid_j = self.dmap_j[idx], self.valid_j[idx]
+        nmap_i, nmap_j = self.nmap_i[idx], self.nmap_j[idx]
         theta_gt = float(self.theta_gt[idx])
         shift_y_gt, shift_x_gt = float(self.shift_y_gt[idx]), float(self.shift_x_gt[idx])
         profile_normal = self.corr_profile_normal[idx]
         profile_mirror = self.corr_profile_mirror[idx]
 
         if self.augment:
-            dmap_i, valid_i, theta_gt, shift_y_gt, shift_x_gt = _augment_rotate(
-                dmap_i, valid_i, theta_gt, shift_y_gt, shift_x_gt, self.rng)
+            dmap_i, valid_i, nmap_i, theta_gt, shift_y_gt, shift_x_gt = _augment_rotate(
+                dmap_i, valid_i, nmap_i, theta_gt, shift_y_gt, shift_x_gt, self.rng)
             # dmap_i a changé (rotation aléatoire) -- le profil précalculé
             # (calculé sur le dmap_i D'ORIGINE, cf. phase8_build_regressor_dataset.py)
             # ne correspond plus. Recalcul exact via FFT (pas une approximation
@@ -108,6 +133,8 @@ class DepthmapPairDataset(Dataset):
             "valid_i": torch.from_numpy(valid_i),
             "dmap_j": torch.from_numpy(dmap_j),
             "valid_j": torch.from_numpy(valid_j),
+            "nmap_i": torch.from_numpy(nmap_i.astype(np.float32)),
+            "nmap_j": torch.from_numpy(nmap_j.astype(np.float32)),
             "profile_normal": torch.from_numpy(profile_normal.astype(np.float32)),
             "profile_mirror": torch.from_numpy(profile_mirror.astype(np.float32)),
             "theta_gt": torch.tensor(theta_gt, dtype=torch.float32),
@@ -141,6 +168,7 @@ def evaluate(model, loader, device):
     for batch in loader:
         batch = {k: v.to(device) for k, v in batch.items()}
         pred = model(batch["dmap_i"], batch["valid_i"], batch["dmap_j"], batch["valid_j"],
+                     batch["nmap_i"], batch["nmap_j"],
                      batch["profile_normal"], batch["profile_mirror"])
         loss, _ = pose_regressor_loss(
             pred, batch["theta_gt"], batch["shift_y_gt"], batch["shift_x_gt"], batch["mirror_gt"])
@@ -223,6 +251,7 @@ def main():
         for batch in train_loader:
             batch = {k: v.to(device) for k, v in batch.items()}
             pred = model(batch["dmap_i"], batch["valid_i"], batch["dmap_j"], batch["valid_j"],
+                         batch["nmap_i"], batch["nmap_j"],
                          batch["profile_normal"], batch["profile_mirror"])
             loss, _ = pose_regressor_loss(
                 pred, batch["theta_gt"], batch["shift_y_gt"], batch["shift_x_gt"],

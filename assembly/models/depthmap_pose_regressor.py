@@ -36,7 +36,28 @@ différentiable, plus ambitieux et plus risqué), option choisie : injecter le
 profil de corrélation par angle (`angle_correlation_profile`,
 `scripts/phase5a_depthmap_matching.py`) comme feature auxiliaire dans la
 fusion, pour CHAQUE hypothèse (normal/miroir) séparément -- le réseau peut
-alors apprendre à pondérer/affiner ce signal plutôt qu'à le redécouvrir."""
+alors apprendre à pondérer/affiner ce signal plutôt qu'à le redécouvrir.
+
+MISE À JOUR (2026-07-31, "features 3D") -- `phase8_eligibility_diagnostic.py`
+a isolé le vrai goulot du modèle avec profil : le miroir mal classé (~27%
+des paires) donne une erreur d'angle quasi aléatoire (88.6° médian) même
+quand `n_corr` reste élevé -- l'éligibilité seule masquait ce problème (des
+paires à miroir faux passent quand même le seuil de correspondances par
+hasard, sur des nuages denses). Hypothèse : sur une fracture quasi plane
+(planéité médiane 0.043), le relief seul porte peu de signal pour trancher
+la réflexion, alors que le SENS des normales dans le plan (u,v) change
+directement sous une réflexion (une réflexion inverse `v`, donc `n_v`),
+contrairement au relief (`depth`, invariant à une réflexion in-plane pure).
+Ajout de 3 canaux de normale par carte (`n_u, n_v, n_n`, moyennés par case
+comme `depth` -- `rasterize_normal_channels()`,
+`scripts/phase5a_depthmap_matching.py`), `in_ch` 2→5.
+
+**Convention miroir pour les normales (vérifiée empiriquement, corrélation
+exacte 1.0 vs -1.0 sans la correction, cf. plan)** : le flip spatial des
+rangées (`torch.flip(dims=[-2])`, déjà appliqué à tous les canaux) suffit
+pour `n_u`/`n_n` (repositionnement pur), mais **`n_v` doit en plus être
+négatée en VALEUR** -- une réflexion `v → -v` inverse aussi la composante
+`v` de tout vecteur exprimé dans ce repère, pas seulement sa position."""
 
 import torch
 import torch.nn as nn
@@ -71,9 +92,10 @@ def _normalize_depth(dmap: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
 
 class _SiameseEncoder(nn.Module):
     """Encodeur CNN partagé (poids communs pour i, j-normal, j-miroir) --
-    entrée (2, R, R) = depth + validity, sortie un vecteur (feat_dim,)."""
+    entrée (5, R, R) = depth + validity + normale (n_u, n_v, n_n), sortie
+    un vecteur (feat_dim,)."""
 
-    def __init__(self, in_ch: int = 2, feat_dim: int = 64):
+    def __init__(self, in_ch: int = 5, feat_dim: int = 64):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, 16, 3, padding=1), nn.GroupNorm(4, 16), nn.ReLU(inplace=True),
@@ -92,14 +114,14 @@ class _SiameseEncoder(nn.Module):
 
 
 class DepthmapPoseRegressor(nn.Module):
-    """Params par défaut : ~100K (feat_dim=64, hidden=128/64, n_angles=36,
-    profile_feat_dim=16) -- cohérent avec la philosophie "petit modèle" du
-    CNN de segmentation (544K)."""
+    """Params par défaut : ~106K (feat_dim=64, hidden=128/64, n_angles=36,
+    profile_feat_dim=16, in_ch=5 avec les canaux de normale) -- cohérent
+    avec la philosophie "petit modèle" du CNN de segmentation (544K)."""
 
     def __init__(self, feat_dim: int = 64, hidden_dim: int = 128,
                  n_angles: int = 36, profile_feat_dim: int = 16):
         super().__init__()
-        self.encoder = _SiameseEncoder(in_ch=2, feat_dim=feat_dim)
+        self.encoder = _SiameseEncoder(in_ch=5, feat_dim=feat_dim)
         self.n_angles = n_angles
         # Encode le profil de corrélation FFT (angle_correlation_profile,
         # phase5a_depthmap_matching.py) -- le mécanisme de "corrélation
@@ -122,9 +144,14 @@ class DepthmapPoseRegressor(nn.Module):
 
     def forward(self, dmap_i: torch.Tensor, valid_i: torch.Tensor,
                 dmap_j: torch.Tensor, valid_j: torch.Tensor,
+                nmap_i: torch.Tensor, nmap_j: torch.Tensor,
                 profile_normal: torch.Tensor, profile_mirror: torch.Tensor):
         """`dmap_*`/`valid_*` : (B, R, R) float -- `valid_i`/`valid_j` en
-        {0,1} (ou probabilités). `profile_normal`/`profile_mirror` :
+        {0,1} (ou probabilités). `nmap_*` : (B, 3, R, R) float -- canaux de
+        normale (n_u, n_v, n_n), sortie de `rasterize_normal_channels()`
+        (`scripts/phase5a_depthmap_matching.py`), REPÈRE NORMAL (pas
+        mirroré -- le mirroring de `j` est géré en interne ci-dessous, comme
+        pour `dmap_j`/`valid_j`). `profile_normal`/`profile_mirror` :
         (B, n_angles) float -- sortie de `angle_correlation_profile()`
         (`scripts/phase5a_depthmap_matching.py`), calculée une fois pour
         `dmap_j` tel quel et une fois pour `dmap_j` mirroré (même convention
@@ -135,15 +162,21 @@ class DepthmapPoseRegressor(nn.Module):
         `mirror_prob` (B,) (probabilité de l'hypothèse miroir, softmax des
         deux confidences) pour le décodage/la perte.
 
-        Le miroir = retourner `dmap_j`/`valid_j` selon l'axe des RANGÉES
-        (`dim=-2`) -- équivalent à négater `v_j` avant rasterisation (cf.
-        docstring module et PLAN_REASSEMBLY_MODULE.md, Phase 8)."""
+        Le miroir = retourner `dmap_j`/`valid_j`/`nmap_j` selon l'axe des
+        RANGÉES (`dim=-2`) -- équivalent à négater `v_j` avant rasterisation
+        (cf. docstring module) -- PLUS, pour `nmap_j` uniquement, négater la
+        VALEUR du canal `n_v` (indice 1 de `nmap_j`) : une réflexion `v→-v`
+        inverse la composante `v` de tout vecteur exprimé dans ce repère,
+        pas seulement sa position (vérifié empiriquement, cf. docstring
+        module -- sans cette négation la corrélation avec le vrai miroir est
+        exactement -1.0 au lieu de +1.0)."""
         dmap_i = _normalize_depth(dmap_i, valid_i)
         dmap_j = _normalize_depth(dmap_j, valid_j)
 
-        x_i = torch.stack([dmap_i, valid_i], dim=1)          # (B, 2, R, R)
-        x_j_normal = torch.stack([dmap_j, valid_j], dim=1)
-        x_j_mirror = torch.flip(x_j_normal, dims=[-2])        # flip des rangées = -v_j
+        x_i = torch.cat([dmap_i.unsqueeze(1), valid_i.unsqueeze(1), nmap_i], dim=1)   # (B, 5, R, R)
+        x_j_normal = torch.cat([dmap_j.unsqueeze(1), valid_j.unsqueeze(1), nmap_j], dim=1)
+        x_j_mirror = torch.flip(x_j_normal, dims=[-2]).clone()   # flip des rangées = -v_j
+        x_j_mirror[:, 3, :, :] = -x_j_mirror[:, 3, :, :]         # n_v (canal 3 = 1er+2 = depth,valid,n_u,n_v,n_n)
 
         f_i = self.encoder(x_i)
         f_j_normal = self.encoder(x_j_normal)

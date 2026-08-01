@@ -143,6 +143,48 @@ def zoom_resample(mesh, seed_pts_gt_frame, extra_budget, expand_rings, rng):
     return np.asarray(new_pts_gt)
 
 
+def zoom_resample_with_normals(mesh, seed_pts_gt_frame, extra_budget, expand_rings, rng):
+    """Identique à `zoom_resample()`, mais retourne AUSSI les normales des
+    nouveaux points échantillonnés (Phase 8, features 3D, 2026-07-31) --
+    `mesh.face_normals[face_idx]`, même convention que `sample_points()`
+    (`assembly/data/breaking_bad/weighted.py`, `meshes[i].face_normals[pcd[1]]`).
+
+    Duplique volontairement `zoom_resample()` (pas un refactor partagé avec
+    un flag) -- `zoom_resample()` est appelée telle quelle par plusieurs
+    scripts déjà validés (phase6b_pipeline_*, phase8_pipeline_learned_check.py,
+    phase8_eligibility_diagnostic.py) avec un seul retour (`np.ndarray`) ;
+    changer sa signature casserait tous ces appels. Retourne
+    `(new_pts_gt, new_normals_gt)` ou `(None, None)` si la zone est vide."""
+    if len(seed_pts_gt_frame) == 0:
+        return None, None
+    tree = cKDTree(mesh.triangles_center)
+    _, seed_face_idx = tree.query(seed_pts_gt_frame)
+    zoom_face_idx = expand_faces_by_adjacency(mesh, np.unique(seed_face_idx), expand_rings)
+    if len(zoom_face_idx) == 0:
+        return None, None
+
+    face_weight = np.zeros(len(mesh.faces), dtype=np.float64)
+    face_weight[zoom_face_idx] = mesh.area_faces[zoom_face_idx]
+    if face_weight.sum() <= 0:
+        return None, None
+
+    seed = int(rng.integers(0, 2**31 - 1))
+    new_pts_gt, new_face_idx = trimesh.sample.sample_surface(
+        mesh, count=extra_budget, face_weight=face_weight, seed=seed)
+    new_normals_gt = mesh.face_normals[new_face_idx]
+    return np.asarray(new_pts_gt), np.asarray(new_normals_gt)
+
+
+def normals_to_input_frame(normals_gt, quat_wxyz):
+    """Comme `to_input_frame()`, mais pour des NORMALES (vecteurs directions,
+    pas des positions) -- pas de soustraction de `translation` (une
+    translation ne change pas une direction), seulement la rotation :
+    `n_input = n_gt @ R(quat)` (même formule que `to_input_frame`, sans le
+    terme `- translation`)."""
+    R = quat_wxyz_to_rotmat(quat_wxyz)
+    return normals_gt @ R
+
+
 def to_input_frame(pts_gt, quat_wxyz, translation):
     """Repère maillage/GT -> repère 'input' (celui de raw_i dans les autres
     scripts Phase 5A). Inverse de la formule de reconstruction Phase 0 :

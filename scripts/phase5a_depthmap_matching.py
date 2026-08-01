@@ -321,6 +321,51 @@ def rasterize(pts: np.ndarray, centroid, u, v, n, resolution: int, pixel_size: f
     return dmap, valid, u_min, v_min
 
 
+def rasterize_normal_channels(pts: np.ndarray, normals: np.ndarray, centroid, u, v, n,
+                               resolution: int, pixel_size: float, u_min: float, v_min: float):
+    """Phase 8 (2026-07-31, features 3D) -- variante de `rasterize()` pour les
+    NORMALES par point plutôt que la profondeur : moyenne par case des 3
+    composantes de la normale projetées dans le repère local (u, v, n).
+    Motivation : le diagnostic d'éligibilité (`phase8_eligibility_diagnostic.py`)
+    a montré que l'ambiguïté de réflexion (u,v) (miroir) est le vrai goulot du
+    modèle appris (erreur d'angle quasi aléatoire quand le miroir est mal
+    classé) -- sur une fracture quasi plane (planéité médiane 0.043, Phase
+    5A.0), le relief seul (depth) porte peu de signal pour trancher entre les
+    deux hypothèses, alors que le SENS des normales dans le plan (u,v) est
+    directement affecté par une réflexion, contrairement au relief.
+
+    PAS de refactor de `rasterize()` (très réutilisée dans les Phases 5A-7,
+    aucune régression tolérable dessus) -- fonction dédiée, recevant `u_min`/
+    `v_min` DÉJÀ CALCULÉS par le `rasterize()` appelé sur les mêmes points
+    (même `centroid`/`u`/`v`/`n`/`resolution`/`pixel_size`), pour garantir un
+    alignement pixel-à-pixel exact avec la depth map (pas de recalcul
+    indépendant de `u_min`/`v_min` qui pourrait diverger numériquement).
+
+    Retourne `nmap` de forme (3, R, R) -- canaux (n_u, n_v, n_n), 0 dans les
+    cases non couvertes (comme `dmap`/`valid` de `rasterize()`)."""
+    pts_c = pts - centroid
+    u_coords = pts_c @ u
+    v_coords = pts_c @ v
+    n_u = normals @ u
+    n_v = normals @ v
+    n_n = normals @ n
+
+    u_pix = np.clip(((u_coords - u_min) / pixel_size).astype(int), 0, resolution - 1)
+    v_pix = np.clip(((v_coords - v_min) / pixel_size).astype(int), 0, resolution - 1)
+
+    nmap_sum = np.zeros((3, resolution, resolution), dtype=np.float64)
+    count = np.zeros((resolution, resolution), dtype=np.float64)
+    for ch, comp in enumerate((n_u, n_v, n_n)):
+        np.add.at(nmap_sum[ch], (v_pix, u_pix), comp)
+    np.add.at(count, (v_pix, u_pix), 1.0)
+
+    valid = count > 0
+    nmap = np.zeros((3, resolution, resolution), dtype=np.float64)
+    for ch in range(3):
+        nmap[ch][valid] = nmap_sum[ch][valid] / count[valid]
+    return nmap
+
+
 # ── Matching ──────────────────────────────────────────────────────────────────
 
 def match_depthmaps(dmap_i, valid_i, dmap_j, valid_j, n_angles: int, score_mode: str = "joint"):

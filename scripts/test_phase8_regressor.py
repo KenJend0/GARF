@@ -27,20 +27,22 @@ def _random_batch(batch_size: int, resolution: int, n_angles: int = 36, device: 
     dmap_j = torch.randn(batch_size, resolution, resolution, generator=g, device=device)
     valid_i = (torch.rand(batch_size, resolution, resolution, generator=g, device=device) > 0.3).float()
     valid_j = (torch.rand(batch_size, resolution, resolution, generator=g, device=device) > 0.3).float()
+    nmap_i = torch.randn(batch_size, 3, resolution, resolution, generator=g, device=device)
+    nmap_j = torch.randn(batch_size, 3, resolution, resolution, generator=g, device=device)
     profile_normal = torch.randn(batch_size, n_angles, generator=g, device=device)
     profile_mirror = torch.randn(batch_size, n_angles, generator=g, device=device)
     theta_gt = torch.rand(batch_size, generator=g, device=device) * 360.0
     shift_y_gt = (torch.rand(batch_size, generator=g, device=device) - 0.5) * 20
     shift_x_gt = (torch.rand(batch_size, generator=g, device=device) - 0.5) * 20
     mirror_gt = torch.rand(batch_size, generator=g, device=device) > 0.5
-    return (dmap_i, valid_i, dmap_j, valid_j, profile_normal, profile_mirror,
+    return (dmap_i, valid_i, dmap_j, valid_j, nmap_i, nmap_j, profile_normal, profile_mirror,
             theta_gt, shift_y_gt, shift_x_gt, mirror_gt)
 
 
 def _test_forward_shapes():
     model = DepthmapPoseRegressor(feat_dim=16, hidden_dim=32)   # petit, rapide pour le test
-    dmap_i, valid_i, dmap_j, valid_j, profile_normal, profile_mirror, *_ = _random_batch(4, 32)
-    pred = model(dmap_i, valid_i, dmap_j, valid_j, profile_normal, profile_mirror)
+    dmap_i, valid_i, dmap_j, valid_j, nmap_i, nmap_j, profile_normal, profile_mirror, *_ = _random_batch(4, 32)
+    pred = model(dmap_i, valid_i, dmap_j, valid_j, nmap_i, nmap_j, profile_normal, profile_mirror)
 
     for branch in ("normal", "mirror"):
         for key in ("sin", "cos", "shift_y", "shift_x", "confidence_logit"):
@@ -57,8 +59,8 @@ def _test_forward_shapes():
 
 def _test_decode():
     model = DepthmapPoseRegressor(feat_dim=16, hidden_dim=32)
-    dmap_i, valid_i, dmap_j, valid_j, profile_normal, profile_mirror, *_ = _random_batch(3, 32)
-    pred = model(dmap_i, valid_i, dmap_j, valid_j, profile_normal, profile_mirror)
+    dmap_i, valid_i, dmap_j, valid_j, nmap_i, nmap_j, profile_normal, profile_mirror, *_ = _random_batch(3, 32)
+    pred = model(dmap_i, valid_i, dmap_j, valid_j, nmap_i, nmap_j, profile_normal, profile_mirror)
     theta_deg, shift_y, shift_x, mirror = DepthmapPoseRegressor.decode(pred)
     assert theta_deg.shape == (3,) and shift_y.shape == (3,) and mirror.shape == (3,)
     assert torch.all((theta_deg >= 0) & (theta_deg < 360.0))
@@ -68,9 +70,9 @@ def _test_decode():
 
 def _test_loss_and_backward():
     model = DepthmapPoseRegressor(feat_dim=16, hidden_dim=32)
-    (dmap_i, valid_i, dmap_j, valid_j, profile_normal, profile_mirror,
+    (dmap_i, valid_i, dmap_j, valid_j, nmap_i, nmap_j, profile_normal, profile_mirror,
      theta_gt, sy_gt, sx_gt, mirror_gt) = _random_batch(4, 32)
-    pred = model(dmap_i, valid_i, dmap_j, valid_j, profile_normal, profile_mirror)
+    pred = model(dmap_i, valid_i, dmap_j, valid_j, nmap_i, nmap_j, profile_normal, profile_mirror)
     loss, parts = pose_regressor_loss(pred, theta_gt, sy_gt, sx_gt, mirror_gt)
 
     assert loss.dim() == 0, "la loss doit être un scalaire"
@@ -121,9 +123,9 @@ def _test_perfect_prediction_low_loss():
 
 def _test_batch_size_one():
     model = DepthmapPoseRegressor(feat_dim=16, hidden_dim=32)
-    (dmap_i, valid_i, dmap_j, valid_j, profile_normal, profile_mirror,
+    (dmap_i, valid_i, dmap_j, valid_j, nmap_i, nmap_j, profile_normal, profile_mirror,
      theta_gt, sy_gt, sx_gt, mirror_gt) = _random_batch(1, 32)
-    pred = model(dmap_i, valid_i, dmap_j, valid_j, profile_normal, profile_mirror)
+    pred = model(dmap_i, valid_i, dmap_j, valid_j, nmap_i, nmap_j, profile_normal, profile_mirror)
     loss, _ = pose_regressor_loss(pred, theta_gt, sy_gt, sx_gt, mirror_gt)
     assert torch.isfinite(loss)
     print("  [OK] _test_batch_size_one")
