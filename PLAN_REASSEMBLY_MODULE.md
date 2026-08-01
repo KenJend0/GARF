@@ -4030,3 +4030,41 @@ nécessaire (attendu, pas un problème).
    même distribution partout, y compris à l'éval bout-en-bout finale.
 4. Si non concluant, réévaluer les options 2/3 (volume spatial /
    Fourier-Mellin) en connaissance de cause.
+
+**Résultat thresh0.3 (2026-07-31) — SUCCÈS, le profil de corrélation résout
+le sur-apprentissage sévère du 2026-07-30.** Dataset régénéré avec le zoom
+actif sur `train` (9578 paires train / 2199 val, résidu de fit
+1.82px/6.77px p95 -- plus bruité que GT comme attendu, mais pas dégénéré).
+Entraînement (200 epochs, `--num_workers 16`, ~8h20) : contrairement au run
+du 2026-07-30 (train ET val restaient au niveau du hasard, angle=68.5°/
+mirror=55% même sur le train), ici le train apprend réellement (angle=44.5°,
+mirror=78%) et la validation aussi (mirror_acc=67.6%, angle médian=19.74°)
+-- moins bon que GT (bruit des labels plus élevé) mais un apprentissage réel,
+pas un collapse.
+
+**Éval bout-en-bout (`phase8_pipeline_learned_check.py --strategy thresh03`,
+N=1487, `best.ckpt`) :**
+```
+                        Hand-crafted (Step15+nn)   Modèle appris + profil
+Éligibilité étage 1            62.6%                       57.8%
+Pose@30 global            14.7% (219 paires)         33.6% (500 paires) -- x2.3
+Succès strict global       6.8% (101 paires)         22.7% (338 paires) -- x3.3
+```
+Légère perte d'éligibilité (-4.8 pts) largement compensée par le gain de
+précision (plus de paires correctement posées EN ABSOLU malgré moins de
+paires traitées). **Première fois que le modèle appris bat le hand-crafted
+sur la condition CNN réelle (thresh0.3), pas seulement en oracle GT.**
+Confirme le diagnostic du 2026-07-31 : le sur-apprentissage n'était pas un
+problème de volume de données ni de cohérence train/val (déjà éliminés le
+2026-07-30), mais un problème d'architecture -- le pooling global de
+l'encodeur siamois empêchait le réseau de développer un vrai mécanisme de
+comparaison spatiale i/j, que le profil de corrélation FFT lui fournit
+directement.
+
+**Décision (2026-07-31, avec l'utilisateur) : résultat retenu comme
+succès du chantier Phase 8.** Reste ouvert pour une itération future si
+souhaité : combler l'écart d'éligibilité (-4.8 pts vs hand-crafted), ou
+pousser plus loin avec les features 3D suggérées par l'utilisateur
+(normales projetées en canaux supplémentaires de la depth map, cf.
+discussion du 2026-07-31 -- non testé, mis de côté pour ne pas empiler
+deux changements avant d'avoir isolé l'effet du profil de corrélation).
