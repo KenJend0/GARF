@@ -57,7 +57,21 @@ exacte 1.0 vs -1.0 sans la correction, cf. plan)** : le flip spatial des
 rangées (`torch.flip(dims=[-2])`, déjà appliqué à tous les canaux) suffit
 pour `n_u`/`n_n` (repositionnement pur), mais **`n_v` doit en plus être
 négatée en VALEUR** -- une réflexion `v → -v` inverse aussi la composante
-`v` de tout vecteur exprimé dans ce repère, pas seulement sa position."""
+`v` de tout vecteur exprimé dans ce repère, pas seulement sa position.
+
+MISE À JOUR (2026-07-31, "tête miroir dédiée") -- concaténer les canaux de
+normale dans l'entrée générale (in_ch 2→5) n'a PAS amélioré la précision
+miroir mesurée par `phase8_eligibility_diagnostic.py` (73.0%→70.3%, dans le
+bruit) alors que le résultat pipeline complet progressait légèrement --
+signe que le signal normal existe mais se noie dans la fusion générale
+(4×feat_dim + profil), partagée avec la tâche de régression angle/shift qui
+domine numériquement. Retour à un encodeur général `in_ch=2` (depth+valid
+seul, comme avant les normales) + un **second encodeur dédié, poids séparés,
+`in_ch=3` (normales seules)**, dont la sortie alimente EXCLUSIVEMENT la
+confiance/décision miroir (`mirror_head`) -- jamais la régression
+angle/shift, qui reste portée par `head`/`profile_encoder` comme validé.
+Isole complètement le canal d'information (normales → décision miroir) de
+la tâche qui semblait le diluer."""
 
 import torch
 import torch.nn as nn
@@ -114,14 +128,14 @@ class _SiameseEncoder(nn.Module):
 
 
 class DepthmapPoseRegressor(nn.Module):
-    """Params par défaut : ~106K (feat_dim=64, hidden=128/64, n_angles=36,
-    profile_feat_dim=16, in_ch=5 avec les canaux de normale) -- cohérent
-    avec la philosophie "petit modèle" du CNN de segmentation (544K)."""
+    """Params par défaut : ~115K (feat_dim=64, hidden=128/64, n_angles=36,
+    profile_feat_dim=16, mirror_feat_dim=32) -- cohérent avec la philosophie
+    "petit modèle" du CNN de segmentation (544K)."""
 
     def __init__(self, feat_dim: int = 64, hidden_dim: int = 128,
-                 n_angles: int = 36, profile_feat_dim: int = 16):
+                 n_angles: int = 36, profile_feat_dim: int = 16, mirror_feat_dim: int = 32):
         super().__init__()
-        self.encoder = _SiameseEncoder(in_ch=5, feat_dim=feat_dim)
+        self.encoder = _SiameseEncoder(in_ch=2, feat_dim=feat_dim)
         self.n_angles = n_angles
         # Encode le profil de corrélation FFT (angle_correlation_profile,
         # phase5a_depthmap_matching.py) -- le mécanisme de "corrélation
@@ -134,13 +148,27 @@ class DepthmapPoseRegressor(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(head_in, hidden_dim), nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim // 2), nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim // 2, 5),   # sin, cos, shift_y, shift_x, confidence_logit
+            nn.Linear(hidden_dim // 2, 4),   # sin, cos, shift_y, shift_x (PAS de confidence -- cf. mirror_head)
+        )
+        # Tête miroir DÉDIÉE (2026-07-31) -- poids séparés de `encoder`,
+        # ne voit QUE les normales (in_ch=3), alimente EXCLUSIVEMENT la
+        # confiance/décision miroir. Isole ce signal de la régression
+        # angle/shift, qui semblait le diluer dans la fusion générale
+        # (cf. docstring module).
+        self.mirror_encoder = _SiameseEncoder(in_ch=3, feat_dim=mirror_feat_dim)
+        self.mirror_head = nn.Sequential(
+            nn.Linear(4 * mirror_feat_dim, mirror_feat_dim), nn.ReLU(inplace=True),
+            nn.Linear(mirror_feat_dim, 1),
         )
 
     def _fuse_and_predict(self, f_i: torch.Tensor, f_j: torch.Tensor,
                            profile_emb: torch.Tensor) -> torch.Tensor:
         fused = torch.cat([f_i, f_j, f_i - f_j, f_i * f_j, profile_emb], dim=1)
-        return self.head(fused)   # (B, 5)
+        return self.head(fused)   # (B, 4)
+
+    def _mirror_confidence(self, m_i: torch.Tensor, m_j: torch.Tensor) -> torch.Tensor:
+        fused = torch.cat([m_i, m_j, m_i - m_j, m_i * m_j], dim=1)
+        return self.mirror_head(fused).squeeze(-1)   # (B,)
 
     def forward(self, dmap_i: torch.Tensor, valid_i: torch.Tensor,
                 dmap_j: torch.Tensor, valid_j: torch.Tensor,
@@ -173,10 +201,9 @@ class DepthmapPoseRegressor(nn.Module):
         dmap_i = _normalize_depth(dmap_i, valid_i)
         dmap_j = _normalize_depth(dmap_j, valid_j)
 
-        x_i = torch.cat([dmap_i.unsqueeze(1), valid_i.unsqueeze(1), nmap_i], dim=1)   # (B, 5, R, R)
-        x_j_normal = torch.cat([dmap_j.unsqueeze(1), valid_j.unsqueeze(1), nmap_j], dim=1)
-        x_j_mirror = torch.flip(x_j_normal, dims=[-2]).clone()   # flip des rangées = -v_j
-        x_j_mirror[:, 3, :, :] = -x_j_mirror[:, 3, :, :]         # n_v (canal 3 = 1er+2 = depth,valid,n_u,n_v,n_n)
+        x_i = torch.stack([dmap_i, valid_i], dim=1)            # (B, 2, R, R)
+        x_j_normal = torch.stack([dmap_j, valid_j], dim=1)
+        x_j_mirror = torch.flip(x_j_normal, dims=[-2])          # flip des rangées = -v_j
 
         f_i = self.encoder(x_i)
         f_j_normal = self.encoder(x_j_normal)
@@ -185,24 +212,37 @@ class DepthmapPoseRegressor(nn.Module):
         prof_n = self.profile_encoder(_normalize_profile(profile_normal))
         prof_m = self.profile_encoder(_normalize_profile(profile_mirror))
 
-        out_normal = self._fuse_and_predict(f_i, f_j_normal, prof_n)
+        out_normal = self._fuse_and_predict(f_i, f_j_normal, prof_n)   # (B, 4) : sin,cos,sy,sx
         out_mirror = self._fuse_and_predict(f_i, f_j_mirror, prof_m)
 
-        conf = torch.stack([out_normal[:, 4], out_mirror[:, 4]], dim=1)   # (B, 2)
-        mirror_prob = torch.softmax(conf, dim=1)[:, 1]                   # (B,)
+        # Tête miroir dédiée -- ne voit que les normales (in_ch=3), poids
+        # séparés de `encoder`. Même convention de flip que ci-dessus, PLUS
+        # la négation de n_v (canal 1 de nmap, cf. docstring module).
+        nmap_j_mirror = torch.flip(nmap_j, dims=[-2]).clone()
+        nmap_j_mirror[:, 1, :, :] = -nmap_j_mirror[:, 1, :, :]   # n_v
 
-        def _unpack(out):
+        m_i = self.mirror_encoder(nmap_i)
+        m_j_normal = self.mirror_encoder(nmap_j)
+        m_j_mirror = self.mirror_encoder(nmap_j_mirror)
+
+        conf_normal = self._mirror_confidence(m_i, m_j_normal)
+        conf_mirror = self._mirror_confidence(m_i, m_j_mirror)
+
+        conf = torch.stack([conf_normal, conf_mirror], dim=1)   # (B, 2)
+        mirror_prob = torch.softmax(conf, dim=1)[:, 1]          # (B,)
+
+        def _unpack(out, confidence_logit):
             norm = torch.linalg.vector_norm(out[:, :2], dim=1, keepdim=True).clamp_min(1e-8)
             sin_cos = out[:, :2] / norm
             return {
                 "sin": sin_cos[:, 0], "cos": sin_cos[:, 1],
                 "shift_y": out[:, 2], "shift_x": out[:, 3],
-                "confidence_logit": out[:, 4],
+                "confidence_logit": confidence_logit,
             }
 
         return {
-            "normal": _unpack(out_normal),
-            "mirror": _unpack(out_mirror),
+            "normal": _unpack(out_normal, conf_normal),
+            "mirror": _unpack(out_mirror, conf_mirror),
             "mirror_prob": mirror_prob,
         }
 
