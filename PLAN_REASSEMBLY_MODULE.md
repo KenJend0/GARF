@@ -4752,3 +4752,42 @@ cas où la bonne pose est proche de la prédiction sans être exactement
 dessus, pas seulement le choix binaire normal/mirror. À discuter avec
 l'utilisateur avant de se lancer (coût : plus d'ICP par paire, rendement
 décroissant à mesurer).
+
+### 9B, extension -- perturbations d'angle (`topM_icp`)
+
+Implémenté (2026-08-03) : `run_learned_stage1_with_offsets()`
+(`phase8_pipeline_learned_check.py`) -- même principe que
+`run_learned_stage1_both_hypotheses` (un seul forward, coût
+supplémentaire uniquement sur correspondances+Kabsch+ICP), mais pour
+CHAQUE hypothèse (normal/mirror), teste aussi `theta_pred + offset` pour
+une liste d'offsets configurable (`--theta_offsets`, défaut
+`0,-10,10,-20,20` -- 5 valeurs x 2 hypothèses = jusqu'à 10 candidats par
+paire, contre 2 pour `top2_icp`). Nouveau mode `--stage1_mode topM_icp`.
+Sélection toujours par énergie ICP finale la plus basse parmi tous les
+candidats valides. `chosen_hypothesis` loggé sous forme `"normal+10"` /
+`"mirror-20"` etc.
+
+**Attendu, pas garanti** : ce mécanisme cible surtout le groupe B (déjà
+dans le bon bassin, une pose proche mais pas assez précise) -- un
+décalage de quelques degrés ne peut pas corriger les erreurs
+catastrophiques du groupe C (~130°, bien au-delà de la plage testée).
+Ne devrait donc PAS réduire le groupe C, mais pourrait convertir une
+partie du groupe B en groupe A (succès strict). Coût réel incertain :
+`top2_icp` (2x l'ICP de `single`) n'a quasiment rien coûté en temps de
+run (1432s → 1464s, +2%, l'ICP est visiblement une fraction mineure du
+temps total par paire) -- `topM_icp` (jusqu'à 5x plus de candidats) reste
+à mesurer mais ne devrait pas être linéaire dans le pire cas.
+
+Pas encore lancé -- prochaine action :
+```
+CUDA_VISIBLE_DEVICES=1 python scripts/phase8_pipeline_learned_check.py --strategy thresh03 \
+    --regressor_ckpt output/phase8_depthmap_regressor_thresh03_mirrorhead/best.ckpt \
+    --ckpt output/cnn_step15_final_model/last.ckpt \
+    --data_root ... --experiment cnn_step15_final_model \
+    --categories everyday --split val \
+    --stage1_mode topM_icp \
+    --rows_csv /tmp/student7/phase9b_rows_thresh03_topMicp.csv \
+    --summary_json /tmp/student7/phase9b_summary_topMicp.json
+```
+À comparer à la référence `top2_icp` : éligibilité 79.3%, Pose@30 global
+40.5%, succès strict 21.2% (N=3803).

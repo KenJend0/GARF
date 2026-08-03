@@ -291,6 +291,76 @@ def run_learned_stage1_both_hypotheses(model, frac_i, frac_j, nrm_i, nrm_j, R_ij
     return result
 
 
+@torch.no_grad()
+def run_learned_stage1_with_offsets(model, frac_i, frac_j, nrm_i, nrm_j, R_ij_gt, t_ij_gt, device,
+                                     theta_offsets):
+    """Extension de `run_learned_stage1_both_hypotheses` (2026-08-03, suite
+    du gain top2_icp) : pour CHAQUE hypothèse (normal/mirror), teste aussi
+    quelques variantes d'angle autour de la prédiction du modèle
+    (`theta_pred + offset`, MÊME shift -- pas de nouveau forward, juste la
+    construction de correspondances + Kabsch répétée). Motivation : le gain
+    top2_icp vient de laisser l'ICP arbitrer plutôt que deviner en amont --
+    ici on étend la même idée à l'angle, pour couvrir le cas où la bonne
+    pose est proche de la prédiction sans être exactement dessus (utile
+    surtout pour le groupe B, déjà dans le bon bassin, pas pour les échecs
+    catastrophiques du groupe C -- un décalage de quelques degrés ne peut
+    pas corriger une erreur de 130°, cf. diagnostic 9A).
+
+    `theta_offsets` : liste de décalages en degrés, ex. [0, -10, 10, -20, 20]
+    -- 0 doit être inclus pour retrouver exactement le comportement
+    top2_icp en sous-cas. Retourne un dict {(label, offset): cand_ou_rien},
+    même format de `cand` que `run_learned_stage1_both_hypotheses`."""
+    result = {}
+    if len(frac_i) < 3 or len(frac_j) < 3:
+        return result
+
+    dmap_i, valid_i, dmap_j, valid_j, frame = build_frame_and_rasterize(frac_i, frac_j)
+    nmap_i = rasterize_normal_channels(
+        frac_i, nrm_i, frame["c_i"], frame["u_i"], frame["v_i"], frame["n_i"],
+        RESOLUTION, frame["pixel_size"], frame["u_min_i"], frame["v_min_i"])
+    nmap_j = rasterize_normal_channels(
+        frac_j, nrm_j, frame["c_j"], frame["u_j"], frame["v_j"], frame["n_j"],
+        RESOLUTION, frame["pixel_size"], frame["u_min_j"], frame["v_min_j"])
+
+    profile_normal = angle_correlation_profile(dmap_i, valid_i, dmap_j, valid_j, DEFAULT_N_ANGLES)
+    profile_mirror = angle_correlation_profile(
+        dmap_i, valid_i, np.flip(dmap_j, axis=0), np.flip(valid_j, axis=0), DEFAULT_N_ANGLES)
+
+    t_dmap_i = torch.from_numpy(dmap_i[None]).float().to(device)
+    t_valid_i = torch.from_numpy(valid_i[None]).float().to(device)
+    t_dmap_j = torch.from_numpy(dmap_j[None]).float().to(device)
+    t_valid_j = torch.from_numpy(valid_j[None]).float().to(device)
+    t_nmap_i = torch.from_numpy(nmap_i[None].astype(np.float32)).to(device)
+    t_nmap_j = torch.from_numpy(nmap_j[None].astype(np.float32)).to(device)
+    t_profile_normal = torch.from_numpy(profile_normal[None].astype(np.float32)).to(device)
+    t_profile_mirror = torch.from_numpy(profile_mirror[None].astype(np.float32)).to(device)
+
+    pred = model(t_dmap_i, t_valid_i, t_dmap_j, t_valid_j, t_nmap_i, t_nmap_j,
+                 t_profile_normal, t_profile_mirror)
+
+    for label, is_mirror in (("normal", False), ("mirror", True)):
+        branch = pred["mirror"] if is_mirror else pred["normal"]
+        theta_base = float(torch.rad2deg(torch.atan2(branch["sin"], branch["cos"])) % 360.0)
+        shift = (float(branch["shift_y"].item()), float(branch["shift_x"].item()))
+        v_j_use = -frame["v_j"] if is_mirror else frame["v_j"]
+        for offset in theta_offsets:
+            theta = (theta_base + offset) % 360.0
+            pts_i3, pts_j3 = build_correspondences_nn(
+                frac_i, frame["c_i"], frame["u_i"], frame["v_i"],
+                frac_j, frame["c_j"], frame["u_j"], v_j_use,
+                frame["u_min_i"], frame["v_min_i"], frame["u_min_j"], frame["v_min_j"],
+                frame["pixel_size"], RESOLUTION, theta, shift,
+            )
+            if pts_i3 is None or len(pts_i3) < 3:
+                continue
+            R_est, t_est = kabsch(pts_i3, pts_j3)
+            result[(label, offset)] = {
+                "R_est": R_est, "t_est": t_est, "n_corr": len(pts_i3),
+                "rot_err": rot_err_deg(R_est, R_ij_gt), "trans_err": trans_err(t_est, t_ij_gt),
+            }
+    return result
+
+
 def _icp_residual_stats(pts_i, nrm_i, pts_j, nrm_j, R, t, trim_ratio, close_thresh=0.02):
     """Stats post-hoc sur la pose finale (après ICP), calculées une fois de
     plus ici plutôt que de faire retourner ces valeurs par
@@ -347,15 +417,23 @@ def main():
                          help="Phase 9A : dump par-paire (groupe A/B/C, erreurs "
                               "avant/après ICP, mirror_prob, n_corr, overlap_frac, "
                               "normal_consistency...) pour analyse hors-ligne.")
-    parser.add_argument("--stage1_mode", default="single", choices=["single", "top2_icp"],
+    parser.add_argument("--stage1_mode", default="single",
+                         choices=["single", "top2_icp", "topM_icp"],
                          help="Phase 9B : 'top2_icp' essaie LES DEUX hypothèses "
                               "(normal/mirror, déjà calculées par le même forward) et "
                               "garde celle dont l'ICP donne la meilleure énergie finale, "
-                              "au lieu de choisir --mirror_mode en amont.")
+                              "au lieu de choisir --mirror_mode en amont. 'topM_icp' ajoute "
+                              "en plus des variantes d'angle autour de chaque hypothèse "
+                              "(cf. --theta_offsets).")
+    parser.add_argument("--theta_offsets", default="0,-10,10,-20,20",
+                         help="Phase 9B (topM_icp) : décalages d'angle en degrés à tester "
+                              "autour de chaque hypothèse (liste séparée par des virgules, "
+                              "0 doit être inclus pour retrouver top2_icp en sous-cas).")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     if args.strategy == "thresh03" and not args.ckpt:
         parser.error("--ckpt (checkpoint CNN) est requis avec --strategy thresh03")
+    theta_offsets = [float(x) for x in args.theta_offsets.split(",")]
 
     device = torch.device(args.device)
     rng = np.random.default_rng(args.seed)
@@ -374,10 +452,15 @@ def main():
         chosen_hypothesis = None
         n_hypotheses_valid = 1
 
-        if args.stage1_mode == "top2_icp":
-            candidates = run_learned_stage1_both_hypotheses(
-                regressor, frac_i_zoom, frac_j_zoom, nrm_i_zoom, nrm_j_zoom,
-                R_ij_gt, t_ij_gt, device)
+        if args.stage1_mode in ("top2_icp", "topM_icp"):
+            if args.stage1_mode == "topM_icp":
+                candidates = run_learned_stage1_with_offsets(
+                    regressor, frac_i_zoom, frac_j_zoom, nrm_i_zoom, nrm_j_zoom,
+                    R_ij_gt, t_ij_gt, device, theta_offsets)
+            else:
+                candidates = run_learned_stage1_both_hypotheses(
+                    regressor, frac_i_zoom, frac_j_zoom, nrm_i_zoom, nrm_j_zoom,
+                    R_ij_gt, t_ij_gt, device)
             valid = {k: v for k, v in candidates.items() if v is not None}
             if not valid:
                 n_stage1_failed += 1
@@ -402,8 +485,10 @@ def main():
                 }
             # Sélection PAR L'ICP (énergie finale la plus basse), pas par une
             # règle de miroir choisie en amont -- coeur de l'idée 9B.
-            chosen_hypothesis = min(icp_results, key=lambda k: icp_results[k]["icp_energy"])
-            chosen = icp_results[chosen_hypothesis]
+            best_key = min(icp_results, key=lambda k: icp_results[k]["icp_energy"])
+            chosen = icp_results[best_key]
+            chosen_hypothesis = (f"{best_key[0]}+{best_key[1]:g}"
+                                  if isinstance(best_key, tuple) else best_key)
             R_final, t_final = chosen["R_final"], chosen["t_final"]
             re_final = rot_err_deg(R_final, R_ij_gt)
             te_final = trans_err(t_final, t_ij_gt)
