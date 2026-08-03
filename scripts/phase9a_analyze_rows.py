@@ -68,6 +68,32 @@ def main():
     table = pd.crosstab(sub_c["mirror_conf_bin"], sub_c["icp_status"], normalize="index") * 100
     print(table.round(1))
 
+    print("\n=== 9A-bis : split du groupe B par rot_ok/trans_ok (seuil strict "
+          "5deg/0.02), avant ET après ICP ===")
+    rot_thresh, trans_thresh = 5.0, 0.02
+    sub_b = df[df["group"] == "B"].copy()
+
+    def _split(rot_col, trans_col):
+        rot_ok = sub_b[rot_col] < rot_thresh
+        trans_ok = sub_b[trans_col] < trans_thresh
+        cat = pd.Series("both_fail", index=sub_b.index)
+        cat[rot_ok & ~trans_ok] = "trans_fail_only"
+        cat[~rot_ok & trans_ok] = "rot_fail_only"
+        cat[rot_ok & trans_ok] = "both_ok"
+        return cat
+
+    sub_b["fail_mode_before_icp"] = _split("rot_err_stage1", "trans_err_stage1")
+    sub_b["fail_mode_after_icp"] = _split("rot_err_final", "trans_err_final")
+
+    print("\n-- Avant ICP (n=%d) --" % len(sub_b))
+    print((sub_b["fail_mode_before_icp"].value_counts(normalize=True) * 100).round(1))
+    print("\n-- Après ICP (n=%d) --" % len(sub_b))
+    print((sub_b["fail_mode_after_icp"].value_counts(normalize=True) * 100).round(1))
+
+    print("\n-- Transition avant -> après ICP (lignes=avant, colonnes=après) --")
+    transition = pd.crosstab(sub_b["fail_mode_before_icp"], sub_b["fail_mode_after_icp"])
+    print(transition)
+
 
 if __name__ == "__main__":
     main()
