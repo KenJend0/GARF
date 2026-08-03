@@ -4303,3 +4303,53 @@ CUDA_VISIBLE_DEVICES=1 python scripts/phase9_normal_orientation_check.py \
 Si confirmé : remplacerait `mirror_head`/`profile_mirror` par une règle
 géométrique déterministe (plus simple, potentiellement plus fiable que le
 86.4% appris) -- levier direct sur le groupe C (40% des échecs Pose@30).
+
+**Résultat GT (2026-08-03, `phase9_normal_orientation_check.py`, N=831)** :
+prévalence mirror=True AVANT (repère non orienté) 50.5%, APRÈS (orienté)
+**98.2%**, stable sur deux runs (98.3%/98.2%) -- confirme le mécanisme :
+deux faces de fracture en contact ont des normales sortantes opposées, et
+regarder un même plan depuis deux côtés opposés produit une image en
+miroir (fait de projection 2D). Correction du raisonnement initial :
+l'intuition "orienter vers l'extérieur élimine le miroir" était inversée
+-- en réalité ça le rend quasi-systématique (prévisible, donc remplaçable
+par une constante déterministe).
+
+**Branché dans le pipeline (`phase8_pipeline_learned_check.py
+--mirror_mode geometric`)** : sélection du miroir remplacée par
+`sign_i == sign_j` (signe de `n_i`/`n_j`, déjà utilisés pour la
+rasterisation, comparé à la moyenne des normales mesh du fragment) --
+AUCUN changement du forward du modèle (les deux hypothèses
+`pred["normal"]`/`pred["mirror"]` restent calculées par le régresseur
+existant, seule la sélection change, même checkpoint, pas de réentraînement).
+
+**Résultat pipeline (2026-08-03, thresh0.3, N=3803, `mirror_head` run
+précédent vs `geometric`) : QUASI IDENTIQUE, pas d'amélioration mesurable.**
+```
+                    mirror_head (appris)   geometric (déterministe)
+Éligibilité              50.4%                   50.4%
+Pose@30 global            30.1% (1145)            30.4% (1157)
+Succès strict             18.0% (684)             17.6% (670)
+Groupe A/B/C             35.7/24.0/40.3%         35.0/25.4/39.6%
+```
+Surprenant vu l'écart GT (98.2% vs 86.4%) -- hypothèse à tester : le
+masque CNN thresh0.3 (bruité, précision/rappel imparfaits sur les paires
+difficiles, cf. diagnostic 2026-07-22) dégrade `nrm_i.mean(axis=0)`
+(moyenne calculée sur les points RETENUS par le CNN + zoom, pas les points
+GT propres), rapprochant l'exactitude géométrique réelle des 86.4% appris
+plutôt que des 98.2% GT. Alternative : le miroir seul n'explique peut-être
+pas la majorité des échecs du groupe C en conditions réelles (theta/shift
+massivement faux même à miroir correct).
+
+**Diagnostic dédié : `scripts/phase9_normal_orientation_check_thresh03.py`**
+-- même mesure que la version GT, mais sur les points CNN thresh0.3+zoom
+(exactement le jeu utilisé par le pipeline réel), avec l'exactitude
+(comparaison à `mirror_gt` oracle, via `R_ij_gt`/`t_ij_gt`, jamais utilisée
+pour la prédiction elle-même) au lieu de la seule prévalence -- comparable
+directement aux 86.4% du `mirror_head` appris. Pas encore lancé --
+prochaine action :
+```
+CUDA_VISIBLE_DEVICES=1 python scripts/phase9_normal_orientation_check_thresh03.py \
+    --ckpt output/cnn_step15_final_model/last.ckpt \
+    --data_root ... --experiment cnn_step15_final_model \
+    --categories everyday --split val --max_batches 3000
+```
