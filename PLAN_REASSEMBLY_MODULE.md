@@ -4142,11 +4142,62 @@ profil de corrélation). **Casse la compatibilité des checkpoints existants**
 (`phase8_depthmap_regressor_gt_corr/`, `_thresh03_corr/`) -- retraining
 complet nécessaire des deux côtés (GT d'abord, oracle-first).
 
-**Prochaines actions :**
-1. Regénérer les `.npz` GT et thresh0.3 (nouveau format avec `nmap_i`/`nmap_j`).
-2. Réentraîner GT d'abord -- vérifier au moins la non-régression vs
-   76.0%/55.1% (Pose@30/succès strict) avant thresh0.3.
-3. Réentraîner thresh0.3, comparer à la barre actuelle avec profil seul :
-   éligibilité 57.8%, Pose@30 global 33.6%, succès strict 22.7%. Regarder
-   en particulier si la précision miroir (73.0%) et l'écart de confiance
-   correct/incorrect (0.775/0.583) s'améliorent.
+**Résultat 1 (2026-07-31, thresh0.3, normales concaténées dans l'entrée
+générale, `in_ch` 2→5) — pipeline complet légèrement meilleur, mais
+diagnostic mirror NON concluant.** Pipeline (N=1487) : éligibilité 59.9%,
+Pose@30 global 36.0% (535, +2.4 pts vs profil seul), succès strict 24.7%
+(367, +2.0 pts). Mais `phase8_eligibility_diagnostic.py` (N=1011) montre
+**précision miroir 70.3%, contre 73.0% avant** -- PAS d'amélioration, dans
+le bruit (écart de confiance correct/incorrect resserré : 0.155 contre
+0.192). **L'hypothèse ciblée (les normales aident le miroir) n'est pas
+confirmée par ce diagnostic** -- le petit gain pipeline vient probablement
+d'ailleurs (bruit d'échantillonnage entre les deux runs de diagnostic, ou
+gain diffus sur l'angle/shift général) plutôt que du mécanisme visé.
+
+**Diagnostic (2026-07-31) : le signal se noie dans la fusion générale.**
+Hypothèse retenue avec l'utilisateur : concaténer les normales dans
+l'entrée de l'encodeur partagé (`in_ch=5`) les mélange avec la tâche de
+régression angle/shift (qui domine numériquement la fusion
+`4×feat_dim+profil`), sans leur donner de chemin dédié pour influencer
+spécifiquement la décision miroir.
+
+**Résultat 2 (2026-07-31, "tête miroir dédiée") — SUCCÈS NET, confirmé.**
+`DepthmapPoseRegressor` : retour à l'encodeur général `in_ch=2`
+(depth+valid seul, comme au run profil-seul) + un **second encodeur, poids
+séparés, `in_ch=3` (normales seules)**, dont la sortie alimente
+EXCLUSIVEMENT `mirror_head` (jamais la régression angle/shift, qui reste
+portée par `head`/`profile_encoder`). Même convention miroir (flip +
+négation `n_v`, canal 1 sur 3 désormais), reconfirmée par test d'intégration
+local. Pas besoin de régénérer les `.npz` (`nmap_i`/`nmap_j` déjà
+précalculés) -- seul le modèle change.
+
+Entraînement (thresh0.3, 200 epochs) : `mirror_acc` décodé sur validation =
+**84.1%** (vs 66-68% sur tous les runs précédents) -- signal fort dès
+l'entraînement. Pipeline complet (N=1487, `best.ckpt`) :
+```
+                        Hand-crafted   Profil seul   +Normales(fusion)   +Tête miroir dédiée
+Éligibilité                62.6%          57.8%           59.9%               59.4%
+Pose@30 global         14.7% (219)    33.6% (500)     36.0% (535)        38.7% (575) -- MEILLEUR
+Succès strict           6.8% (101)    22.7% (338)     24.7% (367)        23.9% (356) -- ~stable
+```
+**Diagnostic (`phase8_eligibility_diagnostic.py`, N=1025) — précision
+miroir 86.4%** (contre 70.3%/73.0% avant, +13-16 points), écart de
+confiance correct/incorrect élargi à 0.256 (0.911/0.655, contre
+0.155-0.192 avant). **Hypothèse confirmée sans ambiguïté cette fois** : le
+signal existait bien dans les normales, mais fallait un chemin dédié pour
+l'exploiter -- la fusion générale le diluait.
+
+**Lecture du résultat pipeline (honnête, pas sur-vendue) :** le gain se
+concentre sur Pose@30 (tolérance large, +2.7 pts vs le run précédent, ×2.6
+vs hand-crafted), le succès strict reste quasi stable (23.9% vs 24.7%,
+dans le bruit). Cohérent : mieux classer le miroir évite les poses
+complètement aberrantes (~90° d'erreur), mais ne garantit pas à lui seul
+une précision fine -- celle-ci dépend encore de l'angle/shift exact et de
+la convergence de l'ICP (étage 2), pas encore améliorés par ce chantier.
+
+**Décision (2026-07-31, avec l'utilisateur) : ce modèle (tête miroir
+dédiée) est le résultat retenu, chantier features 3D clos.** Diagnostic
+propre et confirmé (pas juste un chiffre pipeline ambigu comme le run
+"normales fusionnées") : la piste normales fonctionne, mais seulement
+avec un chemin d'information isolé -- leçon transférable pour toute
+feature auxiliaire future dans ce genre d'architecture à fusion partagée.
