@@ -218,6 +218,79 @@ def run_learned_stage1(model, frac_i, frac_j, nrm_i, nrm_j, R_ij_gt, t_ij_gt, de
     return result
 
 
+@torch.no_grad()
+def run_learned_stage1_both_hypotheses(model, frac_i, frac_j, nrm_i, nrm_j, R_ij_gt, t_ij_gt, device):
+    """Phase 9B (2026-08-03) : au lieu de choisir À L'AVANCE laquelle des
+    deux hypothèses ("normal"/"mirror") est correcte (`mirror_head` appris
+    ou règle géométrique -- toutes deux plafonnées ~86-90% d'exactitude,
+    cf. Phase 9 ci-dessus), on essaie LES DEUX et on laisse l'étage 2
+    (ICP) départager par énergie finale. Justifié par 9A : l'ICP est très
+    fiable pour distinguer une bonne pose d'une mauvaise une fois qu'on
+    lui en donne plusieurs à comparer (96-97%/89-92% d'amélioration dans
+    les groupes A/B), et le miroir n'explique qu'une minorité du groupe C
+    -- donner le choix à l'ICP plutôt que de deviner en amont est agnostique
+    à la cause exacte (miroir, planéité, ou autre chose non identifiée).
+
+    Coût quasi nul : les deux branches (`pred["normal"]`/`pred["mirror"]`)
+    sont DÉJÀ calculées par un seul forward (le modèle les calcule toujours
+    toutes les deux en interne, cf. `DepthmapPoseRegressor.forward`) --
+    seule la construction des correspondances + Kabsch est dupliquée ici,
+    pas le forward du réseau.
+
+    Retourne un dict {"normal": cand_ou_None, "mirror": cand_ou_None},
+    `cand` = {"R_est", "t_est", "n_corr", "rot_err", "trans_err"} (erreurs
+    vs GT calculées ici pour le LOGGING seulement -- la sélection réelle,
+    faite par l'appelant, se fait sur l'énergie ICP finale, pas sur ces
+    erreurs GT)."""
+    result = {"normal": None, "mirror": None}
+    if len(frac_i) < 3 or len(frac_j) < 3:
+        return result
+
+    dmap_i, valid_i, dmap_j, valid_j, frame = build_frame_and_rasterize(frac_i, frac_j)
+    nmap_i = rasterize_normal_channels(
+        frac_i, nrm_i, frame["c_i"], frame["u_i"], frame["v_i"], frame["n_i"],
+        RESOLUTION, frame["pixel_size"], frame["u_min_i"], frame["v_min_i"])
+    nmap_j = rasterize_normal_channels(
+        frac_j, nrm_j, frame["c_j"], frame["u_j"], frame["v_j"], frame["n_j"],
+        RESOLUTION, frame["pixel_size"], frame["u_min_j"], frame["v_min_j"])
+
+    profile_normal = angle_correlation_profile(dmap_i, valid_i, dmap_j, valid_j, DEFAULT_N_ANGLES)
+    profile_mirror = angle_correlation_profile(
+        dmap_i, valid_i, np.flip(dmap_j, axis=0), np.flip(valid_j, axis=0), DEFAULT_N_ANGLES)
+
+    t_dmap_i = torch.from_numpy(dmap_i[None]).float().to(device)
+    t_valid_i = torch.from_numpy(valid_i[None]).float().to(device)
+    t_dmap_j = torch.from_numpy(dmap_j[None]).float().to(device)
+    t_valid_j = torch.from_numpy(valid_j[None]).float().to(device)
+    t_nmap_i = torch.from_numpy(nmap_i[None].astype(np.float32)).to(device)
+    t_nmap_j = torch.from_numpy(nmap_j[None].astype(np.float32)).to(device)
+    t_profile_normal = torch.from_numpy(profile_normal[None].astype(np.float32)).to(device)
+    t_profile_mirror = torch.from_numpy(profile_mirror[None].astype(np.float32)).to(device)
+
+    pred = model(t_dmap_i, t_valid_i, t_dmap_j, t_valid_j, t_nmap_i, t_nmap_j,
+                 t_profile_normal, t_profile_mirror)
+
+    for label, is_mirror in (("normal", False), ("mirror", True)):
+        branch = pred["mirror"] if is_mirror else pred["normal"]
+        theta = float(torch.rad2deg(torch.atan2(branch["sin"], branch["cos"])) % 360.0)
+        shift = (float(branch["shift_y"].item()), float(branch["shift_x"].item()))
+        v_j_use = -frame["v_j"] if is_mirror else frame["v_j"]
+        pts_i3, pts_j3 = build_correspondences_nn(
+            frac_i, frame["c_i"], frame["u_i"], frame["v_i"],
+            frac_j, frame["c_j"], frame["u_j"], v_j_use,
+            frame["u_min_i"], frame["v_min_i"], frame["u_min_j"], frame["v_min_j"],
+            frame["pixel_size"], RESOLUTION, theta, shift,
+        )
+        if pts_i3 is None or len(pts_i3) < 3:
+            continue
+        R_est, t_est = kabsch(pts_i3, pts_j3)
+        result[label] = {
+            "R_est": R_est, "t_est": t_est, "n_corr": len(pts_i3),
+            "rot_err": rot_err_deg(R_est, R_ij_gt), "trans_err": trans_err(t_est, t_ij_gt),
+        }
+    return result
+
+
 def _icp_residual_stats(pts_i, nrm_i, pts_j, nrm_j, R, t, trim_ratio, close_thresh=0.02):
     """Stats post-hoc sur la pose finale (après ICP), calculées une fois de
     plus ici plutôt que de faire retourner ces valeurs par
@@ -274,6 +347,11 @@ def main():
                          help="Phase 9A : dump par-paire (groupe A/B/C, erreurs "
                               "avant/après ICP, mirror_prob, n_corr, overlap_frac, "
                               "normal_consistency...) pour analyse hors-ligne.")
+    parser.add_argument("--stage1_mode", default="single", choices=["single", "top2_icp"],
+                         help="Phase 9B : 'top2_icp' essaie LES DEUX hypothèses "
+                              "(normal/mirror, déjà calculées par le même forward) et "
+                              "garde celle dont l'ICP donne la meilleure énergie finale, "
+                              "au lieu de choisir --mirror_mode en amont.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     if args.strategy == "thresh03" and not args.ckpt:
@@ -293,22 +371,67 @@ def main():
                       nrm_i_zoom, nrm_j_zoom, R_ij_gt, t_ij_gt, n_min_base,
                       full_centroid_i=None, full_centroid_j=None):
         nonlocal n_stage1_failed
-        stage1_res = run_learned_stage1(regressor, frac_i_zoom, frac_j_zoom, nrm_i_zoom, nrm_j_zoom,
-                                         R_ij_gt, t_ij_gt, device, mirror_mode=args.mirror_mode,
-                                         full_centroid_i=full_centroid_i, full_centroid_j=full_centroid_j)
-        if stage1_res["reached_stage"] != "pose_computed":
-            n_stage1_failed += 1
-            return
-        R_init, t_init = stage1_res["R_est"], stage1_res["t_est"]
-        R_final, t_final, _ = trimmed_icp_normals(
-            frac_i_base, frac_i_nrm, frac_j_base, frac_j_nrm, R_init, t_init,
-            max_iters=args.max_icp_iters, trim_ratio=args.trim_ratio,
-            normal_dot_thresh=args.normal_dot_thresh,
-        )
-        re_final = rot_err_deg(R_final, R_ij_gt)
-        te_final = trans_err(t_final, t_ij_gt)
-        icp_energy, overlap_frac, normal_consistency = _icp_residual_stats(
-            frac_i_base, frac_i_nrm, frac_j_base, frac_j_nrm, R_final, t_final, args.trim_ratio)
+        chosen_hypothesis = None
+        n_hypotheses_valid = 1
+
+        if args.stage1_mode == "top2_icp":
+            candidates = run_learned_stage1_both_hypotheses(
+                regressor, frac_i_zoom, frac_j_zoom, nrm_i_zoom, nrm_j_zoom,
+                R_ij_gt, t_ij_gt, device)
+            valid = {k: v for k, v in candidates.items() if v is not None}
+            if not valid:
+                n_stage1_failed += 1
+                return
+            n_hypotheses_valid = len(valid)
+
+            icp_results = {}
+            for label, cand in valid.items():
+                R_f, t_f, _ = trimmed_icp_normals(
+                    frac_i_base, frac_i_nrm, frac_j_base, frac_j_nrm,
+                    cand["R_est"], cand["t_est"],
+                    max_iters=args.max_icp_iters, trim_ratio=args.trim_ratio,
+                    normal_dot_thresh=args.normal_dot_thresh,
+                )
+                energy, ovlp, ncons = _icp_residual_stats(
+                    frac_i_base, frac_i_nrm, frac_j_base, frac_j_nrm, R_f, t_f, args.trim_ratio)
+                icp_results[label] = {
+                    "R_final": R_f, "t_final": t_f, "icp_energy": energy,
+                    "overlap_frac": ovlp, "normal_consistency": ncons,
+                    "rot_err_stage1": cand["rot_err"], "trans_err_stage1": cand["trans_err"],
+                    "n_corr": cand["n_corr"],
+                }
+            # Sélection PAR L'ICP (énergie finale la plus basse), pas par une
+            # règle de miroir choisie en amont -- coeur de l'idée 9B.
+            chosen_hypothesis = min(icp_results, key=lambda k: icp_results[k]["icp_energy"])
+            chosen = icp_results[chosen_hypothesis]
+            R_final, t_final = chosen["R_final"], chosen["t_final"]
+            re_final = rot_err_deg(R_final, R_ij_gt)
+            te_final = trans_err(t_final, t_ij_gt)
+            icp_energy, overlap_frac, normal_consistency = (
+                chosen["icp_energy"], chosen["overlap_frac"], chosen["normal_consistency"])
+            stage1_res = {
+                "rot_err": chosen["rot_err_stage1"], "trans_err": chosen["trans_err_stage1"],
+                "mirror_prob": None, "n_corr": chosen["n_corr"],
+                "pose_30": bool(chosen["rot_err_stage1"] < 30.0 and chosen["trans_err_stage1"] < 0.1),
+                "pose_15": bool(chosen["rot_err_stage1"] < 15.0 and chosen["trans_err_stage1"] < 0.05),
+            }
+        else:
+            stage1_res = run_learned_stage1(regressor, frac_i_zoom, frac_j_zoom, nrm_i_zoom, nrm_j_zoom,
+                                             R_ij_gt, t_ij_gt, device, mirror_mode=args.mirror_mode,
+                                             full_centroid_i=full_centroid_i, full_centroid_j=full_centroid_j)
+            if stage1_res["reached_stage"] != "pose_computed":
+                n_stage1_failed += 1
+                return
+            R_init, t_init = stage1_res["R_est"], stage1_res["t_est"]
+            R_final, t_final, _ = trimmed_icp_normals(
+                frac_i_base, frac_i_nrm, frac_j_base, frac_j_nrm, R_init, t_init,
+                max_iters=args.max_icp_iters, trim_ratio=args.trim_ratio,
+                normal_dot_thresh=args.normal_dot_thresh,
+            )
+            re_final = rot_err_deg(R_final, R_ij_gt)
+            te_final = trans_err(t_final, t_ij_gt)
+            icp_energy, overlap_frac, normal_consistency = _icp_residual_stats(
+                frac_i_base, frac_i_nrm, frac_j_base, frac_j_nrm, R_final, t_final, args.trim_ratio)
 
         final_pose_30 = bool(re_final < 30.0 and te_final < 0.1)
         final_pose_15 = bool(re_final < 15.0 and te_final < 0.05)
@@ -335,6 +458,8 @@ def main():
 
         rows.append({
             "object_id": obj_idx, "pair_id": 0, "group": group,
+            "stage1_mode": args.stage1_mode, "chosen_hypothesis": chosen_hypothesis,
+            "n_hypotheses_valid": n_hypotheses_valid,
             "n_frac_pts_min": n_min_base, "n_corr": stage1_res["n_corr"],
             "mirror_prob": stage1_res["mirror_prob"],
             "rot_err_stage1": stage1_res["rot_err"], "trans_err_stage1": stage1_res["trans_err"],

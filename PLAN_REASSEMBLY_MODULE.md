@@ -4639,3 +4639,90 @@ en ABSOLU, Pose@30 et succès strict progressent tous les deux.
 refermé avec un vrai succès (contrairement à cascade/`contact_eps`,
 rejetés).** Nouvelle barre à dépasser pour la suite : éligibilité 77.2%,
 Pose@30 global 36.8%, succès strict 18.6%.
+
+## Chantier (1), repris sur la nouvelle population (2026-08-03, post `ABS_MIN_POINTS=5`)
+
+9A relancé (`phase9a_analyze_rows.py` sur le CSV du run `ABS_MIN_POINTS=5`,
+N=2937 à l'étage 2, groupe C passé de 41.2% à 52.4%) -- **les deux
+conclusions précédentes tiennent, quasi à l'identique** :
+- Groupe C : `rot_err_stage1` médian toujours ~131°, **73.7% dans la
+  tranche 90-180°** (identique au run précédent) -- le miroir explique
+  toujours une minorité de C, encore plus vrai maintenant que C a
+  quasiment doublé en absolu (1538 contre 772).
+- Groupe B : `trans_fail_only` (21.7%) reste ~2x plus fréquent que
+  `rot_fail_only` (10.1%) après ICP -- ratio resserré vs avant (3.5:1
+  →2.1:1, cohérent avec `n_frac_pts_min` qui baisse aussi dans B,
+  147→90), mais la conclusion ne s'inverse pas : la translation reste le
+  facteur limitant dominant.
+
+**Nouvelle piste testée : la sparsité (`n_frac_pts_min`, effondrée dans C,
+129→54 médiane, avec la nouvelle population sous 50 points) explique-t-elle
+la majorité du groupe C non expliquée par le miroir ?** Croisement
+`n_frac_pts_min` (binné) x catastrophique (`rot_err_stage1 ≥ 90°`) au sein
+de C :
+```
+density_bin   <25    25-50   50-100  100-200  200+
+catastrophic  68.2%  80.4%   75.9%   70.5%    74.7%
+```
+**RÉFUTÉ, proprement.** Le taux catastrophique reste quasi plat sur toutes
+les tranches, y compris à 200+ points (74.7% catastrophique quand même) --
+médiane `n_frac_pts_min` quasi identique entre catastrophique et pas
+(55 vs 52). Ni le miroir ni la sparsité n'expliquent la majorité du groupe
+C. Hypothèse restante, cohérente avec le constat originel du chantier
+(fractures Breaking Bad quasi planes, planéité médiane 0.043) : une
+ambiguïté d'angle liée à la FORME, indépendante du nombre de points --
+pas testée directement (planéité non loggée dans ce CSV, demanderait un
+nouveau champ + rerun).
+
+**Décision (avec l'utilisateur) : ne pas chercher une 4e cause explicative
+(coût croissant, retour décroissant) -- passer à 9B (top-M hypothèses),
+une réponse agnostique à la cause exacte.**
+
+## Phase 9B — les deux hypothèses (normal/mirror) déjà calculées, sélection par énergie ICP
+
+Idée : plutôt que de choisir À L'AVANCE quelle hypothèse (normal/mirror)
+est correcte (`mirror_head` appris ou règle géométrique, toutes deux
+plafonnées ~86-90%), essayer LES DEUX et laisser l'étage 2 (ICP)
+départager par énergie finale -- justifié par 9A (l'ICP est très fiable
+pour distinguer une bonne pose d'une mauvaise une fois qu'on lui en donne
+plusieurs à comparer, 96-97%/89-92% d'amélioration en A/B) et par le fait
+qu'aucune cause explicative unique n'a été trouvée pour la majorité du
+groupe C -- une sélection en aval est agnostique à la cause (miroir,
+planéité, ou autre chose).
+
+**Coût quasi nul : les deux branches (`pred["normal"]`/`pred["mirror"]`)
+sont DÉJÀ calculées par un seul forward du modèle** (le réseau les
+calcule toujours toutes les deux en interne, cf.
+`DepthmapPoseRegressor.forward`) -- pas de forward supplémentaire, juste
+la construction des correspondances + Kabsch + ICP dupliquée (2x au lieu
+de 1x).
+
+**Implémenté dans `scripts/phase8_pipeline_learned_check.py`** :
+- `run_learned_stage1_both_hypotheses()` -- comme `run_learned_stage1`,
+  mais retourne LES DEUX candidats (`R_est`/`t_est`/`n_corr`, plus
+  `rot_err`/`trans_err` vs GT pour le LOGGING seulement, jamais pour la
+  sélection) au lieu d'en choisir un via `mirror_mode`.
+- Nouvel argument `--stage1_mode {single, top2_icp}` (défaut `single` =
+  comportement Phase 8/9 inchangé). En `top2_icp`, `_handle_pair` lance
+  l'ICP sur CHAQUE hypothèse valide, calcule l'énergie finale
+  (`_icp_residual_stats`) pour chacune, et garde celle avec l'énergie la
+  plus basse -- pas de dépendance à `--mirror_mode` dans ce mode.
+- CSV enrichi : `stage1_mode`, `chosen_hypothesis` (normal/mirror),
+  `n_hypotheses_valid` (1 si une seule branche avait ≥3 correspondances,
+  2 sinon) -- pour diagnostiquer ensuite si l'ICP choisit bien la bonne
+  hypothèse la plupart du temps.
+
+Pas encore lancé -- prochaine action :
+```
+CUDA_VISIBLE_DEVICES=1 python scripts/phase8_pipeline_learned_check.py --strategy thresh03 \
+    --regressor_ckpt output/phase8_depthmap_regressor_thresh03_mirrorhead/best.ckpt \
+    --ckpt output/cnn_step15_final_model/last.ckpt \
+    --data_root ... --experiment cnn_step15_final_model \
+    --categories everyday --split val \
+    --stage1_mode top2_icp \
+    --rows_csv /tmp/student7/phase9b_rows_thresh03_top2icp.csv \
+    --summary_json /tmp/student7/phase9b_summary_top2icp.json
+```
+À comparer à la référence actuelle (`ABS_MIN_POINTS=5`, `mirror_mode
+geometric_centroid`) : éligibilité 77.2%, Pose@30 global 36.8%, succès
+strict 18.6% (N=3803).
