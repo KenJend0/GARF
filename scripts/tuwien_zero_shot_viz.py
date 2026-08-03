@@ -98,10 +98,10 @@ def infer_adjacency(global_pts_list, eps=CONTACT_EPS, min_pts=MIN_CONTACT_PTS):
     return pairs
 
 
-def run_cnn_zero_shot(model, frag_pts_local, frag_nrm_local, device):
-    """`frag_pts_local`/`frag_nrm_local` : liste de (n_points, 3) déjà
-    recentrés + normalisés PAR FRAGMENT (repère local CNN). Retourne une
-    liste de (n_points,) probabilités fracture, même ordre que l'entrée.
+def _cnn_forward_batch(model, frag_pts_local, frag_nrm_local, device):
+    """Un seul forward CNN sur les fragments donnés (K = len(frag_pts_local),
+    tous partagent le MÊME contexte global si `use_global_context` est actif
+    sur le checkpoint -- cf. `run_cnn_zero_shot` pour la discussion complète).
 
     IMPORTANT : `extract_normal_list()` (projection_mapping_utils.py)
     suppose TOUJOURS `N_total = max_parts * num_pts` (contrairement à
@@ -142,6 +142,30 @@ def run_cnn_zero_shot(model, frag_pts_local, frag_nrm_local, device):
         out = model(batch)
     scores = out["coarse_seg_pred"].float().cpu().numpy()   # (K*n,)
     return [scores[k * n_points:(k + 1) * n_points] for k in range(K)]
+
+
+def run_cnn_zero_shot(model, frag_pts_local, frag_nrm_local, device, isolate=False):
+    """`frag_pts_local`/`frag_nrm_local` : liste de (n_points, 3) déjà
+    recentrés + normalisés PAR FRAGMENT (repère local CNN). Retourne une
+    liste de (n_points,) probabilités fracture, même ordre que l'entrée.
+
+    `isolate` (2026-08-03, question utilisateur) : Step 15 utilise
+    `use_global_context=True` -- un descripteur global est calculé en
+    moyennant les features de TOUS les fragments du batch (`bottleneck.mean`
+    par fragment puis moyenne inter-fragments, cf. `cnn_segmentation_model.py`
+    étape 5), puis réinjecté dans le traitement de CHAQUE fragment. Sur
+    Breaking Bad, ce contexte vient de fragments du MÊME objet réellement
+    cassé -- signal cohérent. Ici, rien ne garantit que ce contexte reste
+    utile hors distribution : si `isolate=True`, chaque fragment est passé
+    dans un batch à lui seul (K=1, pas de contexte croisé possible) --
+    compare directement à `isolate=False` (comportement par défaut, K=6
+    ensemble) pour savoir si le mélange inter-fragments aide ou nuit ici."""
+    if not isolate:
+        return _cnn_forward_batch(model, frag_pts_local, frag_nrm_local, device)
+    return [
+        _cnn_forward_batch(model, [pts], [nrm], device)[0]
+        for pts, nrm in zip(frag_pts_local, frag_nrm_local)
+    ]
 
 
 def match_pair(pts_i_global, pts_j_global, score_i, score_j, threshold=FRAC_THRESHOLD):
@@ -192,6 +216,13 @@ def main():
     parser.add_argument("--n_points", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--isolate", action="store_true",
+                        help="Fait tourner le CNN fragment par fragment (K=1, pas de contexte "
+                             "global croisé) au lieu des 6 ensemble (défaut) -- teste si le "
+                             "mélange inter-fragments (use_global_context) aide ou nuit hors "
+                             "distribution. Affiche toujours les deux résultats (groupé vs "
+                             "isolé) pour comparaison ; --isolate choisit lequel est utilisé "
+                             "pour le matching/export JSON.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -235,11 +266,16 @@ def main():
     model.eval()
     model.to(device)
 
-    print("Inférence CNN zero-shot...")
-    scores = run_cnn_zero_shot(model, local_pts, local_nrm, device)
-    for i, s in enumerate(scores):
-        print(f"  fragment {i+1}: {int((s > FRAC_THRESHOLD).sum())}/{len(s)} points "
-              f"prédits fracture (thresh {FRAC_THRESHOLD})")
+    print("Inférence CNN zero-shot -- groupé (K=6, contexte global partagé) vs isolé (K=1)...")
+    scores_grouped = run_cnn_zero_shot(model, local_pts, local_nrm, device, isolate=False)
+    scores_isolated = run_cnn_zero_shot(model, local_pts, local_nrm, device, isolate=True)
+    print(f"  {'':<12}{'groupé (K=6)':>16}{'isolé (K=1)':>16}")
+    for i in range(len(scores_grouped)):
+        n_g = int((scores_grouped[i] > FRAC_THRESHOLD).sum())
+        n_i = int((scores_isolated[i] > FRAC_THRESHOLD).sum())
+        print(f"  fragment {i+1:<3}{n_g:>16}{n_i:>16}   (/{len(scores_grouped[i])})")
+    scores = scores_isolated if args.isolate else scores_grouped
+    print(f"  -> utilisé pour le reste du script : {'isolé' if args.isolate else 'groupé'}")
 
     print("Matching hand-crafted par paire adjacente...")
     pair_results = []
