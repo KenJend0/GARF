@@ -4617,3 +4617,25 @@ CUDA_VISIBLE_DEVICES=1 python scripts/phase8_pipeline_learned_check.py --strateg
 dans `phase8_build_regressor_dataset.py` et réentraîner, pour que le
 modèle voie cette population sparse à l'entraînement, pas seulement à
 l'inférence.
+
+**Résultat confirmé à pleine échelle (2026-08-03, N=3803, `ABS_MIN_POINTS=5`,
+sinon réglages identiques -- `geometric_centroid`, checkpoint
+`thresh03_mirrorhead` inchangé, PAS de réentraînement) :**
+```
+                    ABS_MIN_POINTS=50   ABS_MIN_POINTS=5      Δ
+Éligibilité               50.6%             77.2%          +26.6 pts
+Pose@30 global             29.7% (1131)      36.8% (1399)   +7.1 pts (+268 paires)
+Succès strict global       17.6% (669)       18.6% (709)    +1.0 pt  (+40 paires)
+Groupe A/B/C            34.8/24.0/41.2%   24.1/23.5/52.4%
+```
+**Confirme précisément le diagnostic isolé** : 1014 nouvelles paires
+éligibles, dont 268 (26.4%) atteignent réellement Pose@30 -- même ordre
+de grandeur que le test ciblé (13.2%/311), la population ajoutée est plus
+dure que la moyenne mais contribue un gain réel, pas du bruit. Le groupe C
+grossit en PROPORTION (41.2%→52.4%) simplement parce que la nouvelle
+population est plus difficile (cohérent, pas un signe de dégradation) --
+en ABSOLU, Pose@30 et succès strict progressent tous les deux.
+**`ABS_MIN_POINTS=5` devient le réglage de référence, ce chantier (2) est
+refermé avec un vrai succès (contrairement à cascade/`contact_eps`,
+rejetés).** Nouvelle barre à dépasser pour la suite : éligibilité 77.2%,
+Pose@30 global 36.8%, succès strict 18.6%.
