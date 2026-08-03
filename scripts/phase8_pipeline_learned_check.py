@@ -43,6 +43,7 @@ Usage (sur le serveur, oracle-first D'ABORD) :
 """
 
 import argparse
+import csv
 import json
 import sys
 import time
@@ -51,6 +52,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from hydra.utils import instantiate
+from scipy.spatial import cKDTree
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -92,7 +94,7 @@ def run_learned_stage1(model, frac_i, frac_j, nrm_i, nrm_j, R_ij_gt, t_ij_gt, de
     n_i, n_j = len(frac_i), len(frac_j)
     result = {"reached_stage": "unusable_too_few", "n_frac_pts_min": min(n_i, n_j),
               "pose_30": False, "pose_15": False, "rot_err": None, "trans_err": None,
-              "R_est": None, "t_est": None}
+              "R_est": None, "t_est": None, "mirror_prob": None, "n_corr": None}
     if n_i < 3 or n_j < 3:
         return result
 
@@ -126,6 +128,8 @@ def run_learned_stage1(model, frac_i, frac_j, nrm_i, nrm_j, R_ij_gt, t_ij_gt, de
     theta = float(theta_t.item())
     shift = (float(sy_t.item()), float(sx_t.item()))
     mirror = bool(mirror_t.item())
+    mirror_prob = float(pred["mirror_prob"].item())
+    result["mirror_prob"] = mirror_prob
 
     v_j_use = -frame["v_j"] if mirror else frame["v_j"]
     pts_i3, pts_j3 = build_correspondences_nn(
@@ -137,6 +141,7 @@ def run_learned_stage1(model, frac_i, frac_j, nrm_i, nrm_j, R_ij_gt, t_ij_gt, de
     if pts_i3 is None or len(pts_i3) < 3:
         result["reached_stage"] = "no_correspondence"
         return result
+    result["n_corr"] = len(pts_i3)
 
     R_est, t_est = kabsch(pts_i3, pts_j3)
     re = rot_err_deg(R_est, R_ij_gt)
@@ -147,6 +152,30 @@ def run_learned_stage1(model, frac_i, frac_j, nrm_i, nrm_j, R_ij_gt, t_ij_gt, de
         "R_est": R_est, "t_est": t_est,
     })
     return result
+
+
+def _icp_residual_stats(pts_i, nrm_i, pts_j, nrm_j, R, t, trim_ratio, close_thresh=0.02):
+    """Stats post-hoc sur la pose finale (après ICP), calculées une fois de
+    plus ici plutôt que de faire retourner ces valeurs par
+    `trimmed_icp_normals` (`phase6a_convergence_basin_check.py`, déjà validé
+    sur des milliers de paires -- même logique de duplication que le reste
+    du projet, pour ne rien risquer sur une fonction critique). Même
+    `trim_ratio` que l'ICP pour `icp_energy_final` (comparable à l'objectif
+    qu'il minimise). `normal_consistency` : moyenne des dot products
+    normale_i tournée / normale_j la plus proche sur les points gardés --
+    même convention que `normal_dot_thresh` de l'ICP (proche de -1 = bon
+    contact face-à-face, proche de 0/positif = mauvais)."""
+    pts_i_t = (R @ pts_i.T).T + t
+    nrm_i_t = (R @ nrm_i.T).T
+    tree = cKDTree(pts_j)
+    dists, idx = tree.query(pts_i_t)
+    order = np.argsort(dists)
+    n_keep = max(3, int(round(trim_ratio * len(dists))))
+    kept = order[:n_keep]
+    icp_energy = float(np.mean(dists[kept]))
+    overlap_frac = float(np.mean(dists < close_thresh))
+    normal_consistency = float(np.mean(np.sum(nrm_i_t[kept] * nrm_j[idx[kept]], axis=1)))
+    return icp_energy, overlap_frac, normal_consistency
 
 
 def main():
@@ -170,6 +199,10 @@ def main():
     parser.add_argument("--success_trans_thresh", type=float, default=0.02)
     parser.add_argument("--max_batches", type=int, default=0, help="0 = tout le split")
     parser.add_argument("--summary_json", default="")
+    parser.add_argument("--rows_csv", default="",
+                         help="Phase 9A : dump par-paire (groupe A/B/C, erreurs "
+                              "avant/après ICP, mirror_prob, n_corr, overlap_frac, "
+                              "normal_consistency...) pour analyse hors-ligne.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     if args.strategy == "thresh03" and not args.ckpt:
@@ -185,7 +218,7 @@ def main():
     n_stage1_failed = 0
     t0 = time.time()
 
-    def _handle_pair(frac_i_base, frac_j_base, frac_i_nrm, frac_j_nrm, frac_i_zoom, frac_j_zoom,
+    def _handle_pair(obj_idx, frac_i_base, frac_j_base, frac_i_nrm, frac_j_nrm, frac_i_zoom, frac_j_zoom,
                       nrm_i_zoom, nrm_j_zoom, R_ij_gt, t_ij_gt, n_min_base):
         nonlocal n_stage1_failed
         stage1_res = run_learned_stage1(regressor, frac_i_zoom, frac_j_zoom, nrm_i_zoom, nrm_j_zoom,
@@ -201,13 +234,45 @@ def main():
         )
         re_final = rot_err_deg(R_final, R_ij_gt)
         te_final = trans_err(t_final, t_ij_gt)
+        icp_energy, overlap_frac, normal_consistency = _icp_residual_stats(
+            frac_i_base, frac_i_nrm, frac_j_base, frac_j_nrm, R_final, t_final, args.trim_ratio)
+
+        final_pose_30 = bool(re_final < 30.0 and te_final < 0.1)
+        final_pose_15 = bool(re_final < 15.0 and te_final < 0.05)
+        final_strict_success = bool(re_final < args.success_rot_thresh
+                                     and te_final < args.success_trans_thresh)
+
+        # Groupes 9A (PLAN_REASSEMBLY_MODULE.md) : A = Pose@30 final + strict,
+        # B = Pose@30 final mais pas strict, C = Pose@30 final raté.
+        if not final_pose_30:
+            group = "C"
+        elif final_strict_success:
+            group = "A"
+        else:
+            group = "B"
+
+        delta_rot_icp = stage1_res["rot_err"] - re_final
+        delta_trans_icp = stage1_res["trans_err"] - te_final
+        if delta_rot_icp > 1.0:
+            icp_status = "improved"
+        elif delta_rot_icp < -1.0:
+            icp_status = "worsened"
+        else:
+            icp_status = "unchanged"
+
         rows.append({
-            "n_frac_pts_min": n_min_base,
+            "object_id": obj_idx, "pair_id": 0, "group": group,
+            "n_frac_pts_min": n_min_base, "n_corr": stage1_res["n_corr"],
+            "mirror_prob": stage1_res["mirror_prob"],
+            "rot_err_stage1": stage1_res["rot_err"], "trans_err_stage1": stage1_res["trans_err"],
+            "rot_err_final": re_final, "trans_err_final": te_final,
+            "delta_rot_icp": delta_rot_icp, "delta_trans_icp": delta_trans_icp,
+            "icp_status": icp_status,
+            "icp_energy_final": icp_energy, "overlap_frac_final": overlap_frac,
+            "normal_consistency_final": normal_consistency,
             "stage1_pose_30": stage1_res["pose_30"], "stage1_pose_15": stage1_res["pose_15"],
-            "final_pose_30": bool(re_final < 30.0 and te_final < 0.1),
-            "final_pose_15": bool(re_final < 15.0 and te_final < 0.05),
-            "final_strict_success": bool(re_final < args.success_rot_thresh
-                                          and te_final < args.success_trans_thresh),
+            "final_pose_30": final_pose_30, "final_pose_15": final_pose_15,
+            "final_strict_success": final_strict_success,
         })
 
     if args.strategy == "gt":
@@ -296,7 +361,7 @@ def main():
             nrm_i_zoom = np.concatenate([frac_i_nrm, new_i_nrm_input], axis=0)
             nrm_j_zoom = np.concatenate([frac_j_nrm, new_j_nrm_input], axis=0)
 
-            _handle_pair(frac_i_base, frac_j_base, frac_i_nrm, frac_j_nrm,
+            _handle_pair(idx, frac_i_base, frac_j_base, frac_i_nrm, frac_j_nrm,
                          frac_i_zoom, frac_j_zoom, nrm_i_zoom, nrm_j_zoom,
                          R_ij_gt, t_ij_gt, n_min_base)
 
@@ -424,7 +489,7 @@ def main():
                 nrm_i_zoom = np.concatenate([frac_i_nrm, new_i_nrm_input], axis=0)
                 nrm_j_zoom = np.concatenate([frac_j_nrm, new_j_nrm_input], axis=0)
 
-                _handle_pair(frac_i_base, frac_j_base, frac_i_nrm, frac_j_nrm,
+                _handle_pair(idx, frac_i_base, frac_j_base, frac_i_nrm, frac_j_nrm,
                              frac_i_zoom, frac_j_zoom, nrm_i_zoom, nrm_j_zoom,
                              R_ij_gt, t_ij_gt, n_min_raw)
 
@@ -457,6 +522,31 @@ def main():
     barre = ("éligibilité 99.1%, Pose@30 global 37.6%, succès strict 23.2%" if args.strategy == "gt"
              else "éligibilité 62.6%, Pose@30 global 14.7%, succès strict 6.8%")
     print(f"\n(Barre à dépasser -- Step 15 + nn, hand-crafted : {barre})")
+
+    # Phase 9A -- répartition par groupe (A = Pose@30 final + strict,
+    # B = Pose@30 final sans strict, C = Pose@30 final raté) et effet de
+    # l'ICP (improved/unchanged/worsened) au sein de chaque groupe.
+    print("\nRÉPARTITION 9A (parmi les paires ayant atteint l'étage 2) :")
+    for g in ("A", "B", "C"):
+        g_rows = [r for r in rows if r["group"] == g]
+        if not g_rows:
+            continue
+        n_g = len(g_rows)
+        n_imp = sum(1 for r in g_rows if r["icp_status"] == "improved")
+        n_unc = sum(1 for r in g_rows if r["icp_status"] == "unchanged")
+        n_wor = sum(1 for r in g_rows if r["icp_status"] == "worsened")
+        print(f"  Groupe {g}: {n_g}/{n} ({100*n_g/n:.1f}%) -- ICP improved "
+              f"{100*n_imp/n_g:.1f}% / unchanged {100*n_unc/n_g:.1f}% / "
+              f"worsened {100*n_wor/n_g:.1f}%")
+
+    if args.rows_csv:
+        Path(args.rows_csv).parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = list(rows[0].keys())
+        with open(args.rows_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"CSV par-paire (Phase 9A) sauvegardé : {args.rows_csv}")
 
     if args.summary_json:
         Path(args.summary_json).parent.mkdir(parents=True, exist_ok=True)

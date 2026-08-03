@@ -4201,3 +4201,36 @@ propre et confirmé (pas juste un chiffre pipeline ambigu comme le run
 "normales fusionnées") : la piste normales fonctionne, mais seulement
 avec un chemin d'information isolé -- leçon transférable pour toute
 feature auxiliaire future dans ce genre d'architecture à fusion partagée.
+
+## Phase 9 — Goulot du succès strict (Pose@30 → Pose@15/succès strict)
+
+Cadrage (2026-08-03) : la Phase 8 a quasiment refermé l'écart GT→CNN sur
+`Pose@30` (38.7% thresh0.3 vs 37.6% GT hand-crafted), mais le succès
+strict reste plat (~24%) qu'on ajoute ou non le profil/les normales.
+L'écart d'éligibilité (~60% CNN vs 99.1% GT) est un sujet SÉPARÉ, déjà
+instruit et refermé le 2026-07-22 (qualité intrinsèque de la segmentation
+CNN, pas du pipeline de matching) -- volontairement laissé hors scope ici.
+
+**Question 9A :** les échecs stricts (`Pose@30` ✓ mais succès strict ✗)
+viennent-ils d'une sortie d'étage 1 déjà trop imprécise, ou d'un ICP qui
+n'améliore pas assez une entrée pourtant correcte ?
+
+**Implémenté (`scripts/phase8_pipeline_learned_check.py`)** : `_handle_pair`
+construit désormais une ligne par paire ayant atteint l'étage 2 (au lieu
+d'un résumé agrégé seul) -- `group` (A = Pose@30 final + succès strict,
+B = Pose@30 final sans succès strict, C = Pose@30 final raté),
+`rot_err`/`trans_err` avant ET après ICP, `delta_rot_icp`/`delta_trans_icp`,
+`icp_status` (improved/unchanged/worsened, seuil 1° sur `delta_rot_icp`),
+`mirror_prob`, `n_corr`, `icp_energy_final`/`overlap_frac_final`/
+`normal_consistency_final` (nouvelle fonction `_icp_residual_stats`,
+dupliquée depuis la logique de `trimmed_icp_normals` -- par précaution,
+pour ne pas toucher une fonction déjà validée sur des milliers de paires).
+Nouvel argument `--rows_csv` pour dumper la table brute (agrégation
+médiane/p25/p75 par groupe à faire en aval, pas côté serveur). Un résumé
+par groupe (répartition + `icp_status`) est aussi affiché en console.
+
+Pas encore lancé sur le serveur -- prochaine action : lancer avec
+`--strategy thresh03 --rows_csv ...` sur le checkpoint `best.ckpt` du run
+"tête miroir dédiée" (résultat retenu ci-dessus, chemin exact à retrouver
+sur le serveur -- pas noté dans ce plan), puis agréger le CSV par groupe
+A/B/C.
