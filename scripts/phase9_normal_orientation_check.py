@@ -65,10 +65,16 @@ def canonical_pca_frame_oriented(pts, point_normals):
     que `pts`) plutôt que par le signe arbitraire renvoyé par `eigh()`.
     Une fois `n` fixé physiquement, `v` (pas `n`) est retourné au besoin
     pour restaurer `det([u,v,n])=+1` -- contrairement à
-    `canonical_pca_frame`, qui ajuste `n` (ici `n` n'est plus libre)."""
+    `canonical_pca_frame`, qui ajuste `n` (ici `n` n'est plus libre).
+
+    Convention de signe déterminée EMPIRIQUEMENT (2026-08-03) : `n` opposé
+    à la moyenne des normales mesh (pas aligné) -- le premier essai
+    (`n` aligné) donnait mirror=True 98.3% du temps (quasi-déterministe,
+    juste la mauvaise convention), confirmant le mécanisme mais avec le
+    signe inversé. Avec `n` opposé, prévalence attendue ~1-2%."""
     centroid, u, v, n, planarity = compute_pca_frame(pts)
     mean_normal = point_normals.mean(axis=0)
-    if np.dot(n, mean_normal) < 0:
+    if np.dot(n, mean_normal) > 0:
         n = -n
     if np.linalg.det(np.stack([u, v, n], axis=1)) < 0:
         v = -v
