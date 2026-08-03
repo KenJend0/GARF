@@ -4522,10 +4522,45 @@ n'ont aucune prise (ils agissent après la rasterisation, pas avant).
 conventions de comptage EXACTES que `phase8_pipeline_learned_check.py`
 (dénominateur = `n_seen_2frag`, incrémenté avant tout filtre), décompose
 explicitement : masque trop pauvre (< 50 pts, avant zoom) / zoom
-impossible / étage 1 non tenté / `no_correspondence` / éligible. Pas
-encore lancé -- prochaine action :
+impossible / étage 1 non tenté / `no_correspondence` / éligible.
+
+**Résultat (2026-08-03, N=1487) : confirme directement l'hypothèse.**
 ```
-CUDA_VISIBLE_DEVICES=1 python scripts/phase9_eligibility_funnel_check.py \
+Masque CNN trop pauvre (< 50 pts, AVANT tout zoom) : 498 (33.5%)
+Zoom impossible (mesh)                             :   0 (0.0%)
+Étage 1 non tenté (< 3 points après zoom, rare)     :   0 (0.0%)
+Étage 1 tenté, no_correspondence                    : 102 (6.9%)
+Éligible (pose_computed)                            : 887 (59.7%)
+```
+Le masque trop pauvre est de LOIN le premier contributeur à
+l'inéligibilité (33.5%, ~5x plus que `no_correspondence`) -- reconfirme,
+avec un chiffre précis cette fois, ce qui avait déjà été tranché pour le
+hand-crafted en juillet (qualité intrinsèque de la segmentation CNN, pas
+le pipeline de matching) ; Step 16 (tentative d'amélioration de la
+segmentation) déjà marqué résultat net-négatif.
+
+**Objection de l'utilisateur, légitime : le zoom n'a-t-il pas justement
+été conçu pour ce problème ?** Le seuil `ABS_MIN_POINTS=50` s'applique
+dans le code sur le masque CNN BRUT, AVANT le zoom -- donc le zoom n'est
+JAMAIS tenté sur ces 498 paires. Un audit antérieur (`phase5a_skip_audit.py`)
+avait trouvé "too_few_points (50 pts) : 0% auraient réussi -> seuil
+JUSTIFIÉ", MAIS cet audit précède l'introduction du zoom -- il testait
+"forcer la paire brute à passer", pas "forcer la paire jusqu'au zoom".
+Question distincte, jamais testée dans la configuration actuelle.
+
+**Implémenté : `scripts/phase9_lowdensity_zoom_check.py`** -- pour les
+paires dont le masque brut a entre `--min_points_floor` (défaut 5, même
+convention que `phase5a_skip_audit.py`) et 50 points, tente quand même
+`dominant_cluster_mask` + `zoom_resample_with_normals` + étage 1 +
+correspondances (mêmes réglages par défaut que le pipeline principal).
+Mesure l'éligibilité récupérée ET le taux de Pose@30 réel parmi les
+récupérées (même exigence que pour cascade/`contact_eps` : une
+correspondance numérique n'est utile que si la pose est plausible),
+ventilé par tranche de densité brute (5-20/20-35/35-49) pour voir s'il
+existe un seuil plus bas mais encore raisonnable. Pas encore lancé --
+prochaine action :
+```
+CUDA_VISIBLE_DEVICES=1 python scripts/phase9_lowdensity_zoom_check.py \
     --regressor_ckpt output/phase8_depthmap_regressor_thresh03_mirrorhead/best.ckpt \
     --ckpt output/cnn_step15_final_model/last.ckpt \
     --data_root ... --experiment cnn_step15_final_model \
