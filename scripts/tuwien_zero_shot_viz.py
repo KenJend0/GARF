@@ -101,7 +101,19 @@ def infer_adjacency(global_pts_list, eps=CONTACT_EPS, min_pts=MIN_CONTACT_PTS):
 def run_cnn_zero_shot(model, frag_pts_local, frag_nrm_local, device):
     """`frag_pts_local`/`frag_nrm_local` : liste de (n_points, 3) déjà
     recentrés + normalisés PAR FRAGMENT (repère local CNN). Retourne une
-    liste de (n_points,) probabilités fracture, même ordre que l'entrée."""
+    liste de (n_points,) probabilités fracture, même ordre que l'entrée.
+
+    IMPORTANT : `extract_normal_list()` (projection_mapping_utils.py)
+    suppose TOUJOURS `N_total = max_parts * num_pts` (contrairement à
+    `extract_fragment_list()`, qui gère aussi le cas variable via les
+    offsets de `points_per_part`) -- convention Breaking Bad "uniform" :
+    CHAQUE slot, valide ou de padding, réserve le même budget `num_pts`.
+    Il faut donc padder `pointclouds`/`pointclouds_normals` jusqu'à
+    `MAX_PARTS * n_points`, pas juste `K * n_points` -- sinon
+    `extract_normal_list` recalcule un mauvais `num_pts` (= N_total //
+    max_parts) et désaligne silencieusement les normales par rapport aux
+    points (bug trouvé le 2026-08-03 : `RuntimeError` taille 5000 vs 1500
+    dans `HybridGeometryFeatures.forward_fragment_list`)."""
     K = len(frag_pts_local)
     n_points = frag_pts_local[0].shape[0]
     assert all(p.shape[0] == n_points for p in frag_pts_local), (
@@ -109,11 +121,16 @@ def run_cnn_zero_shot(model, frag_pts_local, frag_nrm_local, device):
         "(padding géré via points_per_part, pas via des tailles variables)"
     )
 
-    pointclouds = np.concatenate(frag_pts_local, axis=0)[None]           # (1, K*n, 3)
-    pointclouds_normals = np.concatenate(frag_nrm_local, axis=0)[None]   # (1, K*n, 3)
+    pad_pts = np.zeros((MAX_PARTS - K, n_points, 3), dtype=np.float32)
+    pointclouds = np.concatenate(
+        [np.stack(frag_pts_local, axis=0), pad_pts], axis=0
+    ).reshape(1, MAX_PARTS * n_points, 3)
+    pointclouds_normals = np.concatenate(
+        [np.stack(frag_nrm_local, axis=0), pad_pts], axis=0
+    ).reshape(1, MAX_PARTS * n_points, 3)
     points_per_part = np.zeros((1, MAX_PARTS), dtype=np.int64)
     points_per_part[0, :K] = n_points
-    fracture_surface_gt = np.zeros((1, K * n_points), dtype=np.int64)   # dummy, jamais utilisé
+    fracture_surface_gt = np.zeros((1, MAX_PARTS * n_points), dtype=np.int64)   # dummy, jamais utilisé
 
     batch = {
         "pointclouds": torch.from_numpy(pointclouds).float().to(device),
