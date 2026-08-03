@@ -4345,9 +4345,34 @@ massivement faux même à miroir correct).
 (exactement le jeu utilisé par le pipeline réel), avec l'exactitude
 (comparaison à `mirror_gt` oracle, via `R_ij_gt`/`t_ij_gt`, jamais utilisée
 pour la prédiction elle-même) au lieu de la seule prévalence -- comparable
-directement aux 86.4% du `mirror_head` appris. Pas encore lancé --
-prochaine action :
+directement aux 86.4% du `mirror_head` appris.
+
+**Résultat (2026-08-03, N=994) : exactitude 86.2% (857/994), quasi égale
+aux 86.4% du `mirror_head` appris -- pas de gain.** Plus révélateur :
+**la prévalence VRAIE (`mirror_gt` oracle) tombe à 49.5%** (contre 98.2%
+sur GT propre) -- ce n'est pas seulement l'estimateur géométrique qui se
+dégrade, c'est le label oracle LUI-MÊME qui redevient quasi aléatoire une
+fois le repère PCA calculé sur les points CNN+zoom (bruités) au lieu des
+points GT propres. Le fait physique (normales opposées entre faces qui se
+touchent) reste vrai, mais le repère PCA sur un nuage plus large/moins
+propre ne le capte plus assez fidèlement.
+
+**v2 (2026-08-03, idée de l'utilisateur) : orienter par le centroïde du
+fragment ENTIER plutôt que par la moyenne des normales.** Justification :
+une moyenne de POSITIONS (centre de la zone de fracture vs centre de tout
+le fragment, ce dernier indépendant du masque CNN) encaisse mieux quelques
+points aberrants qu'une moyenne de DIRECTIONS (chaque faux positif peut
+avoir une normale qui pointe n'importe où). Implémenté dans les deux
+scripts (`canonical_pca_frame_oriented_by_centroid` /
+`geometric_mirror_prediction_by_centroid`) -- calcule et compare v1
+(normales) et v2 (centroïde) côte à côte, sur GT ET thresh0.3. Pas encore
+lancé -- prochaine action (mêmes commandes que ci-dessus, scripts mis à
+jour) :
 ```
+CUDA_VISIBLE_DEVICES=1 python scripts/phase9_normal_orientation_check.py \
+    --data_root ... --experiment cnn_step15_final_model \
+    --categories everyday --split val --max_batches 3000
+
 CUDA_VISIBLE_DEVICES=1 python scripts/phase9_normal_orientation_check_thresh03.py \
     --ckpt output/cnn_step15_final_model/last.ckpt \
     --data_root ... --experiment cnn_step15_final_model \

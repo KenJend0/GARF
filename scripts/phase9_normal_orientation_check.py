@@ -81,6 +81,31 @@ def canonical_pca_frame_oriented(pts, point_normals):
     return centroid, u, v, n, planarity
 
 
+def canonical_pca_frame_oriented_by_centroid(pts, full_fragment_centroid):
+    """Variante (2026-08-03, suite à la dégradation observée en thresh0.3
+    de `canonical_pca_frame_oriented` -- prévalence oracle elle-même tombée
+    à ~49.5%, cf. `phase9_normal_orientation_check_thresh03.py`) : au lieu
+    de moyenner les normales (individuelles, bruitées par les faux
+    positifs du masque CNN), oriente `n` en le comparant au vecteur
+    "centre du fragment ENTIER -> centre de la zone de fracture"
+    (`pts.mean(axis=0) - full_fragment_centroid`) -- astuce classique
+    d'orientation de normale de surface par le centre de masse de l'objet.
+    Ne dépend PAS des normales par point (donc pas de `point_normals` en
+    argument) -- seulement des POSITIONS, une moyenne de positions étant
+    beaucoup plus robuste à quelques points aberrants qu'une moyenne de
+    directions (chaque faux positif peut avoir une normale qui pointe
+    n'importe où, mais ne décale que peu le centroïde). `full_fragment_centroid`
+    : centre de TOUT le nuage de points du fragment (pas juste la fracture)
+    -- indépendant du masque CNN, donc fiable à 100%."""
+    centroid, u, v, n, planarity = compute_pca_frame(pts)
+    outward_dir = centroid - full_fragment_centroid
+    if np.dot(n, outward_dir) < 0:
+        n = -n
+    if np.linalg.det(np.stack([u, v, n], axis=1)) < 0:
+        v = -v
+    return centroid, u, v, n, planarity
+
+
 def _pixel_params(frac, c, u, v, n, pixel_size):
     """Réutilise `rasterize()` telle quelle juste pour en extraire
     `u_min`/`v_min` (mêmes conventions que `build_frame_and_rasterize`),
@@ -120,7 +145,7 @@ def main():
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0,
                          collate_fn=datamodule.dataset_cls.collate_fn)
 
-    n_seen, n_old_mirror, n_new_mirror, n_both, n_neither = 0, 0, 0, 0, 0
+    n_seen, n_old_mirror, n_new_mirror, n_centroid_mirror = 0, 0, 0, 0
     t0 = time.time()
 
     for idx, batch in enumerate(loader):
@@ -194,21 +219,34 @@ def main():
             pixel_size_new, RESOLUTION, R_ij_gt, t_ij_gt,
         )
 
+        # -- APRÈS (v2) : réorienté par le centroïde du fragment entier ---
+        full_centroid_i = raw_i.mean(axis=0)
+        full_centroid_j = raw_j.mean(axis=0)
+        c_i3, u_i3, v_i3, n_i3, _ = canonical_pca_frame_oriented_by_centroid(frac_i, full_centroid_i)
+        c_j3, u_j3, v_j3, n_j3, _ = canonical_pca_frame_oriented_by_centroid(frac_j, full_centroid_j)
+        pixel_size_c = _pixel_size_for(frac_i, frac_j, c_i3, u_i3, v_i3, c_j3, u_j3, v_j3)
+        u_min_i3, v_min_i3 = _pixel_params(frac_i, c_i3, u_i3, v_i3, n_i3, pixel_size_c)
+        u_min_j3, v_min_j3 = _pixel_params(frac_j, c_j3, u_j3, v_j3, n_j3, pixel_size_c)
+        _, _, mirror_centroid, _ = fit_theta_shift_mirror_from_gt(
+            frac_i, c_i3, u_i3, v_i3, u_min_i3, v_min_i3,
+            c_j3, u_j3, v_j3, u_min_j3, v_min_j3,
+            pixel_size_c, RESOLUTION, R_ij_gt, t_ij_gt,
+        )
+
         n_old_mirror += int(mirror_old)
         n_new_mirror += int(mirror_new)
-        n_both += int(mirror_old and mirror_new)
-        n_neither += int(not mirror_old and not mirror_new)
+        n_centroid_mirror += int(mirror_centroid)
 
     print(f"\nFini : {n_seen} paires 2-fragments GT en {time.time()-t0:.0f}s\n")
     if n_seen == 0:
         print("Aucune paire exploitable.")
         return
-    print(f"Prévalence mirror=True AVANT (repère non orienté)  : "
+    print(f"Prévalence mirror=True AVANT (repère non orienté)          : "
           f"{100*n_old_mirror/n_seen:.1f}% ({n_old_mirror}/{n_seen})")
-    print(f"Prévalence mirror=True APRÈS (repère orienté normales) : "
+    print(f"Prévalence mirror=True APRÈS (orienté normales, v1)        : "
           f"{100*n_new_mirror/n_seen:.1f}% ({n_new_mirror}/{n_seen})")
-    print(f"  (accord des deux méthodes : {n_both} both-True, {n_neither} both-False, "
-          f"{n_seen - n_both - n_neither} discordantes)")
+    print(f"Prévalence mirror=True APRÈS (orienté centroïde fragment, v2) : "
+          f"{100*n_centroid_mirror/n_seen:.1f}% ({n_centroid_mirror}/{n_seen})")
 
 
 if __name__ == "__main__":

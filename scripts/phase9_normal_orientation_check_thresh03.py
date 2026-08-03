@@ -29,6 +29,15 @@ la prédiction elle-même) -- comparable directement aux 86.4% de précision
 miroir du `mirror_head` appris (`phase8_eligibility_diagnostic.py`,
 2026-07-31).
 
+Mise à jour 2026-08-03 (résultat v1 : 86.2%, quasi égal au modèle appris,
+donc rien gagné) : compare aussi une v2, `geometric_mirror_prediction_by_centroid`,
+qui n'utilise PAS les normales par point (bruitées par les faux positifs
+du masque CNN) mais seulement le vecteur "centre du fragment ENTIER ->
+centre de la zone de fracture" -- une moyenne de POSITIONS, plus robuste
+au bruit qu'une moyenne de DIRECTIONS (idée de l'utilisateur). Le centre
+du fragment entier ne dépend PAS du masque CNN (calculé sur tous les
+points du fragment).
+
 Usage (sur le serveur) :
     CUDA_VISIBLE_DEVICES=1 python scripts/phase9_normal_orientation_check_thresh03.py \\
         --ckpt output/cnn_step15_final_model/last.ckpt \\
@@ -62,9 +71,27 @@ def geometric_mirror_prediction(frame, nrm_i, nrm_j):
     """Même règle que `run_learned_stage1(..., mirror_mode="geometric")`
     (`phase8_pipeline_learned_check.py`) -- dupliquée ici pour ne pas faire
     dépendre ce script de diagnostic du modèle appris (pas de checkpoint
-    régresseur nécessaire, juste la géométrie)."""
+    régresseur nécessaire, juste la géométrie). v1 : orientation par la
+    moyenne des normales mesh de la zone de fracture (bruitée sous
+    thresh0.3, cf. docstring module)."""
     sign_i = 1.0 if np.dot(frame["n_i"], nrm_i.mean(axis=0)) > 0 else -1.0
     sign_j = 1.0 if np.dot(frame["n_j"], nrm_j.mean(axis=0)) > 0 else -1.0
+    return bool(sign_i == sign_j)
+
+
+def geometric_mirror_prediction_by_centroid(frame, frac_i, frac_j, full_centroid_i, full_centroid_j):
+    """v2 (2026-08-03) : au lieu de moyenner des normales individuelles
+    (bruitées par les faux positifs du masque CNN), oriente `n_i`/`n_j` en
+    comparant le centre de la zone de fracture (`frac_i.mean(axis=0)`,
+    déjà = `frame["c_i"]`) au centre du fragment ENTIER
+    (`full_centroid_i`, indépendant du masque CNN -- calculé sur TOUS les
+    points du fragment, pas seulement ceux retenus par le seuillage).
+    Une moyenne de POSITIONS encaisse mieux quelques points aberrants
+    qu'une moyenne de DIRECTIONS (v1)."""
+    outward_i = frame["c_i"] - full_centroid_i
+    outward_j = frame["c_j"] - full_centroid_j
+    sign_i = 1.0 if np.dot(frame["n_i"], outward_i) > 0 else -1.0
+    sign_j = 1.0 if np.dot(frame["n_j"], outward_j) > 0 else -1.0
     return bool(sign_i == sign_j)
 
 
@@ -119,7 +146,7 @@ def main():
     cnn_model.eval()
     cnn_model.to(device)
 
-    n_seen, n_correct, n_geom_true, n_gt_true, n_zoom_failed = 0, 0, 0, 0, 0
+    n_seen, n_correct, n_correct_centroid, n_geom_true, n_gt_true, n_zoom_failed = 0, 0, 0, 0, 0, 0
     t0 = time.time()
 
     with torch.no_grad():
@@ -216,8 +243,13 @@ def main():
             # -- même repère que le pipeline réel (arbitraire, PAS orienté) --
             _, _, _, _, frame = build_frame_and_rasterize(frac_i_zoom, frac_j_zoom)
 
-            # -- prédiction géométrique, SANS R_ij_gt (comme à l'inférence) --
+            # -- prédiction géométrique v1, SANS R_ij_gt (comme à l'inférence) --
             mirror_pred = geometric_mirror_prediction(frame, nrm_i_zoom, nrm_j_zoom)
+
+            # -- prédiction géométrique v2 (centroïde du fragment ENTIER,
+            #    indépendant du masque CNN -- raw0/raw1 = nuage complet) ---
+            mirror_pred_centroid = geometric_mirror_prediction_by_centroid(
+                frame, frac_i_zoom, frac_j_zoom, raw0.mean(axis=0), raw1.mean(axis=0))
 
             # -- vrai label, AVEC R_ij_gt (oracle, validation seulement) -----
             _, _, mirror_gt, _ = fit_theta_shift_mirror_from_gt(
@@ -230,6 +262,7 @@ def main():
 
             n_seen += 1
             n_correct += int(mirror_pred == mirror_gt)
+            n_correct_centroid += int(mirror_pred_centroid == mirror_gt)
             n_geom_true += int(mirror_pred)
             n_gt_true += int(mirror_gt)
 
@@ -239,9 +272,11 @@ def main():
     if n_seen == 0:
         print("Aucune paire exploitable.")
         return
-    print(f"Exactitude de la règle géométrique (vs mirror_gt oracle) : "
+    print(f"Exactitude règle géométrique v1 (moyenne normales)     (vs mirror_gt oracle) : "
           f"{100*n_correct/n_seen:.1f}% ({n_correct}/{n_seen})")
-    print(f"  Prévalence prédite  (mirror=True) : {100*n_geom_true/n_seen:.1f}%")
+    print(f"Exactitude règle géométrique v2 (centroïde fragment)   (vs mirror_gt oracle) : "
+          f"{100*n_correct_centroid/n_seen:.1f}% ({n_correct_centroid}/{n_seen})")
+    print(f"  Prévalence prédite v1 (mirror=True) : {100*n_geom_true/n_seen:.1f}%")
     print(f"  Prévalence vraie    (mirror_gt=True) : {100*n_gt_true/n_seen:.1f}%")
     print(f"\n(Référence GT propre, phase9_normal_orientation_check.py : prévalence ~98.2%)")
     print(f"(Référence mirror_head appris, phase8_eligibility_diagnostic.py : précision 86.4%)")
