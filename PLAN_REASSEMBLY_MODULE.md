@@ -4791,3 +4791,25 @@ CUDA_VISIBLE_DEVICES=1 python scripts/phase8_pipeline_learned_check.py --strateg
 ```
 À comparer à la référence `top2_icp` : éligibilité 79.3%, Pose@30 global
 40.5%, succès strict 21.2% (N=3803).
+
+**Résultat (2026-08-03, N=3803) : SUCCÈS NET, plus large que prévu.**
+```
+                    top2_icp        topM_icp        Δ
+Éligibilité          79.3%           84.6%        +5.3 pts
+Pose@30 global       40.5% (1542)    46.8% (1778)  +6.3 pts (+236 paires)
+Succès strict global 21.2% (808)    27.6% (1048)   +6.4 pts (+240 paires)
+Groupe A/B/C      26.8/24.3/48.9%  32.6/22.7/44.7%
+```
+**Contrairement à l'attendu (cibler surtout le groupe B), le gain ne
+vient pas principalement de "B devient A"** -- le groupe B reste quasi
+stable en absolu (734→730), alors que le groupe A bondit (+240 paires).
+Le mécanisme récupère une partie du groupe C directement (1473→1438,
+-35) ET une bonne fraction des ~170 paires nouvellement éligibles
+(l'éligibilité progresse aussi, +5.3 pts) atterrit directement en succès
+strict. Les offsets d'angle sont visiblement plus puissants que prévu --
+pas seulement un raffinement fin pour les cas déjà proches, mais aussi un
+véritable filet de récupération sur des cas plus larges. Coût temporel :
+1912s (contre 1464s pour `top2_icp`, +31% -- pas linéaire malgré 5x plus
+de candidats). **`stage1_mode=topM_icp` devient le réglage de référence.**
+Nouvelle barre : éligibilité 84.6%, Pose@30 global 46.8%, succès strict
+27.6%.
