@@ -84,13 +84,35 @@ def load_regressor(ckpt_path, device):
 
 
 @torch.no_grad()
-def run_learned_stage1(model, frac_i, frac_j, nrm_i, nrm_j, R_ij_gt, t_ij_gt, device):
+def run_learned_stage1(model, frac_i, frac_j, nrm_i, nrm_j, R_ij_gt, t_ij_gt, device,
+                        mirror_mode="learned"):
     """Étage 1 appris -- retourne un dict analogue à `run_cascade()`
     (`phase5a_zoom_resample_check.py`), même clés (`reached_stage`,
     `R_est`/`t_est`, `pose_30`/`pose_15`, `rot_err`/`trans_err`).
     `nrm_i`/`nrm_j` : normales PAR POINT, même ordre/longueur que
     `frac_i`/`frac_j` (points de zoom inclus) -- pour les canaux de
-    normale du modèle (2026-07-31, "features 3D")."""
+    normale du modèle (2026-07-31, "features 3D").
+
+    `mirror_mode` (2026-08-03, Phase 9, piste géométrique) :
+    - "learned" (défaut) : décision miroir du `mirror_head` appris
+      (`pred["mirror_prob"] > 0.5`), comportement Phase 8 inchangé.
+    - "geometric" : décision miroir déterministe, SANS le `mirror_head` --
+      `n_i`/`n_j` (repère PCA DÉJÀ utilisé pour la rasterisation, signe
+      arbitraire) sont comparés à la moyenne des normales mesh du fragment
+      (`nrm_i`/`nrm_j`, physiquement fiables -- même hypothèse que
+      `normal_dot_thresh` dans `trimmed_icp_normals`). Le régresseur
+      calcule quand même les deux hypothèses (`pred["normal"]`/
+      `pred["mirror"]`, theta/shift) -- seule la SÉLECTION change, pas le
+      forward. Validé sur GT (`phase9_normal_orientation_check.py`,
+      2026-08-03) : une fois `n_i`/`n_j` orientés vers l'extérieur du
+      fragment (signe cohérent avec les normales mesh), le miroir est
+      nécessaire ~98% du temps -- car deux faces de fracture en contact
+      ont des normales sortantes opposées, et regarder un même plan depuis
+      deux côtés opposés produit une image en miroir (fait de projection
+      2D, pas un artefact). Donc : miroir nécessaire ssi `n_i`/`n_j`
+      partagent le MÊME signe relatif à leurs normales mesh respectives
+      (tous les deux déjà orientés dehors, ou tous les deux déjà orientés
+      dedans dans le repère existant) -- `sign_i == sign_j`."""
     n_i, n_j = len(frac_i), len(frac_j)
     result = {"reached_stage": "unusable_too_few", "n_frac_pts_min": min(n_i, n_j),
               "pose_30": False, "pose_15": False, "rot_err": None, "trans_err": None,
@@ -124,12 +146,24 @@ def run_learned_stage1(model, frac_i, frac_j, nrm_i, nrm_j, R_ij_gt, t_ij_gt, de
 
     pred = model(t_dmap_i, t_valid_i, t_dmap_j, t_valid_j, t_nmap_i, t_nmap_j,
                  t_profile_normal, t_profile_mirror)
-    theta_t, sy_t, sx_t, mirror_t = DepthmapPoseRegressor.decode(pred)
-    theta = float(theta_t.item())
-    shift = (float(sy_t.item()), float(sx_t.item()))
-    mirror = bool(mirror_t.item())
     mirror_prob = float(pred["mirror_prob"].item())
     result["mirror_prob"] = mirror_prob
+
+    if mirror_mode == "geometric":
+        sign_i = 1.0 if np.dot(frame["n_i"], nrm_i.mean(axis=0)) > 0 else -1.0
+        sign_j = 1.0 if np.dot(frame["n_j"], nrm_j.mean(axis=0)) > 0 else -1.0
+        mirror = bool(sign_i == sign_j)
+        mirror_t = torch.tensor([mirror], device=device)
+        chosen = {k: torch.where(mirror_t, pred["mirror"][k], pred["normal"][k])
+                  for k in ("sin", "cos", "shift_y", "shift_x")}
+        theta_t = torch.rad2deg(torch.atan2(chosen["sin"], chosen["cos"])) % 360.0
+        theta = float(theta_t.item())
+        shift = (float(chosen["shift_y"].item()), float(chosen["shift_x"].item()))
+    else:
+        theta_t, sy_t, sx_t, mirror_t = DepthmapPoseRegressor.decode(pred)
+        theta = float(theta_t.item())
+        shift = (float(sy_t.item()), float(sx_t.item()))
+        mirror = bool(mirror_t.item())
 
     v_j_use = -frame["v_j"] if mirror else frame["v_j"]
     pts_i3, pts_j3 = build_correspondences_nn(
@@ -199,6 +233,10 @@ def main():
     parser.add_argument("--success_trans_thresh", type=float, default=0.02)
     parser.add_argument("--max_batches", type=int, default=0, help="0 = tout le split")
     parser.add_argument("--summary_json", default="")
+    parser.add_argument("--mirror_mode", default="learned", choices=["learned", "geometric"],
+                         help="Phase 9 : 'geometric' remplace le mirror_head appris par une "
+                              "décision déterministe (n orienté via les normales mesh, cf. "
+                              "phase9_normal_orientation_check.py).")
     parser.add_argument("--rows_csv", default="",
                          help="Phase 9A : dump par-paire (groupe A/B/C, erreurs "
                               "avant/après ICP, mirror_prob, n_corr, overlap_frac, "
@@ -222,7 +260,7 @@ def main():
                       nrm_i_zoom, nrm_j_zoom, R_ij_gt, t_ij_gt, n_min_base):
         nonlocal n_stage1_failed
         stage1_res = run_learned_stage1(regressor, frac_i_zoom, frac_j_zoom, nrm_i_zoom, nrm_j_zoom,
-                                         R_ij_gt, t_ij_gt, device)
+                                         R_ij_gt, t_ij_gt, device, mirror_mode=args.mirror_mode)
         if stage1_res["reached_stage"] != "pose_computed":
             n_stage1_failed += 1
             return
