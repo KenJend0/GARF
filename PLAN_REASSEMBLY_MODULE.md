@@ -4557,12 +4557,63 @@ Mesure l'éligibilité récupérée ET le taux de Pose@30 réel parmi les
 récupérées (même exigence que pour cascade/`contact_eps` : une
 correspondance numérique n'est utile que si la pose est plausible),
 ventilé par tranche de densité brute (5-20/20-35/35-49) pour voir s'il
-existe un seuil plus bas mais encore raisonnable. Pas encore lancé --
-prochaine action :
+existe un seuil plus bas mais encore raisonnable.
+
+**Résultat (2026-08-03, N=469 paires ciblées, masque brut 5-49 pts,
+26 sous le plancher jamais tentées) : SUCCÈS NET, à l'opposé de
+cascade/`contact_eps`.**
 ```
-CUDA_VISIBLE_DEVICES=1 python scripts/phase9_lowdensity_zoom_check.py \
+Zoom impossible / étage 1 non tenté : 0/469   (0.0%)
+no_correspondence après zoom        : 158/469 (33.7%)
+Éligible (pose_computed) après zoom : 311/469 (66.3%)
+  dont Pose@30 correct              : 41/311  (13.2%)
+Global (Pose@30 réel / ciblées)     : 41/469  (8.7%)
+
+Ventilation par tranche :
+  5-20  (n=103) : éligible 50.5% | Pose@30 (parmi ciblées)  8.7%
+  20-35 (n=177) : éligible 66.7% | Pose@30 (parmi ciblées)  9.6%
+  35-49 (n=189) : éligible 74.6% | Pose@30 (parmi ciblées)  7.9%
+```
+**Contrairement à cascade/`contact_eps` (0% de vrais succès), ici on
+récupère de la vraie justesse** -- 8.7% de Pose@30 RÉEL sur une
+population que le pipeline actuel jette entièrement (0% de contribution).
+Le taux de succès réel reste quasi CONSTANT sur toute la plage 5-49
+(7.9-9.6%) -- pas de seuil naturel où ça s'effondre, pas de sous-tranche
+à traiter différemment.
+
+**Met à jour (ne contredit pas un bug, contredit un test différent) la
+conclusion de l'audit antérieur `phase5a_skip_audit.py`** ("too_few_points
+(50 pts) : 0% auraient réussi -> seuil JUSTIFIÉ") -- cet audit précédait
+le zoom et testait "passer la paire brute sans densifier", pas "passer la
+paire jusqu'au zoom". Les deux résultats sont corrects, sur deux
+questions différentes ; celui-ci est la version à jour pour le pipeline
+actuel.
+
+**Impact estimé sur cet échantillon (N=1487, même population que le
+funnel exact ci-dessus)** : éligibilité 887/1487 (59.7%) ->
+(887+311)/1487 ≈ **80.6%**, plus 41 nouveaux succès Pose@30 réels
+gagnés sur une population auparavant à 0% de contribution.
+
+**Décision : `ABS_MIN_POINTS` abaissé de 50 à 5 dans
+`scripts/phase8_pipeline_learned_check.py`** (plancher numérique pur,
+même convention que `phase5a_skip_audit.py` -- pas de retraining
+nécessaire, le checkpoint existant a déjà été testé tel quel sur cette
+population out-of-distribution et généralise correctement). Prochaine
+action : relancer l'éval complète (thresh0.3, pleine échelle) pour
+confirmer le gain projeté :
+```
+CUDA_VISIBLE_DEVICES=1 python scripts/phase8_pipeline_learned_check.py --strategy thresh03 \
     --regressor_ckpt output/phase8_depthmap_regressor_thresh03_mirrorhead/best.ckpt \
     --ckpt output/cnn_step15_final_model/last.ckpt \
     --data_root ... --experiment cnn_step15_final_model \
-    --categories everyday --split val --max_batches 3000
+    --categories everyday --split val \
+    --mirror_mode geometric_centroid \
+    --rows_csv /tmp/student7/phase9a_rows_thresh03_lowmin.csv \
+    --summary_json /tmp/student7/phase9a_summary_lowmin.json
 ```
+À comparer à la référence `ABS_MIN_POINTS=50` : éligibilité 50.6%, Pose@30
+29.7%, strict 17.6% (N=3803). **Piste future si on veut pousser plus loin**
+(pas urgente, le gain existe déjà sans) : abaisser aussi `ABS_MIN_POINTS`
+dans `phase8_build_regressor_dataset.py` et réentraîner, pour que le
+modèle voie cette population sparse à l'entraînement, pas seulement à
+l'inférence.

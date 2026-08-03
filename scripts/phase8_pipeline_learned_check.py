@@ -71,7 +71,18 @@ from scripts.phase8_depthmap_regressor_dataset import canonical_pca_frame
 from scripts.phase8_build_regressor_dataset import build_frame_and_rasterize, RESOLUTION
 from assembly.models.depthmap_pose_regressor import DepthmapPoseRegressor
 
-ABS_MIN_POINTS = 50
+ABS_MIN_POINTS = 5
+# Phase 9 (2026-08-03) : abaissé de 50 à 5 (plancher numérique pur, même
+# convention que `phase5a_skip_audit.py`) -- validé par
+# `phase9_lowdensity_zoom_check.py` : sur les paires masque brut 5-49 pts
+# (actuellement écartées AVANT le zoom avec le seuil à 50), le zoom+étage1
+# récupère 8.7% de VRAIS succès Pose@30 (pas juste de l'éligibilité
+# creuse comme la cascade de résolution/contact_eps, chantier voisin,
+# rejeté à 0%). Le taux de succès réel reste quasi constant sur toute la
+# plage 5-49 (7.9-9.6% par tranche), pas de seuil naturel à préserver.
+# Contredit un audit antérieur (`phase5a_skip_audit.py`, "too_few_points :
+# 0% auraient réussi") -- mais cet audit précédait l'introduction du zoom,
+# il ne testait pas cette question précise.
 
 
 def load_regressor(ckpt_path, device):
