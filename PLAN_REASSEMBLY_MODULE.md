@@ -4726,3 +4726,29 @@ CUDA_VISIBLE_DEVICES=1 python scripts/phase8_pipeline_learned_check.py --strateg
 À comparer à la référence actuelle (`ABS_MIN_POINTS=5`, `mirror_mode
 geometric_centroid`) : éligibilité 77.2%, Pose@30 global 36.8%, succès
 strict 18.6% (N=3803).
+
+**Résultat (2026-08-03, N=3803) : SUCCÈS NET, gain sur toute la ligne.**
+```
+                    single/geometric_centroid   top2_icp        Δ
+Éligibilité              77.2%                    79.3%      +2.1 pts
+Pose@30 global           36.8% (1399)              40.5% (1542)  +3.7 pts (+143 paires)
+Succès strict global     18.6% (709)               21.2% (808)   +2.6 pts (+99 paires)
+Groupe A/B/C          24.1/23.5/52.4%           26.8/24.3/48.9%
+```
+Le groupe C se réduit en proportion (52.4%→48.9%), A et B progressent
+tous les deux -- cohérent avec l'hypothèse : donner le choix à l'ICP
+entre les deux hypothèses (au lieu de committer sur une seule via
+`geometric_centroid`, ~90% d'exactitude) récupère une partie des paires
+que la règle géométrique plaçait à tort en échec catastrophique.
+**`stage1_mode=top2_icp` devient le réglage de référence** -- gain
+obtenu sans réentraînement, sans changer le modèle, juste par la
+sélection en aval. Nouvelle barre : éligibilité 79.3%, Pose@30 global
+40.5%, succès strict 21.2%.
+
+**Prochaine action possible (pas encore actée)** : pousser au-delà de
+M=2 -- ajouter de petites perturbations d'angle/shift autour de chaque
+hypothèse (idée originale 9B, `θ_pred ± {5°,10°}` etc.) pour couvrir le
+cas où la bonne pose est proche de la prédiction sans être exactement
+dessus, pas seulement le choix binaire normal/mirror. À discuter avec
+l'utilisateur avant de se lancer (coût : plus d'ICP par paire, rendement
+décroissant à mesurer).
