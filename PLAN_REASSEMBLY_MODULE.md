@@ -4487,9 +4487,45 @@ Pour chaque mécanisme : combien de paires récupérées, et parmi elles,
 combien atteignent Pose@30 par rapport à la vraie pose GT (vérifier qu'on
 récupère des poses plausibles, pas juste "une pose" -- sinon on déplace
 juste le problème vers le groupe C). Sélection miroir : `geometric_centroid`
-(v2, validée ci-dessus). Pas encore lancé -- prochaine action :
+(v2, validée ci-dessus).
+
+**Résultat (2026-08-03, N=987 paires ayant déjà passé le filtre de
+densité) : les deux mécanismes ÉCHOUENT proprement.** Éligible dès la
+config par défaut : 89.3% (881/987, note : dénominateur DIFFÉRENT du
+pipeline complet, cf. ci-dessous). Sur les 106 `no_correspondence`
+restantes :
 ```
-CUDA_VISIBLE_DEVICES=1 python scripts/phase9_stage1_recovery_check.py \
+                       récupérées    dont Pose@30 correct
+Cascade résolution     52/106 (49.1%)      0/52 (0.0%)
+contact_eps généreux   55/106 (51.9%)      0/55 (0.0%)
+```
+Les deux mécanismes trouvent bien ≥3 "correspondances" au sens numérique,
+mais 0% d'entre elles sont de VRAIES correspondances (même mécanisme que
+le rejet du gaussian splat/dilatation : desserrer une tolérance récupère
+de la quantité, pas de la justesse). **Chantier cascade/contact_eps
+refermé, négatif.**
+
+**Écart inattendu à éclaircir** : 89.3% d'éligibilité ici contre ~50%
+mesuré par `phase8_pipeline_learned_check.py` sur le pipeline complet.
+Explication par recoupement (dénominateurs différents -- ce script ne
+compte que les paires ayant déjà passé le filtre `ABS_MIN_POINTS=50`,
+alors que le pipeline complet compte l'éligibilité sur TOUTES les paires
+2-fragments vues, y compris celles rejetées avant même de tenter l'étage
+1 à cause d'un masque CNN trop pauvre) : implique qu'environ 40-45% de
+TOUTES les paires sont écartées avant même d'essayer, un contributeur à
+l'inéligibilité globale bien plus gros que `no_correspondence` (10.7% des
+paires qui ont eu leur chance) -- et sur lequel cascade/`contact_eps`
+n'ont aucune prise (ils agissent après la rasterisation, pas avant).
+
+**Implémenté (vérification directe, pas déduite) :
+`scripts/phase9_eligibility_funnel_check.py`** -- réutilise les mêmes
+conventions de comptage EXACTES que `phase8_pipeline_learned_check.py`
+(dénominateur = `n_seen_2frag`, incrémenté avant tout filtre), décompose
+explicitement : masque trop pauvre (< 50 pts, avant zoom) / zoom
+impossible / étage 1 non tenté / `no_correspondence` / éligible. Pas
+encore lancé -- prochaine action :
+```
+CUDA_VISIBLE_DEVICES=1 python scripts/phase9_eligibility_funnel_check.py \
     --regressor_ckpt output/phase8_depthmap_regressor_thresh03_mirrorhead/best.ckpt \
     --ckpt output/cnn_step15_final_model/last.ckpt \
     --data_root ... --experiment cnn_step15_final_model \
