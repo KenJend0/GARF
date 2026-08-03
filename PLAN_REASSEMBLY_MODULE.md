@@ -4378,3 +4378,31 @@ CUDA_VISIBLE_DEVICES=1 python scripts/phase9_normal_orientation_check_thresh03.p
     --data_root ... --experiment cnn_step15_final_model \
     --categories everyday --split val --max_batches 3000
 ```
+
+**Résultat (2026-08-03) :** GT (N=835) -- v1 97.7%, v2 (centroïde) 96.2%,
+toutes deux quasi-déterministes comme attendu. **Thresh0.3+zoom (N=1002,
+le vrai test) -- v1 87.3%, v2 90.0% : la v2 bat v1 ET le `mirror_head`
+appris (86.4%)**, +3.6pts, un gain net (modeste mais réel) -- confirme
+l'intuition de l'utilisateur : une moyenne de POSITIONS (centre fracture
+vs centre fragment entier) encaisse mieux le bruit du masque CNN qu'une
+moyenne de DIRECTIONS (normales individuelles).
+
+**Branché dans le pipeline** : `--mirror_mode geometric_centroid`
+(`phase8_pipeline_learned_check.py`) -- même mécanisme que `geometric`
+(sélection seule, pas de changement du forward/checkpoint), utilise
+`full_centroid_i`/`full_centroid_j` (centre de TOUT le fragment, plombé
+depuis `raw_i`/`raw_j` en stratégie GT, `raw0`/`raw1` en thresh0.3 --
+indépendant du masque CNN). Pas encore évalué en bout-en-bout -- prochaine
+action :
+```
+CUDA_VISIBLE_DEVICES=1 python scripts/phase8_pipeline_learned_check.py --strategy thresh03 \
+    --regressor_ckpt output/phase8_depthmap_regressor_thresh03_mirrorhead/best.ckpt \
+    --ckpt output/cnn_step15_final_model/last.ckpt \
+    --data_root ... --experiment cnn_step15_final_model \
+    --categories everyday --split val \
+    --mirror_mode geometric_centroid \
+    --rows_csv /tmp/student7/phase9a_rows_thresh03_geocentroid.csv \
+    --summary_json /tmp/student7/phase9a_summary_geocentroid.json
+```
+À comparer aux résultats déjà obtenus : `mirror_head` (éligibilité 50.4%,
+Pose@30 30.1%, strict 18.0%) et `geometric` v1 (50.4%/30.4%/17.6%).

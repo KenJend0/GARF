@@ -85,7 +85,7 @@ def load_regressor(ckpt_path, device):
 
 @torch.no_grad()
 def run_learned_stage1(model, frac_i, frac_j, nrm_i, nrm_j, R_ij_gt, t_ij_gt, device,
-                        mirror_mode="learned"):
+                        mirror_mode="learned", full_centroid_i=None, full_centroid_j=None):
     """Étage 1 appris -- retourne un dict analogue à `run_cascade()`
     (`phase5a_zoom_resample_check.py`), même clés (`reached_stage`,
     `R_est`/`t_est`, `pose_30`/`pose_15`, `rot_err`/`trans_err`).
@@ -112,7 +112,18 @@ def run_learned_stage1(model, frac_i, frac_j, nrm_i, nrm_j, R_ij_gt, t_ij_gt, de
       2D, pas un artefact). Donc : miroir nécessaire ssi `n_i`/`n_j`
       partagent le MÊME signe relatif à leurs normales mesh respectives
       (tous les deux déjà orientés dehors, ou tous les deux déjà orientés
-      dedans dans le repère existant) -- `sign_i == sign_j`."""
+      dedans dans le repère existant) -- `sign_i == sign_j`.
+    - "geometric_centroid" (2026-08-03, v2, idée de l'utilisateur) : même
+      principe, mais `n_i`/`n_j` sont comparés au vecteur "centre du
+      fragment ENTIER (`full_centroid_i`/`full_centroid_j`, indépendant du
+      masque CNN) -> centre de la zone de fracture" plutôt qu'à la moyenne
+      des normales individuelles (bruitée par les faux positifs du masque
+      CNN -- une moyenne de POSITIONS encaisse mieux quelques points
+      aberrants qu'une moyenne de DIRECTIONS). Validé sur thresh0.3+zoom
+      (`phase9_normal_orientation_check_thresh03.py`, 2026-08-03) :
+      exactitude 90.0% vs 86.4% pour le `mirror_head` appris et 87.3% pour
+      la v1 (normales) -- meilleur des trois. Nécessite `full_centroid_i`/
+      `full_centroid_j` (obligatoires dans ce mode)."""
     n_i, n_j = len(frac_i), len(frac_j)
     result = {"reached_stage": "unusable_too_few", "n_frac_pts_min": min(n_i, n_j),
               "pose_30": False, "pose_15": False, "rot_err": None, "trans_err": None,
@@ -149,9 +160,17 @@ def run_learned_stage1(model, frac_i, frac_j, nrm_i, nrm_j, R_ij_gt, t_ij_gt, de
     mirror_prob = float(pred["mirror_prob"].item())
     result["mirror_prob"] = mirror_prob
 
-    if mirror_mode == "geometric":
-        sign_i = 1.0 if np.dot(frame["n_i"], nrm_i.mean(axis=0)) > 0 else -1.0
-        sign_j = 1.0 if np.dot(frame["n_j"], nrm_j.mean(axis=0)) > 0 else -1.0
+    if mirror_mode in ("geometric", "geometric_centroid"):
+        if mirror_mode == "geometric_centroid":
+            assert full_centroid_i is not None and full_centroid_j is not None, \
+                "full_centroid_i/full_centroid_j requis en mode geometric_centroid"
+            outward_i = frame["c_i"] - full_centroid_i
+            outward_j = frame["c_j"] - full_centroid_j
+            sign_i = 1.0 if np.dot(frame["n_i"], outward_i) > 0 else -1.0
+            sign_j = 1.0 if np.dot(frame["n_j"], outward_j) > 0 else -1.0
+        else:
+            sign_i = 1.0 if np.dot(frame["n_i"], nrm_i.mean(axis=0)) > 0 else -1.0
+            sign_j = 1.0 if np.dot(frame["n_j"], nrm_j.mean(axis=0)) > 0 else -1.0
         mirror = bool(sign_i == sign_j)
         mirror_t = torch.tensor([mirror], device=device)
         chosen = {k: torch.where(mirror_t, pred["mirror"][k], pred["normal"][k])
@@ -233,10 +252,13 @@ def main():
     parser.add_argument("--success_trans_thresh", type=float, default=0.02)
     parser.add_argument("--max_batches", type=int, default=0, help="0 = tout le split")
     parser.add_argument("--summary_json", default="")
-    parser.add_argument("--mirror_mode", default="learned", choices=["learned", "geometric"],
+    parser.add_argument("--mirror_mode", default="learned",
+                         choices=["learned", "geometric", "geometric_centroid"],
                          help="Phase 9 : 'geometric' remplace le mirror_head appris par une "
                               "décision déterministe (n orienté via les normales mesh, cf. "
-                              "phase9_normal_orientation_check.py).")
+                              "phase9_normal_orientation_check.py). 'geometric_centroid' (v2, "
+                              "plus précis sur thresh0.3 : 90.0%% vs 86.4%% appris) oriente via "
+                              "le centroïde du fragment entier au lieu des normales.")
     parser.add_argument("--rows_csv", default="",
                          help="Phase 9A : dump par-paire (groupe A/B/C, erreurs "
                               "avant/après ICP, mirror_prob, n_corr, overlap_frac, "
@@ -257,10 +279,12 @@ def main():
     t0 = time.time()
 
     def _handle_pair(obj_idx, frac_i_base, frac_j_base, frac_i_nrm, frac_j_nrm, frac_i_zoom, frac_j_zoom,
-                      nrm_i_zoom, nrm_j_zoom, R_ij_gt, t_ij_gt, n_min_base):
+                      nrm_i_zoom, nrm_j_zoom, R_ij_gt, t_ij_gt, n_min_base,
+                      full_centroid_i=None, full_centroid_j=None):
         nonlocal n_stage1_failed
         stage1_res = run_learned_stage1(regressor, frac_i_zoom, frac_j_zoom, nrm_i_zoom, nrm_j_zoom,
-                                         R_ij_gt, t_ij_gt, device, mirror_mode=args.mirror_mode)
+                                         R_ij_gt, t_ij_gt, device, mirror_mode=args.mirror_mode,
+                                         full_centroid_i=full_centroid_i, full_centroid_j=full_centroid_j)
         if stage1_res["reached_stage"] != "pose_computed":
             n_stage1_failed += 1
             return
@@ -401,7 +425,8 @@ def main():
 
             _handle_pair(idx, frac_i_base, frac_j_base, frac_i_nrm, frac_j_nrm,
                          frac_i_zoom, frac_j_zoom, nrm_i_zoom, nrm_j_zoom,
-                         R_ij_gt, t_ij_gt, n_min_base)
+                         R_ij_gt, t_ij_gt, n_min_base,
+                         full_centroid_i=raw_i.mean(axis=0), full_centroid_j=raw_j.mean(axis=0))
 
     else:   # thresh03
         from torch.utils.data import DataLoader
@@ -529,7 +554,8 @@ def main():
 
                 _handle_pair(idx, frac_i_base, frac_j_base, frac_i_nrm, frac_j_nrm,
                              frac_i_zoom, frac_j_zoom, nrm_i_zoom, nrm_j_zoom,
-                             R_ij_gt, t_ij_gt, n_min_raw)
+                             R_ij_gt, t_ij_gt, n_min_raw,
+                             full_centroid_i=raw0.mean(axis=0), full_centroid_j=raw1.mean(axis=0))
 
     elapsed = time.time() - t0
     print(f"\nFini : {len(rows)} paires ayant atteint l'étage 2 sur {n_seen_2frag} objets "
