@@ -4234,3 +4234,72 @@ Pas encore lancé sur le serveur -- prochaine action : lancer avec
 "tête miroir dédiée" (résultat retenu ci-dessus, chemin exact à retrouver
 sur le serveur -- pas noté dans ce plan), puis agréger le CSV par groupe
 A/B/C.
+
+**Résultat 9A (2026-08-03, thresh0.3, `phase8_depthmap_regressor_thresh03_mirrorhead/best.ckpt`,
+N=3803 objets 2-frags, 1917 paires étage 2) :** éligibilité 50.4%, Pose@30
+global 30.1% (1145), succès strict global 18.0% (684). Répartition par
+groupe : A (Pose@30+strict) 35.7%, B (Pose@30 sans strict) 24.0%, C
+(Pose@30 raté) 40.3%. Effet ICP par groupe : A improved 96.9%, B improved
+90.5%, **C improved seulement 41.8%, worsened 52.2%** -- l'ICP ne sauve pas
+une mauvaise hypothèse d'étage 1, il l'aggrave souvent. Confirmé par
+`rot_err_stage1` : médiane 129° dans le groupe C (dont 73.7% dans la
+tranche 90-180°) contre 13.7°/20.8° pour A/B -- hors du bassin de
+convergence documenté en Phase 6A. **9A-bis (split groupe B)** : avant ICP,
+94.6% des paires B échouent sur rotation ET translation ; après ICP,
+64.6% restent en échec double mais **27.5% passent en `trans_fail_only`
+contre seulement 7.8% en `rot_fail_only`** -- l'ICP corrige la rotation
+nettement mieux que la translation dans ce groupe (ratio ~3.5:1),
+cohérent avec le glissement tangentiel déjà anticipé dans le docstring de
+`trimmed_icp_normals` (fractures quasi planes, planéité médiane 0.043).
+
+**Conclusion 9A : le goulot du succès strict est à deux niveaux distincts.**
+Groupe C (40% des paires) -- angle initial hors bassin, cause probable
+= mauvaise hypothèse miroir choisie par le modèle (cf. ci-dessous, piste
+géométrique). Groupe B (24%) -- l'ICP fonctionne mais laisse un résidu de
+translation tangentielle. 9D (retoucher l'ICP en général) n'est PAS la
+priorité : l'ICP est déjà très efficace sur A/B (90-97% improved), le
+problème est concentré sur l'initialisation (C) et la composante
+translation (B).
+
+## Piste géométrique pour éliminer le miroir à la racine (2026-08-03, en cours de validation)
+
+Discussion avec l'utilisateur, suite au diagnostic du groupe C : le
+"miroir" pourrait être un artefact du signe ARBITRAIRE de l'axe normal
+`n` renvoyé par la PCA (`compute_pca_frame`), pas une vraie ambiguïté
+physique. Argument (algèbre linéaire) : `canonical_pca_frame` force déjà
+`det([u,v,n])=+1` indépendamment pour i et j -- deux repères DIRECTS sont
+TOUJOURS reliés par une rotation pure, jamais une réflexion. Le miroir
+observé (52.2% des paires réelles, `phase8_reflection_prevalence_check.py`)
+vient donc d'ailleurs : rien ne garantit que la vraie rotation GT envoie
+`n_i` vers `-n_j` (normales opposées, comme deux faces qui se touchent)
+plutôt que vers `+n_j` (même sens) -- et un taux ~52% est exactement ce
+qu'on attend d'un signe non contrôlé (tirage quasi aléatoire de `eigh()`).
+
+Intuition de l'utilisateur (cas à 2 fragments) : si on met la surface de
+fracture dans un plan, le reste de la masse du fragment est forcément
+d'un côté -- donc orienter `n` selon "où est le reste du fragment" (au
+lieu d'un signe arbitraire) est un critère géométrique bien défini, sans
+apprentissage. Ingrédient déjà présent et déjà considéré fiable ailleurs
+dans le pipeline : `pointclouds_normals` (normales mesh par point),
+utilisées telles quelles par `trimmed_icp_normals` (`normal_dot_thresh`
+suppose déjà des normales opposées entre fragments adjacents).
+
+**Implémenté (validation géométrique pure, aucun entraînement) :**
+`scripts/phase9_normal_orientation_check.py` -- `canonical_pca_frame_oriented()`
+fixe le signe de `n` via la moyenne des normales mesh du fragment
+(`point_normals.mean(axis=0)`), puis ajuste `v` (pas `n`, qui n'est plus
+libre) pour restaurer `det=+1`. Compare, sur le split GT, la prévalence de
+`mirror=True` (via `fit_theta_shift_mirror_from_gt`, réutilisée telle
+quelle, seuls les repères passés en argument changent) AVANT (repère
+existant) vs APRÈS (repère réorienté). Si l'hypothèse est correcte, la
+prévalence doit chuter de ~52% à ~0%.
+
+Pas encore lancé sur le serveur -- prochaine action :
+```
+CUDA_VISIBLE_DEVICES=1 python scripts/phase9_normal_orientation_check.py \
+    --data_root ... --experiment cnn_step15_final_model \
+    --categories everyday --split val --max_batches 3000
+```
+Si confirmé : remplacerait `mirror_head`/`profile_mirror` par une règle
+géométrique déterministe (plus simple, potentiellement plus fiable que le
+86.4% appris) -- levier direct sur le groupe C (40% des échecs Pose@30).
