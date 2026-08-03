@@ -43,7 +43,9 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.analyze_errors import load_config_and_model
-from scripts.phase5a_depthmap_matching import quat_wxyz_to_rotmat, rot_err_deg, trans_err
+from scripts.phase5a_depthmap_matching import (
+    quat_wxyz_to_rotmat, rot_err_deg, trans_err, compute_pca_frame, rasterize,
+)
 from scripts.phase5a_zoom_resample_check import zoom_resample, to_input_frame, run_cascade
 from scripts.phase5a_zoom_resample_thresh03_check import dominant_cluster_mask, remove_tiny_clusters_mask
 from scripts.phase6a_convergence_basin_check import trimmed_icp_normals
@@ -74,28 +76,63 @@ def scatter3d(ax, pts, color, s=1, alpha=0.5, label=None):
     ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=color, s=s, alpha=alpha, label=label)
 
 
+def compute_display_depthmaps(frac_i, frac_j, resolution=64):
+    """Cartes de profondeur pour affichage uniquement -- recalculées avec
+    `compute_pca_frame`/`rasterize` (mêmes fonctions que le pipeline réel,
+    résolution fixe choisie pour la lisibilité, indépendante de la cascade
+    multi-résolution utilisée par `run_cascade` pour trouver la pose)."""
+    if len(frac_i) < 3 or len(frac_j) < 3:
+        return None, None, None, None
+    c_i, u_i, v_i, n_i, _ = compute_pca_frame(frac_i)
+    c_j, u_j, v_j, n_j, _ = compute_pca_frame(frac_j)
+    ci, cj = frac_i - c_i, frac_j - c_j
+    span_i = max(float((ci @ u_i).max() - (ci @ u_i).min()),
+                 float((ci @ v_i).max() - (ci @ v_i).min()), 1e-8)
+    span_j = max(float((cj @ u_j).max() - (cj @ u_j).min()),
+                 float((cj @ v_j).max() - (cj @ v_j).min()), 1e-8)
+    pixel_size = max(span_i, span_j) * 1.1 / resolution
+    dmap_i, valid_i, _, _ = rasterize(frac_i, c_i, u_i, v_i, n_i, resolution, pixel_size)
+    dmap_j, valid_j, _, _ = rasterize(frac_j, c_j, u_j, v_j, n_j, resolution, pixel_size)
+    return dmap_i, valid_i, dmap_j, valid_j
+
+
 def make_figure(category, obj_idx, raw_i, raw_j, frac_i_base, frac_j_base,
                  R_ij_gt, t_ij_gt, stage1_res, R_final, t_final, re_final, te_final,
-                 success_rot_thresh, success_trans_thresh, out_path):
+                 success_rot_thresh, success_trans_thresh, out_path,
+                 dmap_i=None, valid_i=None, dmap_j=None, valid_j=None):
     fig = plt.figure(figsize=(20, 10))
 
     ax1 = fig.add_subplot(2, 4, 1, projection="3d")
-    scatter3d(ax1, raw_i, "tab:blue")
-    ax1.set_title(f"Fragment i — {len(raw_i)} pts")
+    scatter3d(ax1, raw_i, "lightgray", s=1, alpha=0.3)
+    scatter3d(ax1, frac_i_base, "red", s=4, alpha=0.9)
+    ax1.set_title(f"Fracture i (thresh0.3, CNN) — {len(frac_i_base)} pts")
 
     ax2 = fig.add_subplot(2, 4, 2, projection="3d")
-    scatter3d(ax2, raw_j, "tab:orange")
-    ax2.set_title(f"Fragment j — {len(raw_j)} pts")
+    scatter3d(ax2, raw_j, "lightgray", s=1, alpha=0.3)
+    scatter3d(ax2, frac_j_base, "green", s=4, alpha=0.9)
+    ax2.set_title(f"Fracture j (thresh0.3, CNN) — {len(frac_j_base)} pts")
 
-    ax3 = fig.add_subplot(2, 4, 3, projection="3d")
-    scatter3d(ax3, raw_i, "lightgray", s=1, alpha=0.3)
-    scatter3d(ax3, frac_i_base, "red", s=4, alpha=0.9)
-    ax3.set_title(f"Fracture i (thresh0.3, CNN) — {len(frac_i_base)} pts")
+    cmap = plt.cm.coolwarm.copy()
+    cmap.set_bad("lightgray")
+    ax3 = fig.add_subplot(2, 4, 3)
+    if dmap_i is not None:
+        dmap_i_show = np.ma.masked_where(~valid_i, dmap_i)
+        im3 = ax3.imshow(dmap_i_show, cmap=cmap, origin="lower")
+        plt.colorbar(im3, ax=ax3, fraction=0.046)
+        ax3.set_title(f"Depth map i ({int(valid_i.sum())} px valides / {valid_i.size})")
+    else:
+        ax3.axis("off")
+        ax3.set_title("Depth map i — non calculable")
 
-    ax4 = fig.add_subplot(2, 4, 4, projection="3d")
-    scatter3d(ax4, raw_j, "lightgray", s=1, alpha=0.3)
-    scatter3d(ax4, frac_j_base, "green", s=4, alpha=0.9)
-    ax4.set_title(f"Fracture j (thresh0.3, CNN) — {len(frac_j_base)} pts")
+    ax4 = fig.add_subplot(2, 4, 4)
+    if dmap_j is not None:
+        dmap_j_show = np.ma.masked_where(~valid_j, dmap_j)
+        im4 = ax4.imshow(dmap_j_show, cmap=cmap, origin="lower")
+        plt.colorbar(im4, ax=ax4, fraction=0.046)
+        ax4.set_title(f"Depth map j ({int(valid_j.sum())} px valides / {valid_j.size})")
+    else:
+        ax4.axis("off")
+        ax4.set_title("Depth map j — non calculable")
 
     ax8 = fig.add_subplot(2, 4, 8, projection="3d")
     raw_j_gt = (R_ij_gt.T @ (raw_j - t_ij_gt).T).T
@@ -324,9 +361,11 @@ def main():
                 continue
             found[category] = True
             out_path = out_dir / f"{category}.png"
+            dmap_i, valid_i, dmap_j, valid_j = compute_display_depthmaps(frac_i_zoom, frac_j_zoom)
             make_figure(category, n_seen_2frag, raw0, raw1, frac_i_base, frac_j_base,
                         R_ij_gt, t_ij_gt, stage1_res, R_final, t_final, re_final, te_final,
-                        args.success_rot_thresh, args.success_trans_thresh, out_path)
+                        args.success_rot_thresh, args.success_trans_thresh, out_path,
+                        dmap_i=dmap_i, valid_i=valid_i, dmap_j=dmap_j, valid_j=valid_j)
             print(f"  [{len(found)}/{len(CATEGORIES)}] {category} -> {out_path.name} (objet #{n_seen_2frag})")
 
     missing = [c for c in CATEGORIES if c not in found]

@@ -50,6 +50,7 @@ from scripts.phase5a_zoom_resample_check import (
 from scripts.phase5a_zoom_resample_thresh03_check import dominant_cluster_mask
 from scripts.phase6a_convergence_basin_check import trimmed_icp_normals
 from scripts.phase8_pipeline_learned_check import load_regressor, run_learned_stage1
+from scripts.phase8_build_regressor_dataset import build_frame_and_rasterize
 from assembly.models.cnn_segmentation_model import CNNFracSeg
 from assembly.models.projection_mapping_utils import extract_fragment_list
 
@@ -77,28 +78,53 @@ def scatter3d(ax, pts, color, s=1, alpha=0.5, label=None):
     ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=color, s=s, alpha=alpha, label=label)
 
 
+def compute_display_depthmaps(frac_i, frac_j):
+    """Cartes de profondeur pour affichage -- réutilise `build_frame_and_rasterize`
+    (même fonction/résolution que `run_learned_stage1`), sur les MÊMES points
+    (zoomés) réellement passés au modèle, pour une figure fidèle à ce qu'il voit."""
+    if len(frac_i) < 3 or len(frac_j) < 3:
+        return None, None, None, None
+    dmap_i, valid_i, dmap_j, valid_j, _ = build_frame_and_rasterize(frac_i, frac_j)
+    return dmap_i, valid_i, dmap_j, valid_j
+
+
 def make_figure(category, obj_idx, raw_i, raw_j, frac_i_base, frac_j_base,
                  R_ij_gt, t_ij_gt, stage1_res, R_final, t_final, re_final, te_final,
-                 success_rot_thresh, success_trans_thresh, out_path):
+                 success_rot_thresh, success_trans_thresh, out_path,
+                 dmap_i=None, valid_i=None, dmap_j=None, valid_j=None):
     fig = plt.figure(figsize=(20, 10))
 
     ax1 = fig.add_subplot(2, 4, 1, projection="3d")
-    scatter3d(ax1, raw_i, "tab:blue")
-    ax1.set_title(f"Fragment i — {len(raw_i)} pts")
+    scatter3d(ax1, raw_i, "lightgray", s=1, alpha=0.3)
+    scatter3d(ax1, frac_i_base, "red", s=4, alpha=0.9)
+    ax1.set_title(f"Fracture i (thresh0.3, CNN) — {len(frac_i_base)} pts")
 
     ax2 = fig.add_subplot(2, 4, 2, projection="3d")
-    scatter3d(ax2, raw_j, "tab:orange")
-    ax2.set_title(f"Fragment j — {len(raw_j)} pts")
+    scatter3d(ax2, raw_j, "lightgray", s=1, alpha=0.3)
+    scatter3d(ax2, frac_j_base, "green", s=4, alpha=0.9)
+    ax2.set_title(f"Fracture j (thresh0.3, CNN) — {len(frac_j_base)} pts")
 
-    ax3 = fig.add_subplot(2, 4, 3, projection="3d")
-    scatter3d(ax3, raw_i, "lightgray", s=1, alpha=0.3)
-    scatter3d(ax3, frac_i_base, "red", s=4, alpha=0.9)
-    ax3.set_title(f"Fracture i (thresh0.3, CNN) — {len(frac_i_base)} pts")
+    cmap = plt.cm.coolwarm.copy()
+    cmap.set_bad("lightgray")
+    ax3 = fig.add_subplot(2, 4, 3)
+    if dmap_i is not None:
+        dmap_i_show = np.ma.masked_where(~valid_i, dmap_i)
+        im3 = ax3.imshow(dmap_i_show, cmap=cmap, origin="lower")
+        plt.colorbar(im3, ax=ax3, fraction=0.046)
+        ax3.set_title(f"Depth map i ({int(valid_i.sum())} px valides / {valid_i.size})")
+    else:
+        ax3.axis("off")
+        ax3.set_title("Depth map i — non calculable")
 
-    ax4 = fig.add_subplot(2, 4, 4, projection="3d")
-    scatter3d(ax4, raw_j, "lightgray", s=1, alpha=0.3)
-    scatter3d(ax4, frac_j_base, "green", s=4, alpha=0.9)
-    ax4.set_title(f"Fracture j (thresh0.3, CNN) — {len(frac_j_base)} pts")
+    ax4 = fig.add_subplot(2, 4, 4)
+    if dmap_j is not None:
+        dmap_j_show = np.ma.masked_where(~valid_j, dmap_j)
+        im4 = ax4.imshow(dmap_j_show, cmap=cmap, origin="lower")
+        plt.colorbar(im4, ax=ax4, fraction=0.046)
+        ax4.set_title(f"Depth map j ({int(valid_j.sum())} px valides / {valid_j.size})")
+    else:
+        ax4.axis("off")
+        ax4.set_title("Depth map j — non calculable")
 
     ax8 = fig.add_subplot(2, 4, 8, projection="3d")
     raw_j_gt = (R_ij_gt.T @ (raw_j - t_ij_gt).T).T
@@ -329,9 +355,11 @@ def main():
                 continue
             found[category] = True
             out_path = out_dir / f"{category}.png"
+            dmap_i, valid_i, dmap_j, valid_j = compute_display_depthmaps(frac_i_zoom, frac_j_zoom)
             make_figure(category, n_seen_2frag, raw0, raw1, frac_i_base, frac_j_base,
                         R_ij_gt, t_ij_gt, stage1_res, R_final, t_final, re_final, te_final,
-                        args.success_rot_thresh, args.success_trans_thresh, out_path)
+                        args.success_rot_thresh, args.success_trans_thresh, out_path,
+                        dmap_i=dmap_i, valid_i=valid_i, dmap_j=dmap_j, valid_j=valid_j)
             print(f"  [{len(found)}/{len(CATEGORIES)}] {category} -> {out_path.name} (objet #{n_seen_2frag})")
 
     missing = [c for c in CATEGORIES if c not in found]
