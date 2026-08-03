@@ -94,6 +94,25 @@ def main():
     transition = pd.crosstab(sub_b["fail_mode_before_icp"], sub_b["fail_mode_after_icp"])
     print(transition)
 
+    print("\n=== Groupe C : sparsité (n_frac_pts_min) x catastrophique "
+          "(rot_err_stage1 >= 90°) ===")
+    print("(teste si la majorité du groupe C non expliquée par le miroir "
+          "s'explique par un signal trop pauvre pour l'étage 1, indépendamment "
+          "du miroir -- cf. PLAN_REASSEMBLY_MODULE.md, 2026-08-03)")
+    sub_c2 = df[df["group"] == "C"].copy()
+    sub_c2["catastrophic"] = sub_c2["rot_err_stage1"] >= 90
+    density_bins = [0, 25, 50, 100, 200, 10**6]
+    density_labels = ["<25", "25-50", "50-100", "100-200", "200+"]
+    sub_c2["density_bin"] = pd.cut(sub_c2["n_frac_pts_min"], bins=density_bins,
+                                    labels=density_labels, include_lowest=True)
+    table = pd.crosstab(sub_c2["density_bin"], sub_c2["catastrophic"], normalize="index") * 100
+    print(table.round(1))
+    counts = sub_c2["density_bin"].value_counts().sort_index()
+    print("  (n par tranche)")
+    print(counts)
+    print("\n  Médiane n_frac_pts_min, catastrophique vs pas (au sein de C) :")
+    print(sub_c2.groupby("catastrophic")["n_frac_pts_min"].median())
+
 
 if __name__ == "__main__":
     main()
