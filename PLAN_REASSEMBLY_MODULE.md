@@ -4406,3 +4406,92 @@ CUDA_VISIBLE_DEVICES=1 python scripts/phase8_pipeline_learned_check.py --strateg
 ```
 À comparer aux résultats déjà obtenus : `mirror_head` (éligibilité 50.4%,
 Pose@30 30.1%, strict 18.0%) et `geometric` v1 (50.4%/30.4%/17.6%).
+
+**Résultat (2026-08-03, N=1923) : quasi identique aux deux runs
+précédents** (éligibilité 50.6%, Pose@30 29.7%, strict 17.6%, groupes
+A/B/C 34.8/24.0/41.2%). **Conclusion, par élimination quantitative** :
+prévalence vraie du miroir ~50/50 (mesuré précédemment) + exactitude
+86-90% selon la méthode → le miroir mal choisi ne peut expliquer qu'environ
+10-14% de TOUTES les paires (~190-270/1920), très inférieur à la taille du
+groupe C (770-790 paires, ~40%). **Donc l'essentiel du groupe C (500+
+paires, plus de la moitié) échoue catastrophiquement (erreur d'angle
+90-180°) pour une raison AUTRE que le miroir** -- probablement une
+régression theta/shift massivement fausse même à miroir correct. Chantier
+miroir refermé : gain isolé réel (+3.6pts d'exactitude) mais pas le levier
+dominant du groupe C. Cf. section "Phase 9 — Goulot du succès strict"
+ci-dessus pour la suite (chantiers (1)/(2) décidés le 2026-08-03).
+
+## Phase 9, suite (2026-08-03) — deux chantiers séparés, décidés avec l'utilisateur
+
+Le miroir refermé (ci-dessus), le goulot restant se scinde en deux
+questions indépendantes, à mener dans cet ordre (décidé avec
+l'utilisateur, cascade d'abord -- population plus large, mécanisme déjà
+éprouvé côté hand-crafted, moins risqué que le diagnostic fin du groupe C) :
+
+1. **Pourquoi certaines paires restent inéligibles** (`no_correspondence`,
+   ~49-50% des paires vues) -- chantier neuf, jamais creusé pour le
+   pipeline appris (contrairement au hand-crafted, tranché en juillet :
+   qualité intrinsèque du masque CNN, pas le pipeline de matching -- mais
+   CE diagnostic-là portait sur le hand-crafted AVEC cascade déjà active,
+   donc compatible avec un gain supplémentaire ici).
+2. **Pourquoi les éligibles ne donnent pas tous Pose@30** -- suite directe
+   de 9A/9A-bis : pour le groupe C, la question se réduit maintenant à
+   "pourquoi l'angle reste catastrophique (90-180°) sur la majorité des
+   paires même quand le miroir est correct ?" ; pour le groupe B, "le
+   résidu de translation après ICP" (déjà caractérisé, ratio 3.5:1 vs
+   rotation).
+
+**Décision sur la piste "correspondances plus robustes" / gaussian
+splatting (discutée avec l'utilisateur avant de choisir la cascade) :**
+- `build_correspondences_nn` (`phase5a_depthmap_matching.py`) a DÉJÀ été
+  identifié comme fragile (arrondi de grille, dépendant de la résolution)
+  et corrigé le 2026-07-22 -- version actuelle : plus-proche-voisin
+  CONTINU + tolérance physique absolue `contact_eps` (défaut 0.05).
+  Preuve du fix : overlap à la vraie pose GT passé de ~0.7-0.76 (grille)
+  à 99.99% (continu). Donc la méthode de correspondance elle-même n'est
+  plus le suspect -- mais `contact_eps` n'a jamais été réglé
+  spécifiquement pour le pipeline appris, et vu que l'étage 1 n'a besoin
+  que d'être grossier (l'ICP raffine derrière), l'assouplir est une piste
+  bon marché, testée ci-dessous en parallèle de la cascade.
+- **Gaussian splatting / dilatation des trous de depth map : DÉJÀ testé
+  (2026-07-20), y compris à un réglage doux (`σ=0.5`, pas agressif) --
+  rejeté dans le pipeline réel** (Pose@30 20.87%→19.08%, RotErr pire).
+  Mécanisme identifié à l'époque (avec l'utilisateur) : un bon
+  recouvrement est nécessaire mais pas suffisant -- flouter détruit les
+  petites encoches qui distinguent le BON angle des angles voisins presque
+  aussi plausibles (analogie du puzzle). Ce test portait sur la recherche
+  HAND-CRAFTED (corrélation FFT sur le relief) ; pas retesté avec le
+  modèle appris (qui a le profil de corrélation + les normales en plus du
+  relief brut) -- argument "le flou détruit le signal discriminant" jugé
+  générique (pas spécifique à la FFT), donc piste laissée de côté pour
+  l'instant, pas repriorisée sans raison nouvelle de penser que le modèle
+  appris s'en sortirait différemment.
+
+**Implémenté (chantier 1, cascade + contact_eps) :
+`scripts/phase9_stage1_recovery_check.py`.** Sur les paires
+`no_correspondence` à la config par défaut (résolution 64, contact_eps
+0.05), teste deux mécanismes de récupération INDÉPENDANTS, sans
+réentraînement :
+- **Cascade de résolution** (48, 32, 24) : `_SiameseEncoder` utilise
+  `AdaptiveAvgPool2d(1)` (vérifié dans le code) donc accepte n'importe
+  quelle taille de carte sans erreur de forme -- mais jamais vu autre
+  chose que 64x64 à l'entraînement (vrai risque de décalage de
+  distribution, pas juste une question de forme). Nouveau forward du
+  MÊME checkpoint à chaque résolution candidate.
+- **`contact_eps` plus généreux** (0.08, 0.1, 0.15, 0.2), résolution 64
+  fixe : réutilise le (theta, shift, mirror) déjà prédit à la résolution
+  de base (aucun nouveau forward, gratuit), retente juste
+  `build_correspondences_nn` avec une tolérance plus large.
+
+Pour chaque mécanisme : combien de paires récupérées, et parmi elles,
+combien atteignent Pose@30 par rapport à la vraie pose GT (vérifier qu'on
+récupère des poses plausibles, pas juste "une pose" -- sinon on déplace
+juste le problème vers le groupe C). Sélection miroir : `geometric_centroid`
+(v2, validée ci-dessus). Pas encore lancé -- prochaine action :
+```
+CUDA_VISIBLE_DEVICES=1 python scripts/phase9_stage1_recovery_check.py \
+    --regressor_ckpt output/phase8_depthmap_regressor_thresh03_mirrorhead/best.ckpt \
+    --ckpt output/cnn_step15_final_model/last.ckpt \
+    --data_root ... --experiment cnn_step15_final_model \
+    --categories everyday --split val --max_batches 3000
+```
