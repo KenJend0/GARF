@@ -4813,3 +4813,66 @@ véritable filet de récupération sur des cas plus larges. Coût temporel :
 de candidats). **`stage1_mode=topM_icp` devient le réglage de référence.**
 Nouvelle barre : éligibilité 84.6%, Pose@30 global 46.8%, succès strict
 27.6%.
+
+## Bilan de session (2026-08-03/04) et pistes ouvertes pour la suite
+
+**Progression, en partant du meilleur résultat Phase 8 (tête miroir
+dédiée) :**
+```
+                          Éligibilité   Pose@30 global   Succès strict
+Phase 8 (mirror_head)        59.4%        38.7%             23.9%
++ ABS_MIN_POINTS=5            77.2%        36.8%             18.6%  (population élargie, plus dure en moyenne)
++ top2_icp                    79.3%        40.5%             21.2%
++ topM_icp                    84.6%        46.8%             27.6%
+```
+Gain net sur toute la ligne : éligibilité +25.2 pts, Pose@30 +8.1 pts,
+succès strict +3.7 pts par rapport à la meilleure config Phase 8 --
+obtenu SANS réentraîner le modèle, uniquement par des changements de
+pipeline en aval (seuil de densité pré-zoom, sélection multi-hypothèses
+par énergie ICP).
+
+**Ce qui est refermé cette session (conclusions établies, pas à
+rouvrir sans raison nouvelle) :**
+- Cascade de résolution + `contact_eps` généreux pour l'éligibilité :
+  rejeté, 0% de vrais succès (Pose@30) parmi les paires "récupérées".
+- Miroir géométrique (v1 normales, v2 centroïde) : v2 bat le
+  `mirror_head` appris en isolé (90.0% vs 86.4%) mais ne bouge rien en
+  pipeline (branché puis retiré au profit de `top2_icp`, plus efficace
+  et agnostique à la question miroir).
+- Sparsité comme explication du groupe C (au-delà du miroir) : réfutée,
+  taux catastrophique plat quelle que soit la densité (68-80%, y compris
+  à 200+ points).
+- Éligibilité (masque CNN trop pauvre, seuil 50 pts avant zoom) :
+  root-caused, corrigé (`ABS_MIN_POINTS=5`), confirmé à pleine échelle.
+
+**Pistes ouvertes, non explorées, pour une prochaine session (par ordre
+de coût croissant) :**
+1. **Pousser `topM_icp` plus loin** -- plus d'offsets d'angle, ou ajouter
+   des offsets de shift (idée originale 9B, jamais testée). Rendement
+   décroissant probable mais pas mesuré ; le saut topM_icp a été plus
+   gros que prévu, donc pas à exclure d'office.
+2. **9D reconsidéré** -- diagnostic ICP spécifique sur les cas encore en
+   échec après `topM_icp` (trimming, seuil de normale, multi-start).
+   Repoussé plusieurs fois cette session au profit de pistes moins
+   chères ; pourrait redevenir pertinent maintenant que topM_icp a
+   changé la composition des groupes A/B/C.
+3. **Piste planéité pour le groupe C** -- logger la planéité par paire
+   (champ absent du CSV actuel) et croiser avec le taux catastrophique,
+   pour vérifier l'hypothèse de forme plutôt que sparsité (cf.
+   "Chantier (1), repris" ci-dessus). Nécessite un rerun.
+4. **9A-bis du groupe B, jamais refermé** -- le résidu de translation
+   après ICP (ratio ~2-3.5:1 vs rotation) n'a jamais été creusé plus loin
+   (décomposition tangentielle/normale évoquée mais pas implémentée,
+   nécessite le repère local (u,v,n) par paire, pas juste les erreurs
+   scalaires actuellement loggées).
+5. **Réentraînement avec `ABS_MIN_POINTS=5` dans
+   `phase8_build_regressor_dataset.py`** -- le modèle généralise déjà
+   sans avoir vu cette population sparse à l'entraînement (26.4% de
+   Pose@30 sur les paires récupérées) ; l'entraîner dessus pourrait
+   pousser plus loin. Coût : réentraînement complet.
+6. **Simplification architecture** -- si `geometric_centroid` ou
+   `top2_icp`/`topM_icp` restent la config de référence, `mirror_head`/
+   `mirror_encoder` (+ leur terme de perte) peuvent être supprimés du
+   modèle (cf. Phase 9 ci-dessus, argument déjà posé : la régression
+   angle/shift à l'entraînement sélectionne déjà via `mirror_gt`, pas
+   via `mirror_head`). Pas urgent, juste un nettoyage possible.
