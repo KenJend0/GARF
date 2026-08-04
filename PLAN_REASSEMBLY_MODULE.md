@@ -4973,3 +4973,24 @@ CUDA_VISIBLE_DEVICES=1 python scripts/phase8_pipeline_learned_check.py --strateg
 ```
 À comparer à la référence `topM_icp` : éligibilité 84.1%, Pose@30 global
 48.4%, succès strict 28.1% (N=3803, run du diagnostic oracle).
+
+**Résultat (2026-08-04, N=3803) : SUCCÈS NET ET CIBLÉ, sur le succès
+strict précisément.**
+```
+                    topM_icp        topM_icp_shift    Δ
+Éligibilité          84.1%           84.5%           +0.4 pt (bruit)
+Pose@30 global       48.4% (1839)    48.8% (1854)     +0.4 pt (+15 paires, marginal)
+Succès strict global 28.1% (1069)    31.2% (1185)     +3.1 pts (+116 paires)
+Groupe A/B/C      33.4/24.1/42.5%  36.9/20.8/42.3%
+```
+Signature propre : groupe A +116, groupe B -101, groupe C quasi stable
+(-2, bruit) -- exactement la conversion "B devient A" anticipée pour les
+offsets d'angle seuls mais qui n'était pas apparue (le gain topM_icp
+initial venait plutôt de C et de l'éligibilité, pas de B). Confirme la
+lecture du diagnostic oracle : l'écart oracle-énergie sur les candidats
+angle seuls n'était que ~2 points (plafond de la génération angle-only) ;
+en ajoutant de VRAIS nouveaux candidats (shift), le gain (+3.1 pts
+strict) dépasse ce plafond -- valide que la génération, pas la
+sélection, était le bon levier. **`stage1_mode=topM_icp_shift` devient
+le réglage de référence.** Nouvelle barre : éligibilité 84.5%, Pose@30
+global 48.8%, succès strict 31.2%.
