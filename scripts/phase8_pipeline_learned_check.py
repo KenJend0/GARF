@@ -451,6 +451,12 @@ def main():
         nonlocal n_stage1_failed
         chosen_hypothesis = None
         n_hypotheses_valid = 1
+        oracle_hypothesis = None
+        oracle_rot_err_final = None
+        oracle_trans_err_final = None
+        oracle_pose_30 = None
+        oracle_strict_success = None
+        energy_matches_oracle = None
 
         if args.stage1_mode in ("top2_icp", "topM_icp"):
             if args.stage1_mode == "topM_icp":
@@ -477,10 +483,15 @@ def main():
                 )
                 energy, ovlp, ncons = _icp_residual_stats(
                     frac_i_base, frac_i_nrm, frac_j_base, frac_j_nrm, R_f, t_f, args.trim_ratio)
+                # rot_err/trans_err final calculés pour TOUS les candidats (pas
+                # seulement celui retenu) -- coût quasi nul (l'ICP tourne déjà
+                # sur chacun), sert au diagnostic oracle-vs-énergie ci-dessous
+                # (Phase 9C, 2026-08-04).
                 icp_results[label] = {
                     "R_final": R_f, "t_final": t_f, "icp_energy": energy,
                     "overlap_frac": ovlp, "normal_consistency": ncons,
                     "rot_err_stage1": cand["rot_err"], "trans_err_stage1": cand["trans_err"],
+                    "rot_err_final": rot_err_deg(R_f, R_ij_gt), "trans_err_final": trans_err(t_f, t_ij_gt),
                     "n_corr": cand["n_corr"],
                 }
             # Sélection PAR L'ICP (énergie finale la plus basse), pas par une
@@ -500,6 +511,23 @@ def main():
                 "pose_30": bool(chosen["rot_err_stage1"] < 30.0 and chosen["trans_err_stage1"] < 0.1),
                 "pose_15": bool(chosen["rot_err_stage1"] < 15.0 and chosen["trans_err_stage1"] < 0.05),
             }
+
+            # -- Phase 9C : diagnostic oracle-vs-énergie (2026-08-04) --------
+            # oracle = le MEILLEUR candidat possible (au sens rot_err_final vs
+            # GT) parmi ceux générés -- jamais utilisable en production (accès
+            # à la GT), sert seulement à savoir si le verrou actuel est "le bon
+            # candidat n'est pas généré" (oracle proche de énergie) ou "il est
+            # généré mais mal choisi" (oracle nettement meilleur qu'énergie).
+            oracle_key = min(icp_results, key=lambda k: icp_results[k]["rot_err_final"])
+            oracle = icp_results[oracle_key]
+            oracle_hypothesis = (f"{oracle_key[0]}+{oracle_key[1]:g}"
+                                  if isinstance(oracle_key, tuple) else oracle_key)
+            oracle_rot_err_final = oracle["rot_err_final"]
+            oracle_trans_err_final = oracle["trans_err_final"]
+            oracle_pose_30 = bool(oracle_rot_err_final < 30.0 and oracle_trans_err_final < 0.1)
+            oracle_strict_success = bool(oracle_rot_err_final < args.success_rot_thresh
+                                          and oracle_trans_err_final < args.success_trans_thresh)
+            energy_matches_oracle = bool(best_key == oracle_key)
         else:
             stage1_res = run_learned_stage1(regressor, frac_i_zoom, frac_j_zoom, nrm_i_zoom, nrm_j_zoom,
                                              R_ij_gt, t_ij_gt, device, mirror_mode=args.mirror_mode,
@@ -556,6 +584,12 @@ def main():
             "stage1_pose_30": stage1_res["pose_30"], "stage1_pose_15": stage1_res["pose_15"],
             "final_pose_30": final_pose_30, "final_pose_15": final_pose_15,
             "final_strict_success": final_strict_success,
+            "oracle_hypothesis": oracle_hypothesis,
+            "oracle_rot_err_final": oracle_rot_err_final,
+            "oracle_trans_err_final": oracle_trans_err_final,
+            "oracle_pose_30": oracle_pose_30,
+            "oracle_strict_success": oracle_strict_success,
+            "energy_matches_oracle": energy_matches_oracle,
         })
 
     if args.strategy == "gt":
@@ -823,6 +857,28 @@ def main():
         print(f"  Groupe {g}: {n_g}/{n} ({100*n_g/n:.1f}%) -- ICP improved "
               f"{100*n_imp/n_g:.1f}% / unchanged {100*n_unc/n_g:.1f}% / "
               f"worsened {100*n_wor/n_g:.1f}%")
+
+    # Phase 9C (2026-08-04) -- diagnostic oracle-vs-énergie : le bon
+    # candidat est-il généré mais mal sélectionné (oracle >> énergie), ou
+    # n'est-il pas généré du tout (oracle proche de énergie) ?
+    if args.stage1_mode in ("top2_icp", "topM_icp") and rows:
+        n_energy_match = sum(1 for r in rows if r["energy_matches_oracle"])
+        n_oracle_p30 = sum(1 for r in rows if r["oracle_pose_30"])
+        n_oracle_strict = sum(1 for r in rows if r["oracle_strict_success"])
+        n_energy_p30 = sum(1 for r in rows if r["final_pose_30"])
+        n_energy_strict = sum(1 for r in rows if r["final_strict_success"])
+        print(f"\nPHASE 9C -- DIAGNOSTIC ORACLE vs ÉNERGIE (parmi les {n} paires étage 2) :")
+        print(f"  Sélection énergie == sélection oracle : {n_energy_match}/{n} "
+              f"({100*n_energy_match/n:.1f}%)")
+        print(f"  Pose@30 (parmi étage 2)   : énergie {100*n_energy_p30/n:.1f}% "
+              f"| oracle {100*n_oracle_p30/n:.1f}% "
+              f"(plafond atteignable avec la génération actuelle de candidats)")
+        print(f"  Succès strict (parmi étage 2) : énergie {100*n_energy_strict/n:.1f}% "
+              f"| oracle {100*n_oracle_strict/n:.1f}%")
+        gap_p30 = n_oracle_p30 - n_energy_p30
+        gap_strict = n_oracle_strict - n_energy_strict
+        print(f"  Écart oracle-énergie : {gap_p30} paires Pose@30, {gap_strict} paires strict "
+              f"-- {'sélection à améliorer' if gap_p30 > n*0.02 else 'génération de candidats à enrichir'}")
 
     if args.rows_csv:
         Path(args.rows_csv).parent.mkdir(parents=True, exist_ok=True)

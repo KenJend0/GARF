@@ -4876,3 +4876,46 @@ de coût croissant) :**
    modèle (cf. Phase 9 ci-dessus, argument déjà posé : la régression
    angle/shift à l'entraînement sélectionne déjà via `mirror_gt`, pas
    via `mirror_head`). Pas urgent, juste un nettoyage possible.
+
+## Phase 9C — diagnostic oracle-vs-énergie (2026-08-04, priorité avant tout push supplémentaire)
+
+Cadrage (avec l'utilisateur) : avant d'ajouter plus d'offsets ou de
+retoucher quoi que ce soit, trancher UNE question qui conditionne toute
+la suite -- **le bon candidat (au sens erreur GT) est-il déjà généré par
+`topM_icp` mais mal sélectionné par l'énergie ICP, ou n'est-il tout
+simplement pas généré du tout ?** Si le premier cas domine, il faut
+améliorer le CRITÈRE de sélection (score ICP). Si le second domine, il
+faut enrichir la GÉNÉRATION de candidats (plus d'offsets, shift, etc.).
+
+**Implémenté dans `phase8_pipeline_learned_check.py`, coût quasi nul**
+(l'ICP tourne déjà sur tous les candidats en `top2_icp`/`topM_icp`, on
+logge juste plus de ce qui est déjà calculé) :
+- Chaque candidat de `icp_results` stocke maintenant aussi
+  `rot_err_final`/`trans_err_final` (vs GT, pas seulement pour le
+  candidat retenu).
+- `oracle_key` = candidat avec le plus petit `rot_err_final` parmi tous
+  les candidats générés -- **jamais utilisable en production** (accès à
+  la GT), sert uniquement à mesurer le plafond atteignable avec la
+  génération actuelle.
+- Nouveaux champs CSV : `oracle_hypothesis`, `oracle_rot_err_final`,
+  `oracle_trans_err_final`, `oracle_pose_30`, `oracle_strict_success`,
+  `energy_matches_oracle` (bool -- la sélection ICP a-t-elle choisi le
+  même candidat que l'oracle ?).
+- Résumé console : taux d'accord énergie/oracle, Pose@30 et succès
+  strict comparés (énergie vs oracle, parmi les paires étage 2), écart
+  en nombre de paires -- avec une lecture automatique (écart > 2% du
+  total → "sélection à améliorer", sinon → "génération de candidats à
+  enrichir").
+
+Pas encore lancé -- prochaine action (même checkpoint, même
+`--stage1_mode topM_icp`, juste relire les nouvelles lignes du résumé) :
+```
+CUDA_VISIBLE_DEVICES=1 python scripts/phase8_pipeline_learned_check.py --strategy thresh03 \
+    --regressor_ckpt output/phase8_depthmap_regressor_thresh03_mirrorhead/best.ckpt \
+    --ckpt output/cnn_step15_final_model/last.ckpt \
+    --data_root ... --experiment cnn_step15_final_model \
+    --categories everyday --split val \
+    --stage1_mode topM_icp \
+    --rows_csv /tmp/student7/phase9c_rows_thresh03_oracle.csv \
+    --summary_json /tmp/student7/phase9c_summary_oracle.json
+```
