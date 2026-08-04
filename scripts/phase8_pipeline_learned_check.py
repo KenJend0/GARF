@@ -515,6 +515,8 @@ def main():
         oracle_pose_30 = None
         oracle_strict_success = None
         energy_matches_oracle = None
+        oracle_energy_rank = None
+        n_candidates_total = None
 
         if args.stage1_mode in ("top2_icp", "topM_icp", "topM_icp_shift"):
             frame = None
@@ -613,6 +615,13 @@ def main():
             oracle_strict_success = bool(oracle_rot_err_final < args.success_rot_thresh
                                           and oracle_trans_err_final < args.success_trans_thresh)
             energy_matches_oracle = bool(best_key == oracle_key)
+            # Rang (1-indexé) du candidat oracle une fois tous les candidats
+            # triés par énergie ICP -- 1 si l'énergie l'a directement choisi
+            # (= energy_matches_oracle), >1 sinon (à quel point il fallait
+            # descendre dans le classement énergie pour le trouver).
+            sorted_by_energy = sorted(icp_results, key=lambda k: icp_results[k]["icp_energy"])
+            oracle_energy_rank = sorted_by_energy.index(oracle_key) + 1
+            n_candidates_total = len(icp_results)
         else:
             stage1_res = run_learned_stage1(regressor, frac_i_zoom, frac_j_zoom, nrm_i_zoom, nrm_j_zoom,
                                              R_ij_gt, t_ij_gt, device, mirror_mode=args.mirror_mode,
@@ -675,6 +684,8 @@ def main():
             "oracle_pose_30": oracle_pose_30,
             "oracle_strict_success": oracle_strict_success,
             "energy_matches_oracle": energy_matches_oracle,
+            "oracle_energy_rank": oracle_energy_rank,
+            "n_candidates_total": n_candidates_total,
         })
 
     if args.strategy == "gt":
@@ -946,12 +957,20 @@ def main():
     # Phase 9C (2026-08-04) -- diagnostic oracle-vs-énergie : le bon
     # candidat est-il généré mais mal sélectionné (oracle >> énergie), ou
     # n'est-il pas généré du tout (oracle proche de énergie) ?
-    if args.stage1_mode in ("top2_icp", "topM_icp") and rows:
+    if args.stage1_mode in ("top2_icp", "topM_icp", "topM_icp_shift") and rows:
         n_energy_match = sum(1 for r in rows if r["energy_matches_oracle"])
         n_oracle_p30 = sum(1 for r in rows if r["oracle_pose_30"])
         n_oracle_strict = sum(1 for r in rows if r["oracle_strict_success"])
         n_energy_p30 = sum(1 for r in rows if r["final_pose_30"])
         n_energy_strict = sum(1 for r in rows if r["final_strict_success"])
+        # % de paires où AUCUN candidat généré n'atteint Pose@30 (même
+        # l'oracle échoue) -- distingue "mal choisi" de "pas de bon candidat".
+        n_no_good_candidate = sum(1 for r in rows if not r["oracle_pose_30"])
+        # % de paires où un candidat correct EXISTAIT (oracle_pose_30) mais
+        # où l'énergie a choisi un autre candidat qui, lui, échoue.
+        n_correct_exists_not_chosen = sum(
+            1 for r in rows if r["oracle_pose_30"] and not r["final_pose_30"])
+        ranks_when_mismatch = [r["oracle_energy_rank"] for r in rows if not r["energy_matches_oracle"]]
         print(f"\nPHASE 9C -- DIAGNOSTIC ORACLE vs ÉNERGIE (parmi les {n} paires étage 2) :")
         print(f"  Sélection énergie == sélection oracle : {n_energy_match}/{n} "
               f"({100*n_energy_match/n:.1f}%)")
@@ -964,6 +983,15 @@ def main():
         gap_strict = n_oracle_strict - n_energy_strict
         print(f"  Écart oracle-énergie : {gap_p30} paires Pose@30, {gap_strict} paires strict "
               f"-- {'sélection à améliorer' if gap_p30 > n*0.02 else 'génération de candidats à enrichir'}")
+        print(f"  Aucun candidat correct généré (oracle échoue aussi) : "
+              f"{n_no_good_candidate}/{n} ({100*n_no_good_candidate/n:.1f}%)")
+        print(f"  Candidat correct généré MAIS pas choisi par l'énergie : "
+              f"{n_correct_exists_not_chosen}/{n} ({100*n_correct_exists_not_chosen/n:.1f}%)")
+        if ranks_when_mismatch:
+            ranks_sorted = sorted(ranks_when_mismatch)
+            median_rank = ranks_sorted[len(ranks_sorted)//2]
+            print(f"  Rang énergie du candidat oracle, quand différent du choisi "
+                  f"(médiane sur {len(ranks_when_mismatch)} paires) : {median_rank}")
 
     if args.rows_csv:
         Path(args.rows_csv).parent.mkdir(parents=True, exist_ok=True)

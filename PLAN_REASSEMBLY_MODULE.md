@@ -4994,3 +4994,50 @@ strict) dépasse ce plafond -- valide que la génération, pas la
 sélection, était le bon levier. **`stage1_mode=topM_icp_shift` devient
 le réglage de référence.** Nouvelle barre : éligibilité 84.5%, Pose@30
 global 48.8%, succès strict 31.2%.
+
+**Correction de comparaison (2026-08-04, avec l'utilisateur) :** un
+récapitulatif de session avait mélangé le résultat Phase 8
+(mirror_head, N=1487, 59.4%/38.7%/23.9%) avec les résultats de cette
+session (N=3803) comme s'il s'agissait d'une trajectoire continue --
+en particulier, `ABS_MIN_POINTS=5` avait été lu à tort comme "dégradant
+temporairement le succès strict" (23.9%→18.6%) alors que la bonne
+comparaison, à N=3803 constant, montre que ce changement était déjà un
+gain net sur les trois métriques (17.6%→18.6%, +1.0 pt, pas une baisse).
+Table de référence, N précisé partout :
+```
+                                          N      Éligibilité   Pose@30   Strict
+Hand-crafted (référence)                1487        62.6%        14.7%     6.8%
+Phase 8, meilleur résultat (mirror_head) 1487        59.4%        38.7%    23.9%
+── Cette session, à partir d'ici : N=3803 ──
+Single/geometric_centroid (seuil=50)    3803        50.6%        29.7%    17.6%
++ ABS_MIN_POINTS=5                       3803        77.2%        36.8%    18.6%
++ top2_icp                               3803        79.3%        40.5%    21.2%
++ topM_icp                               3803        84.6%        46.8%    27.6%
++ topM_icp_shift                          3803        84.5%        48.8%    31.2%
+```
+
+**Diagnostic oracle-vs-énergie étendu (2026-08-04)** -- appliqué
+maintenant aussi à `topM_icp_shift` (la condition d'affichage du résumé
+ne listait que `top2_icp`/`topM_icp`, corrigé) et enrichi :
+- `oracle_energy_rank` : rang (1-indexé) du candidat oracle une fois
+  tous les candidats triés par énergie ICP -- indique à quel point
+  l'énergie était "proche" de trouver le bon candidat quand elle se
+  trompe.
+- `n_no_good_candidate` : % de paires où AUCUN candidat généré n'atteint
+  Pose@30 (l'oracle échoue aussi) -- distingue "mal choisi" de "pas de
+  bon candidat du tout".
+- `n_correct_exists_not_chosen` : % de paires où un candidat correct
+  EXISTAIT mais où l'énergie a choisi un autre candidat, qui échoue.
+- `n_candidates_total` loggé par paire.
+
+Pas encore relancé sur `topM_icp_shift` -- prochaine action :
+```
+CUDA_VISIBLE_DEVICES=1 python scripts/phase8_pipeline_learned_check.py --strategy thresh03 \
+    --regressor_ckpt output/phase8_depthmap_regressor_thresh03_mirrorhead/best.ckpt \
+    --ckpt output/cnn_step15_final_model/last.ckpt \
+    --data_root ... --experiment cnn_step15_final_model \
+    --categories everyday --split val \
+    --stage1_mode topM_icp_shift \
+    --rows_csv /tmp/student7/phase9c_rows_thresh03_topMshift_oracle.csv \
+    --summary_json /tmp/student7/phase9c_summary_topMshift_oracle.json
+```
