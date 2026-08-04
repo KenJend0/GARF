@@ -4919,3 +4919,57 @@ CUDA_VISIBLE_DEVICES=1 python scripts/phase8_pipeline_learned_check.py --strateg
     --rows_csv /tmp/student7/phase9c_rows_thresh03_oracle.csv \
     --summary_json /tmp/student7/phase9c_summary_oracle.json
 ```
+
+**Résultat (2026-08-04, N=3198) :** désaccord énergie/oracle élevé
+(47.9% -- l'énergie choisit un candidat différent de l'oracle plus d'une
+fois sur deux), mais écart de performance PETIT : Pose@30 énergie 57.5%
+vs oracle 59.6% (+67 paires, +2.1 pts), strict 33.4% vs 35.2% (+56
+paires, +1.75 pts). **Beaucoup de désaccords portent sur des candidats du
+MÊME côté du seuil de succès** (deux candidats catastrophiques, ou deux
+candidats qui réussissent tous les deux) -- le désaccord ne coûte
+réellement que dans une minorité de cas. Le message automatique du
+script ("sélection à améliorer") était un appel marginal (67 contre un
+seuil arbitraire de 64, 2% du total) -- lecture plus juste, avec le
+critère de l'utilisateur ("oracle proche de énergie → le problème est la
+génération") : **le plafond de la génération actuelle de candidats
+(~59.6%) est proche de ce qu'on obtient déjà (~57.5%), donc raffiner le
+critère de sélection a un rendement plafonné à ~2 points.** Décision
+(avec l'utilisateur) : enrichir la génération de candidats (offsets de
+shift) plutôt que le critère de sélection.
+
+## Phase 9C, suite — offsets de shift en deux étages (2026-08-04)
+
+Implémenté : `--stage1_mode topM_icp_shift`. Approche en DEUX étages
+(coût maîtrisé, pas de produit cartésien angle×shift complet) :
+1. Génère les candidats angle comme `topM_icp` (jusqu'à 10 : 2
+   hypothèses x 5 offsets), ICP + énergie sur chacun (inchangé).
+2. Garde les `--shift_refine_topk` (défaut 2) meilleurs par énergie ICP,
+   et pour CHACUN teste des variantes de shift (`--shift_offsets_px`,
+   défaut `-1,0;1,0;0,-1;0,1` pixels) -- même theta/mirror, nouvelles
+   correspondances + Kabsch + ICP pour chaque variante (pas de nouveau
+   forward, `frame` déjà calculé réutilisé).
+3. Sélection finale par énergie ICP la plus basse parmi TOUS les
+   candidats (angle + shift-raffinés).
+
+**Implémenté proprement** : `run_learned_stage1_with_offsets` retourne
+maintenant aussi `frame` et chaque candidat inclut `theta`/`shift`/
+`is_mirror` (nécessaire pour reconstruire des correspondances avec un
+shift différent sans nouvelle rasterisation). Nouvelle fonction
+`_correspondence_candidate()` (factorise la construction
+correspondances+Kabsch, réutilisée pour les variantes de shift).
+`_format_candidate_key()` gère l'affichage des clés imbriquées
+(`(("normal", 10.0), "shift+1+0")`) dans le CSV.
+
+Pas encore lancé -- prochaine action :
+```
+CUDA_VISIBLE_DEVICES=1 python scripts/phase8_pipeline_learned_check.py --strategy thresh03 \
+    --regressor_ckpt output/phase8_depthmap_regressor_thresh03_mirrorhead/best.ckpt \
+    --ckpt output/cnn_step15_final_model/last.ckpt \
+    --data_root ... --experiment cnn_step15_final_model \
+    --categories everyday --split val \
+    --stage1_mode topM_icp_shift \
+    --rows_csv /tmp/student7/phase9c_rows_thresh03_topMshift.csv \
+    --summary_json /tmp/student7/phase9c_summary_topMshift.json
+```
+À comparer à la référence `topM_icp` : éligibilité 84.1%, Pose@30 global
+48.4%, succès strict 28.1% (N=3803, run du diagnostic oracle).

@@ -308,11 +308,16 @@ def run_learned_stage1_with_offsets(model, frac_i, frac_j, nrm_i, nrm_j, R_ij_gt
 
     `theta_offsets` : liste de décalages en degrés, ex. [0, -10, 10, -20, 20]
     -- 0 doit être inclus pour retrouver exactement le comportement
-    top2_icp en sous-cas. Retourne un dict {(label, offset): cand_ou_rien},
-    même format de `cand` que `run_learned_stage1_both_hypotheses`."""
+    top2_icp en sous-cas. Retourne `(result, frame)` -- `result` =
+    {(label, offset): cand_ou_rien}, `cand` inclut maintenant aussi
+    `theta`/`shift`/`is_mirror` (2026-08-04, Phase 9C-suite : nécessaire
+    pour raffiner le shift autour des meilleurs candidats sans refaire un
+    forward -- cf. `_correspondence_candidate`). `frame` est retourné pour
+    la même raison (reconstruire des correspondances avec un shift
+    différent, même repère, pas de nouvelle rasterisation)."""
     result = {}
     if len(frac_i) < 3 or len(frac_j) < 3:
-        return result
+        return result, None
 
     dmap_i, valid_i, dmap_j, valid_j, frame = build_frame_and_rasterize(frac_i, frac_j)
     nmap_i = rasterize_normal_channels(
@@ -357,8 +362,44 @@ def run_learned_stage1_with_offsets(model, frac_i, frac_j, nrm_i, nrm_j, R_ij_gt
             result[(label, offset)] = {
                 "R_est": R_est, "t_est": t_est, "n_corr": len(pts_i3),
                 "rot_err": rot_err_deg(R_est, R_ij_gt), "trans_err": trans_err(t_est, t_ij_gt),
+                "theta": theta, "shift": shift, "is_mirror": is_mirror,
             }
-    return result
+    return result, frame
+
+
+def _correspondence_candidate(frac_i, frac_j, frame, theta, shift, is_mirror, R_ij_gt, t_ij_gt):
+    """Construit un candidat (correspondances + Kabsch) pour un
+    (theta, shift, is_mirror) EXPLICITE, dans un repère (`frame`) déjà
+    calculé -- pas de nouveau forward ni de nouvelle rasterisation.
+    Réutilisée par `run_learned_stage1_with_offsets` (implicitement, même
+    logique) et par le raffinement de shift (2026-08-04, Phase 9C-suite)."""
+    v_j_use = -frame["v_j"] if is_mirror else frame["v_j"]
+    pts_i3, pts_j3 = build_correspondences_nn(
+        frac_i, frame["c_i"], frame["u_i"], frame["v_i"],
+        frac_j, frame["c_j"], frame["u_j"], v_j_use,
+        frame["u_min_i"], frame["v_min_i"], frame["u_min_j"], frame["v_min_j"],
+        frame["pixel_size"], RESOLUTION, theta, shift,
+    )
+    if pts_i3 is None or len(pts_i3) < 3:
+        return None
+    R_est, t_est = kabsch(pts_i3, pts_j3)
+    return {
+        "R_est": R_est, "t_est": t_est, "n_corr": len(pts_i3),
+        "rot_err": rot_err_deg(R_est, R_ij_gt), "trans_err": trans_err(t_est, t_ij_gt),
+        "theta": theta, "shift": shift, "is_mirror": is_mirror,
+    }
+
+
+def _format_candidate_key(key):
+    """Représentation lisible d'une clé de candidat pour le CSV -- gère les
+    clés simples ("normal"), les tuples (label, offset) de `topM_icp`, et
+    les tuples imbriqués ((label, offset), "shift+1+0") de
+    `topM_icp_shift` (2026-08-04), sans hypothèse de profondeur fixe."""
+    if isinstance(key, tuple):
+        return "+".join(_format_candidate_key(part) for part in key)
+    if isinstance(key, float):
+        return f"{key:g}"
+    return str(key)
 
 
 def _icp_residual_stats(pts_i, nrm_i, pts_j, nrm_j, R, t, trim_ratio, close_thresh=0.02):
@@ -418,22 +459,39 @@ def main():
                               "avant/après ICP, mirror_prob, n_corr, overlap_frac, "
                               "normal_consistency...) pour analyse hors-ligne.")
     parser.add_argument("--stage1_mode", default="single",
-                         choices=["single", "top2_icp", "topM_icp"],
+                         choices=["single", "top2_icp", "topM_icp", "topM_icp_shift"],
                          help="Phase 9B : 'top2_icp' essaie LES DEUX hypothèses "
                               "(normal/mirror, déjà calculées par le même forward) et "
                               "garde celle dont l'ICP donne la meilleure énergie finale, "
                               "au lieu de choisir --mirror_mode en amont. 'topM_icp' ajoute "
                               "en plus des variantes d'angle autour de chaque hypothèse "
-                              "(cf. --theta_offsets).")
+                              "(cf. --theta_offsets). 'topM_icp_shift' (Phase 9C-suite, "
+                              "2026-08-04) raffine en plus le shift autour des "
+                              "--shift_refine_topk meilleurs candidats angle -- motivé par "
+                              "le diagnostic oracle-vs-énergie (écart de sélection faible, "
+                              "~2pts : la génération de candidats est le vrai levier, pas "
+                              "le critère de sélection).")
     parser.add_argument("--theta_offsets", default="0,-10,10,-20,20",
-                         help="Phase 9B (topM_icp) : décalages d'angle en degrés à tester "
-                              "autour de chaque hypothèse (liste séparée par des virgules, "
-                              "0 doit être inclus pour retrouver top2_icp en sous-cas).")
+                         help="Phase 9B (topM_icp/topM_icp_shift) : décalages d'angle en "
+                              "degrés à tester autour de chaque hypothèse (liste séparée "
+                              "par des virgules, 0 doit être inclus pour retrouver top2_icp "
+                              "en sous-cas).")
+    parser.add_argument("--shift_offsets_px", default="-1,0;1,0;0,-1;0,1",
+                         help="Phase 9C-suite (topM_icp_shift) : décalages de shift en "
+                              "pixels à tester autour des meilleurs candidats angle "
+                              "(paires 'dy,dx' séparées par ';', (0,0) implicite -- déjà "
+                              "couvert par le candidat de base).")
+    parser.add_argument("--shift_refine_topk", type=int, default=2,
+                         help="Phase 9C-suite (topM_icp_shift) : nombre de meilleurs "
+                              "candidats angle (par énergie ICP) autour desquels raffiner "
+                              "le shift.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     if args.strategy == "thresh03" and not args.ckpt:
         parser.error("--ckpt (checkpoint CNN) est requis avec --strategy thresh03")
     theta_offsets = [float(x) for x in args.theta_offsets.split(",")]
+    shift_offsets_px = [tuple(float(v) for v in pair.split(","))
+                         for pair in args.shift_offsets_px.split(";")]
 
     device = torch.device(args.device)
     rng = np.random.default_rng(args.seed)
@@ -458,9 +516,10 @@ def main():
         oracle_strict_success = None
         energy_matches_oracle = None
 
-        if args.stage1_mode in ("top2_icp", "topM_icp"):
-            if args.stage1_mode == "topM_icp":
-                candidates = run_learned_stage1_with_offsets(
+        if args.stage1_mode in ("top2_icp", "topM_icp", "topM_icp_shift"):
+            frame = None
+            if args.stage1_mode in ("topM_icp", "topM_icp_shift"):
+                candidates, frame = run_learned_stage1_with_offsets(
                     regressor, frac_i_zoom, frac_j_zoom, nrm_i_zoom, nrm_j_zoom,
                     R_ij_gt, t_ij_gt, device, theta_offsets)
             else:
@@ -473,8 +532,7 @@ def main():
                 return
             n_hypotheses_valid = len(valid)
 
-            icp_results = {}
-            for label, cand in valid.items():
+            def _icp_and_stats(cand):
                 R_f, t_f, _ = trimmed_icp_normals(
                     frac_i_base, frac_i_nrm, frac_j_base, frac_j_nrm,
                     cand["R_est"], cand["t_est"],
@@ -483,23 +541,51 @@ def main():
                 )
                 energy, ovlp, ncons = _icp_residual_stats(
                     frac_i_base, frac_i_nrm, frac_j_base, frac_j_nrm, R_f, t_f, args.trim_ratio)
-                # rot_err/trans_err final calculés pour TOUS les candidats (pas
-                # seulement celui retenu) -- coût quasi nul (l'ICP tourne déjà
-                # sur chacun), sert au diagnostic oracle-vs-énergie ci-dessous
-                # (Phase 9C, 2026-08-04).
-                icp_results[label] = {
+                return {
                     "R_final": R_f, "t_final": t_f, "icp_energy": energy,
                     "overlap_frac": ovlp, "normal_consistency": ncons,
                     "rot_err_stage1": cand["rot_err"], "trans_err_stage1": cand["trans_err"],
                     "rot_err_final": rot_err_deg(R_f, R_ij_gt), "trans_err_final": trans_err(t_f, t_ij_gt),
-                    "n_corr": cand["n_corr"],
+                    "n_corr": cand["n_corr"], "cand": cand,
                 }
+
+            # rot_err/trans_err final calculés pour TOUS les candidats (pas
+            # seulement celui retenu) -- coût quasi nul (l'ICP tourne déjà
+            # sur chacun), sert au diagnostic oracle-vs-énergie ci-dessous
+            # (Phase 9C, 2026-08-04).
+            icp_results = {label: _icp_and_stats(cand) for label, cand in valid.items()}
+
+            # -- topM_icp_shift (2026-08-04, Phase 9C-suite) : raffinement en
+            # DEUX étages -- garde les `--shift_refine_topk` meilleurs
+            # candidats (angle) par énergie ICP, puis teste autour d'eux
+            # SEULEMENT des offsets de shift (`--shift_offsets_px`), même
+            # theta/mirror, correspondances+Kabsch+ICP recalculés pour
+            # chaque variante. Motivation : le diagnostic oracle-vs-énergie
+            # a montré que la sélection n'était pas le verrou (écart ~2pts
+            # seulement) -- enrichir la GÉNÉRATION de candidats (ici, en
+            # shift) a plus de marge que raffiner le critère de sélection.
+            if args.stage1_mode == "topM_icp_shift" and frame is not None:
+                top_k_keys = sorted(icp_results, key=lambda k: icp_results[k]["icp_energy"]
+                                     )[:args.shift_refine_topk]
+                for base_key in top_k_keys:
+                    base_cand = icp_results[base_key]["cand"]
+                    for dsy, dsx in shift_offsets_px:
+                        if dsy == 0 and dsx == 0:
+                            continue
+                        new_shift = (base_cand["shift"][0] + dsy, base_cand["shift"][1] + dsx)
+                        new_cand = _correspondence_candidate(
+                            frac_i_zoom, frac_j_zoom, frame, base_cand["theta"], new_shift,
+                            base_cand["is_mirror"], R_ij_gt, t_ij_gt)
+                        if new_cand is None:
+                            continue
+                        new_key = (base_key, f"shift{dsy:+g}{dsx:+g}")
+                        icp_results[new_key] = _icp_and_stats(new_cand)
+
             # Sélection PAR L'ICP (énergie finale la plus basse), pas par une
             # règle de miroir choisie en amont -- coeur de l'idée 9B.
             best_key = min(icp_results, key=lambda k: icp_results[k]["icp_energy"])
             chosen = icp_results[best_key]
-            chosen_hypothesis = (f"{best_key[0]}+{best_key[1]:g}"
-                                  if isinstance(best_key, tuple) else best_key)
+            chosen_hypothesis = _format_candidate_key(best_key)
             R_final, t_final = chosen["R_final"], chosen["t_final"]
             re_final = rot_err_deg(R_final, R_ij_gt)
             te_final = trans_err(t_final, t_ij_gt)
@@ -520,8 +606,7 @@ def main():
             # généré mais mal choisi" (oracle nettement meilleur qu'énergie).
             oracle_key = min(icp_results, key=lambda k: icp_results[k]["rot_err_final"])
             oracle = icp_results[oracle_key]
-            oracle_hypothesis = (f"{oracle_key[0]}+{oracle_key[1]:g}"
-                                  if isinstance(oracle_key, tuple) else oracle_key)
+            oracle_hypothesis = _format_candidate_key(oracle_key)
             oracle_rot_err_final = oracle["rot_err_final"]
             oracle_trans_err_final = oracle["trans_err_final"]
             oracle_pose_30 = bool(oracle_rot_err_final < 30.0 and oracle_trans_err_final < 0.1)
