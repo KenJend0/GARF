@@ -113,6 +113,28 @@ def main():
     print("\n  Médiane n_frac_pts_min, catastrophique vs pas (au sein de C) :")
     print(sub_c2.groupby("catastrophic")["n_frac_pts_min"].median())
 
+    if "planarity_min" in df.columns and df["planarity_min"].notna().any():
+        print("\n=== Planéité (planarity_min) x oracle_pose_30, TOUTES les paires "
+              "étage 2 ===")
+        print("(teste si les paires où même le MEILLEUR candidat généré échoue "
+              "Pose@30 -- oracle_pose_30=False, 'aucun bon candidat du tout' -- "
+              "sont systématiquement plus plates. planarity proche de 0 = "
+              "quasi plat, cf. compute_pca_frame)")
+        sub_p = df[df["planarity_min"].notna()].copy()
+        print(f"\n  Médiane planarity_min, oracle_pose_30 True vs False (n={len(sub_p)}) :")
+        print(sub_p.groupby("oracle_pose_30")["planarity_min"].median())
+        try:
+            sub_p["planarity_bin"] = pd.qcut(sub_p["planarity_min"], q=5, duplicates="drop")
+            table_p = pd.crosstab(sub_p["planarity_bin"], sub_p["oracle_pose_30"],
+                                   normalize="index") * 100
+            print("\n  oracle_pose_30 (%) par tranche de planéité (quintiles, "
+                  "tranche la plus plate en premier) :")
+            print(table_p.round(1))
+            print("  (n par tranche)")
+            print(sub_p["planarity_bin"].value_counts().sort_index())
+        except ValueError as e:
+            print(f"  (binning impossible : {e})")
+
 
 if __name__ == "__main__":
     main()

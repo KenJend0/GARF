@@ -517,6 +517,8 @@ def main():
         energy_matches_oracle = None
         oracle_energy_rank = None
         n_candidates_total = None
+        planarity_i = None
+        planarity_j = None
 
         if args.stage1_mode in ("top2_icp", "topM_icp", "topM_icp_shift"):
             frame = None
@@ -524,6 +526,9 @@ def main():
                 candidates, frame = run_learned_stage1_with_offsets(
                     regressor, frac_i_zoom, frac_j_zoom, nrm_i_zoom, nrm_j_zoom,
                     R_ij_gt, t_ij_gt, device, theta_offsets)
+                if frame is not None:
+                    planarity_i = frame["planarity_i"]
+                    planarity_j = frame["planarity_j"]
             else:
                 candidates = run_learned_stage1_both_hypotheses(
                     regressor, frac_i_zoom, frac_j_zoom, nrm_i_zoom, nrm_j_zoom,
@@ -686,6 +691,9 @@ def main():
             "energy_matches_oracle": energy_matches_oracle,
             "oracle_energy_rank": oracle_energy_rank,
             "n_candidates_total": n_candidates_total,
+            "planarity_i": planarity_i, "planarity_j": planarity_j,
+            "planarity_min": (min(planarity_i, planarity_j)
+                               if planarity_i is not None and planarity_j is not None else None),
         })
 
     if args.strategy == "gt":

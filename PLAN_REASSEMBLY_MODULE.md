@@ -5041,3 +5041,51 @@ CUDA_VISIBLE_DEVICES=1 python scripts/phase8_pipeline_learned_check.py --strateg
     --rows_csv /tmp/student7/phase9c_rows_thresh03_topMshift_oracle.csv \
     --summary_json /tmp/student7/phase9c_summary_topMshift_oracle.json
 ```
+
+## Piste planéité pour le groupe C -- implémentée (2026-08-04)
+
+Contexte : le tuteur suggère de remplacer l'encodeur (petit CNN siamois)
+par un réseau plus capable (ResNet, MAE) pour une meilleure précision
+théorique. Avant de s'engager dans un changement d'architecture (coût
+élevé, risque de surapprentissage déjà rencontré une fois sur ce projet
+avec un réseau BEAUCOUP plus petit que ResNet/MAE, cf. Phase 8 chapitre 3
+"the model memorizes"), vérifier d'abord si le goulot restant (38.5% des
+paires, "aucun bon candidat généré" même par l'oracle) est une limite de
+CAPACITÉ du réseau ou une limite d'INFORMATION dans la depth map
+elle-même (fracture trop plate) -- un réseau plus gros ne peut pas
+extraire un signal qui n'existe pas physiquement dans l'image d'entrée.
+
+**Implémenté :**
+- `build_frame_and_rasterize()` (`phase8_build_regressor_dataset.py`) :
+  capture maintenant `planarity_i`/`planarity_j` (déjà calculées par
+  `canonical_pca_frame`/`compute_pca_frame`, jetées jusqu'ici) et les
+  ajoute au dict `frame` -- ajout pur, aucune régression possible pour
+  les appelants existants (nouvelles clés seulement).
+- `phase8_pipeline_learned_check.py` : `planarity_i`/`planarity_j`/
+  `planarity_min` loggés dans le CSV par paire, pour `topM_icp`/
+  `topM_icp_shift` (là où `frame` est déjà accessible).
+- `phase9a_analyze_rows.py` : nouvelle section -- médiane de
+  `planarity_min` selon `oracle_pose_30` (True/False), et répartition par
+  quintile de planéité. `oracle_pose_30=False` = aucun des ~18 candidats
+  générés (même le meilleur) n'atteint Pose@30 -- exactement la
+  population qu'on cherche à expliquer.
+
+Pas encore relancé (nécessite un nouveau run complet, `planarity_i`/`_j`
+n'existaient pas dans les CSV précédents) -- prochaine action :
+```
+CUDA_VISIBLE_DEVICES=1 python scripts/phase8_pipeline_learned_check.py --strategy thresh03 \
+    --regressor_ckpt output/phase8_depthmap_regressor_thresh03_mirrorhead/best.ckpt \
+    --ckpt output/cnn_step15_final_model/last.ckpt \
+    --data_root ... --experiment cnn_step15_final_model \
+    --categories everyday --split val \
+    --stage1_mode topM_icp_shift \
+    --rows_csv /tmp/student7/phase9c_rows_thresh03_planarity.csv \
+    --summary_json /tmp/student7/phase9c_summary_planarity.json
+
+python scripts/phase9a_analyze_rows.py /tmp/student7/phase9c_rows_thresh03_planarity.csv
+```
+**Lecture attendue** : si `oracle_pose_30=False` corrèle avec une
+planéité nettement plus basse, l'hypothèse "signal insuffisant" est
+confirmée -- argument contre un changement d'architecture (ResNet/MAE).
+Si la planéité ne discrimine pas (comme la sparsité, déjà réfutée), il
+faudra chercher encore ailleurs avant de statuer sur l'architecture.

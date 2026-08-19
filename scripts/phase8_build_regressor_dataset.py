@@ -84,8 +84,8 @@ def build_frame_and_rasterize(frac_i, frac_j):
     """Repère PCA canonique + rasterisation à résolution fixe, pour LES
     DEUX fragments d'une paire -- même convention (pixel_size partagé)
     que `run_match_at_resolution`/`process_pair`."""
-    c_i, u_i, v_i, n_i, _ = canonical_pca_frame(frac_i)
-    c_j, u_j, v_j, n_j, _ = canonical_pca_frame(frac_j)
+    c_i, u_i, v_i, n_i, planarity_i = canonical_pca_frame(frac_i)
+    c_j, u_j, v_j, n_j, planarity_j = canonical_pca_frame(frac_j)
 
     ci, cj = frac_i - c_i, frac_j - c_j
     span_i = max(float((ci @ u_i).max() - (ci @ u_i).min()),
@@ -101,6 +101,12 @@ def build_frame_and_rasterize(frac_i, frac_j):
         "c_i": c_i, "u_i": u_i, "v_i": v_i, "n_i": n_i, "u_min_i": u_min_i, "v_min_i": v_min_i,
         "c_j": c_j, "u_j": u_j, "v_j": v_j, "n_j": n_j, "u_min_j": u_min_j, "v_min_j": v_min_j,
         "pixel_size": pixel_size,
+        # 2026-08-04 : planéité par fragment (lambda_min / somme des lambdas
+        # de la PCA, cf. compute_pca_frame -- proche de 0 = quasi plat),
+        # déjà calculée par canonical_pca_frame mais jetée jusqu'ici. Ajout
+        # additif pur (nouvelles clés dans le dict) -- ne change rien pour
+        # les appelants existants qui ne les lisent pas.
+        "planarity_i": planarity_i, "planarity_j": planarity_j,
     }
     return dmap_i, valid_i, dmap_j, valid_j, frame
 
