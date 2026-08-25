@@ -5089,3 +5089,39 @@ planéité nettement plus basse, l'hypothèse "signal insuffisant" est
 confirmée -- argument contre un changement d'architecture (ResNet/MAE).
 Si la planéité ne discrimine pas (comme la sparsité, déjà réfutée), il
 faudra chercher encore ailleurs avant de statuer sur l'architecture.
+
+**Résultat (2026-08-04, N=3170) : CONFIRMÉ, tendance monotone nette --
+contrairement à la sparsité (plate partout), la planéité discrimine
+vraiment.**
+```
+Médiane planarity_min : échec oracle (False) 0.029 | succès oracle (True) 0.061 (x2.1)
+
+Par quintile de planéité (le plus plat en premier), % d'échec oracle :
+  le plus plat   : 56.9%
+                 : 47.0%
+                 : 41.0%
+                 : 26.8%
+  le moins plat  : 26.0%
+```
+Le taux d'échec oracle est divisé par plus de 2 entre le quintile le
+plus plat et le moins plat -- tendance monotone claire, pas du bruit.
+**Confirme l'hypothèse planéité** : moins il y a de relief, moins
+l'étage 1 a de signal angulaire disponible, quel que soit le nombre de
+candidats générés autour.
+
+**Nuance importante, à ne pas sur-vendre** : même dans le quintile le
+MOINS plat, il reste 26.0% d'échec oracle -- la planéité n'explique donc
+qu'une partie du phénomène, pas la totalité. Il reste une part
+substantielle d'échecs (~26% dans le meilleur des cas) qui ne s'explique
+ni par le miroir (~10-14% de toutes les paires), ni par la sparsité
+(réfutée), ni entièrement par la planéité.
+
+**Lecture pour la question du tuteur (remplacer l'encodeur par
+ResNet/MAE)** : nuancée, ni oui ni non franc. La planéité est confirmée
+comme un facteur réel et mesurable -- une partie du problème est
+structurelle (signal angulaire absent sur les fractures très plates),
+pas un problème d'extraction, donc un encodeur plus gros n'y changerait
+rien pour cette part-là. Mais le résidu ~26% d'échec même sur les cas
+favorables (peu plats) laisse une place légitime, plus restreinte que ce
+qu'on pensait au départ, à un potentiel gain de capacité du modèle --
+pas le levier prioritaire, mais pas à exclure complètement non plus.
